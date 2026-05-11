@@ -22,7 +22,7 @@ CURRENT_VERSION = "1.0"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
-PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/New.py"
+PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/AutoChecker.py"
 
 
 def check_for_updates():
