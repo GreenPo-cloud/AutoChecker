@@ -1,0 +1,33 @@
+{
+    "NAME": "NoNaMe",
+
+    "CAMERA_ID": 1,
+    "FOCUS": 360,
+    "PHOTO_DELAY": 1.5,
+    "SCAN_PORT": "COM3",
+    "DISPLAY_PORT": "COM8",
+    "OLDER": 12,
+
+    "REMOVE_PHRASES": [
+        "UPS Standard",
+        "Zasilkovna",
+        "UPS Express Saver",
+        "Postal Service with tracking",
+        "Germany ✈",
+        "Denmark ✈",
+        "Romania ✈",
+        "Portugal ✈",
+        "Austria ✈",
+        "Greece ✈",
+        "Slovakia ✈",
+        "Spain ✈",
+        "France ✈",
+        "(Gift)",
+        "™"
+    ],
+
+    "REMOVE_ITEMS": [
+        "Mystery Box"
+    ]
+
+}

@@ -1,3 +1,51 @@
+import sys
+import subprocess
+import importlib
+
+def ensure_package(module_name, pip_name=None):
+
+    """
+    module_name = как импортируется
+    pip_name = как ставится через pip
+    """
+
+    if pip_name is None:
+        pip_name = module_name
+
+    try:
+        importlib.import_module(module_name)
+
+    except ImportError:
+
+        print(f"Installing missing package: {pip_name}")
+
+        subprocess.check_call([
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            pip_name
+        ])
+
+        print(f"{pip_name} installed")
+
+
+REQUIRED_PACKAGES = [
+
+    ("cv2", "opencv-python"),
+    ("serial", "pyserial"),
+    ("pdfplumber", "pdfplumber"),
+    ("send2trash", "send2trash"),
+    ("numpy", "numpy"),
+    ("requests", "requests"),
+
+]
+
+for module_name, pip_name in REQUIRED_PACKAGES:
+    ensure_package(module_name, pip_name)
+        
+        
+        
 import os
 import re
 import glob
@@ -13,7 +61,11 @@ from send2trash import send2trash
 import datetime
 import numpy as np
 import requests
-import sys
+
+
+
+
+
 
 
 
@@ -22,7 +74,7 @@ CURRENT_VERSION = "1.0"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
-PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/New.py"
+PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/AutoChecker.py"
 
 
 def check_for_updates():
@@ -91,6 +143,25 @@ del "%~f0"
 check_for_updates()
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 error_flash_start = 0
 ERROR_FLASH_DURATION = 0.8  # секунд
 
@@ -113,6 +184,10 @@ PHOTO_DELAY = CONFIG["PHOTO_DELAY"]
 SCAN_PORT = CONFIG["SCAN_PORT"]
 DISPLAY_PORT = CONFIG["DISPLAY_PORT"]
 OLDER = CONFIG["OLDER"]
+REMOVE_ITEMS = CONFIG["REMOVE_ITEMS"]
+
+with open("PRODUCTS.json", "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
 
 REMOVE_PHRASES = CONFIG["REMOVE_PHRASES"]
 FEM_BONUS = CONFIG["FEM_BONUS"]
@@ -129,14 +204,12 @@ STATISTICS = os.path.join(DESKTOP, "Statistik")
 SCAN_INTERVAL = 0.2
 scale = 0.15
 
-AUTO_COMPLETE_ITEMS = [
-    "Stickers - 420 FastBuds. 2025 Sticker"
-]
+AUTO_COMPLETE_ITEMS = CONFIG["AUTO_COMPLETE_ITEMS"]
 
 def Printer(text):
     global STATUS_LINES
 
-    REMOVE_FRAGMENTS = ["Auto ", "™", "Fem"]
+    REMOVE_FRAGMENTS = ["Auto ", "Fem"]
 
     if isinstance(text, str):
         lines = text.splitlines()
@@ -237,7 +310,7 @@ def draw_status_panel(frame, panel_width=500):
 
 
 def send(ser, message):
-    for fragment in ["Auto ", "™", "#", "Fem"]:
+    for fragment in ["Auto ", "#", "Fem"]:
         message = message.replace(fragment, "")
 
     message = message.strip()
@@ -256,9 +329,6 @@ def send(ser, message):
 
 def normalize(name):
 
-    # убираем (Gift)
-    name = re.sub(r"\s*\(Gift\)", "", name)
-
     # убираем Outlet |
     name = re.sub(r"^Outlet \|\s*", "", name)
 
@@ -270,18 +340,139 @@ def normalize(name):
 
     return name.strip()
 
+def sort_key(item):
+
+    name, qty = item
+
+    normalized = normalize(name)
+
+    # ===== BONUS =====
+    is_bonus = "Bonus" in name
+
+    # ===== NO BARCODE =====
+    is_no_barcode = normalized not in PRODUCTS.values()
+
+    # ===== fem count =====
+    fem_match = re.search(r"(\d+)\s*fem", name)
+
+    fem_count = int(fem_match.group(1)) if fem_match else 0
+
+    # ===== base name =====
+    base_name = re.sub(
+        r"\s*-\s*\d+\s*fem",
+        "",
+        normalized
+    ).strip().lower()
+
+    # ===== priority =====
+    if not is_bonus and not is_no_barcode:
+        category = 0  # обычные
+
+    elif is_bonus:
+        category = 1  # bonus
+
+    else:
+        category = 2  # no barcode
+
+    return (
+        category,
+        base_name,
+        fem_count
+    )
 
 
+def find_latest_pdf(previous=False):
 
-def parse_orders():
-    pdfs = glob.glob(os.path.join(DOWNLOADS, "*.pdf"))
-    if not pdfs:
-        print("PDF не найден в папке Downloads")
+    today = datetime.datetime.now().strftime("%d.%m.%Y")
+
+    pattern = re.compile(
+        rf"^{re.escape(today)} Part (\d+)\.pdf$",
+        re.IGNORECASE
+    )
+
+    found = []
+
+    for file in os.listdir(DOWNLOADS):
+
+        if not file.lower().endswith(".pdf"):
+            continue
+
+        match = pattern.match(file)
+
+        if match:
+
+            part = int(match.group(1))
+
+            full_path = os.path.join(DOWNLOADS, file)
+
+            found.append((part, full_path))
+
+    if not found:
+        return None, None
+
+    # сортировка по номеру Part
+    found.sort(key=lambda x: x[0])
+
+    latest_part, latest_path = found[-1]
+
+    # если нужен предыдущий PDF
+    if previous and latest_part > 1:
+
+        previous_part = latest_part - 1
+
+        for part, path in found:
+            if part == previous_part:
+                return path, previous_part
+
+    return latest_path, latest_part
+
+def save_part_to_statistics(pdf_path, parsed_orders):
+
+    today = datetime.datetime.now().strftime("%d.%m.%Y")
+
+    stat_file = os.path.join(
+        STATISTICS,
+        f"{today}.txt"
+    )
+
+    pdf_name = os.path.basename(pdf_path)
+
+    header = f"----------{pdf_name}----------"
+
+    # если файла нет — создаём
+    if not os.path.exists(stat_file):
+        with open(stat_file, "w", encoding="utf-8") as f:
+            pass
+
+    # читаем содержимое
+    with open(stat_file, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # если такая part уже записана
+    if header in content:
+        return
+
+    # добавляем новую запись
+    with open(stat_file, "a", encoding="utf-8") as f:
+
+        f.write(header + "\n")
+
+        for order_id in parsed_orders.keys():
+            f.write(order_id + "\n")
+
+        f.write("\n")
+
+
+def parse_orders(previous=False):
+
+    latest, part = find_latest_pdf(previous)
+
+    if not latest:
+        Printer("XXX Orders PDF not found")
         return None
 
-    pdfs.sort(key=os.path.getmtime, reverse=True)
-    latest = pdfs[0]
-    Printer("Update PDF")
+    Printer(f"*Update PDF | Part {part}")
+    send(DISPLAY, f"*Update PDF | Part {part}")
 
     with pdfplumber.open(latest) as pdf:
         pages = [page.extract_text() or "" for page in pdf.pages]
@@ -314,12 +505,29 @@ def parse_orders():
 
         parsed[oid] = list(agg.items())
 
-    for oid, items in parsed.items():
-        parsed[oid] = [
-            (name, qty)
-            for name, qty in items
-            if "Mystery Box" not in name
-        ]
+    filtered_items = []
+
+    for name, qty in items:
+
+        # проверяем список исключений
+        skip = False
+
+        for remove_text in REMOVE_ITEMS:
+
+            if remove_text in name:
+                skip = True
+                break
+
+        if not skip:
+            filtered_items.append((name, qty))
+
+    # сортировка позиций
+    filtered_items.sort(key=sort_key)
+
+    parsed[oid] = filtered_items
+        
+    # сохраняем информацию о Part
+    save_part_to_statistics(latest, parsed)
 
     return parsed
 
@@ -483,13 +691,26 @@ def main():
             
         elif key == ord('u'):
             orders = parse_orders()
+        elif key == ord('U'):
+            orders = parse_orders(previous=True)
+        elif key == ord('r'):
+            check_for_updates()
+        elif key == ord('c'):
+
+            t = threading.Thread(
+                target=cancel_order_manual,
+                daemon=True
+            )
+
+            t.start()
+            
 
         try:
             if DISPLAY.in_waiting > 0:
                 message = DISPLAY.read(DISPLAY.in_waiting).decode(errors='ignore').strip()
                 if "x" in message and current_order:
-                    save_photo(current_order, frame)
-                    Printer("\n*Photo taken (manual display)")
+                    save_photo(current_order, frame, manually=True)
+                    # Printer("\n*Photo taken (manual display)")
                     photo_pending = False
                 if "e" in message:
                     # Копируем кадр, чтобы поток не трогал текущий frame
@@ -544,6 +765,13 @@ def process_scan(code, orders, current_order, counts, extras, errors, no_barcode
             print_fn(f"XXX Unknown order {code}")
             send_fn(f"XXX Unknown order {code}")
             return current_order, photo_pending, photo_start
+        
+        if is_order_cancelled(matched):
+
+            print_fn(f"XXX Cancelled order {matched}")
+            send_fn(f"XXX Cancelled order {matched}")
+
+            return current_order, photo_pending, photo_start
 
         current_order = matched
         counts.clear()
@@ -564,13 +792,10 @@ def process_scan(code, orders, current_order, counts, extras, errors, no_barcode
                     no_barcode_items.append((item, qty))
 
 
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        name_folder = os.path.join(STATISTICS, NAME)
-        os.makedirs(name_folder, exist_ok=True)
-        date_filename = datetime.datetime.now().strftime("%Y-%m-%d") + ".txt"
-        stat_file = os.path.join(name_folder, date_filename)
-        with open(stat_file, 'a', encoding='utf-8') as f:
-            f.write(f"{current_order}   {now}\n")
+        update_order_in_statistics(
+            current_order,
+            add_name=True
+        )
 
         show_status(current_order, orders[current_order], counts, extras, errors, no_barcode_items, print_fn, send_fn)
 
@@ -774,20 +999,169 @@ def order_ready(items, counts, extras, errors, no_barcode_items):
                 return False
     return True
 
+def update_order_in_statistics(order_id, add_name=False, add_plus=False, add_cancelled=False):
+    
+    updated = False
 
+    today = datetime.datetime.now().strftime("%d.%m.%Y")
+
+    stat_file = os.path.join(
+        STATISTICS,
+        f"{today}.txt"
+    )
+
+    if not os.path.exists(stat_file):
+        return
+
+    try:
+
+        with open(stat_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        updated_lines = []
+
+        for line in lines:
+
+            stripped = line.strip()
+
+            # ищем строку заказа
+            if stripped.startswith(order_id):
+
+                # если заказ уже Cancelled —
+                # ===== пропускаем cancelled =====
+                if "Cancelled" in stripped:
+                    updated_lines.append(line)
+                    continue
+
+                # ===== добавляем NAME =====
+                if add_name and NAME not in stripped:
+                    stripped += f" {NAME}"
+
+                # ===== добавляем + =====
+                if add_plus and "+" not in stripped:
+                    stripped += " +"
+                
+                # ===== добавляем Cancelled =====
+                if add_cancelled and "Cancelled" not in stripped:
+                    stripped += " Cancelled"
+
+                line = stripped + "\n"
+                updated = True
+
+            updated_lines.append(line)
+
+        with open(stat_file, "w", encoding="utf-8") as f:
+            f.writelines(updated_lines)
+
+    except Exception as e:
+        Printer(f"XXX Statistics update error: {e}")
+        
+    return updated
+        
+def cancel_order_manual():
+
+    order = input("Enter cancelled order number: #").strip()
+
+    if not order.isdigit():
+        print("Invalid order number")
+        return
+
+    order_id = f"#{order}"
+
+    success = update_order_in_statistics(
+    order_id,
+    add_cancelled=True
+)
+
+    if success:
+        Printer(f"XXX {order_id} Cancelled")
+        send(DISPLAY, f"XXX {order_id} Cancelled")
+    else:
+        Printer(f"XXX Active order not found {order_id}")
+        send(DISPLAY, f"XXX Active order not found {order_id}")
+
+
+
+def is_order_cancelled(order_id):
+
+    today = datetime.datetime.now().strftime("%d.%m.%Y")
+
+    stat_file = os.path.join(
+        STATISTICS,
+        f"{today}.txt"
+    )
+
+    if not os.path.exists(stat_file):
+        return False
+
+    try:
+
+        with open(stat_file, "r", encoding="utf-8") as f:
+
+            for line in f:
+
+                stripped = line.strip()
+
+                if stripped.startswith(order_id):
+
+                    if "Cancelled" not in stripped:
+                        return False
+
+        return True
+
+    except:
+        return False
 
 
 
 completed_orders = 0
-def save_photo(order_id, frame):
+def save_photo(order_id, frame, manually=False):
+
     if not order_id or frame is None:
         return
 
-    # сохраняем фото
-    path = os.path.join(FOTO, f"{order_id}.jpg")
+    # =========================
+    # Поиск свободного имени
+    # =========================
+
+    photo_number = 1
+
+    while True:
+
+        if photo_number == 1:
+            filename = f"{order_id}.jpg"
+        else:
+            filename = f"{order_id}_{photo_number}.jpg"
+
+        path = os.path.join(FOTO, filename)
+
+        if not os.path.exists(path):
+            break
+
+        photo_number += 1
+
+    # =========================
+    # Сохраняем фото
+    # =========================
+
     cv2.imwrite(path, frame)
-    Printer("* Photo saved")
-    send(DISPLAY, "* Photo saved")
+
+    # =========================
+    # Сообщение
+    # =========================
+
+    if manually:
+        message = f"* {filename} * Photo taken (manual display)"
+    else:
+        message = f"* {filename} * Photo saved"
+
+    send(DISPLAY, message)
+    Printer(message)
+        
+    update_order_in_statistics(
+        order_id,
+        add_plus=True
+    )
 
     # ==== считаем количество уникальных заказов в статистике ====
     global completed_orders
@@ -801,19 +1175,27 @@ def save_photo(order_id, frame):
         completed_orders = 0
         return
 
-    unique_orders = set()
+    completed_orders = 0
 
     try:
+
         with open(stat_file, 'r', encoding='utf-8') as f:
+
             for line in f:
-                parts = line.strip().split()
-                if parts:
-                    order = parts[0]
-                    unique_orders.add(order)
+
+                stripped = line.strip()
+
+                # считаем только:
+                # заказ + NAME + +
+                if (
+                    stripped.startswith("#")
+                    and NAME in stripped
+                    and "+" in stripped
+                ):
+                    completed_orders += 1
+
     except:
         pass
-
-    completed_orders = len(unique_orders)
 
 
 def manual_photo_with_order(frame):
