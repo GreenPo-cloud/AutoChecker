@@ -486,7 +486,7 @@ def parse_orders(previous=False):
 
     text = re.sub(r"(fem -).*?(x\d+)", r"\1 \2", text, flags=re.DOTALL)
 
-    order_blocks = re.split(r"(#\S+)", text)
+    order_blocks = re.split(r"(?m)^(?!.*☐).*?(#\S+)", text)
     contents = OrderedDict()
 
     for i in range(1, len(order_blocks), 2):
