@@ -70,7 +70,7 @@ import requests
 
 
 
-CURRENT_VERSION = "1.0"
+CURRENT_VERSION = "1.1"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -469,8 +469,13 @@ def parse_orders(previous=False):
     latest, part = find_latest_pdf(previous)
 
     if not latest:
-        Printer("XXX Orders PDF not found")
-        return None
+
+        message = "XXX Orders PDF not found. Check Downloads folder"
+
+        Printer(message)
+        send(DISPLAY, message)
+
+        return {}
 
     Printer(f"*Update PDF | Part {part}")
     send(DISPLAY, f"*Update PDF | Part {part}")
@@ -749,6 +754,19 @@ def main():
 
 
 def process_scan(code, orders, current_order, counts, extras, errors, no_barcode_items, print_fn, send_fn, photo_pending, photo_start):
+    
+    if not orders:
+
+        message = "XXX Orders not loaded. Press U to reload PDF"
+
+        print_fn(message)
+        send_fn(message)
+
+        return (
+            current_order,
+            photo_pending,
+            photo_start
+        )
 
     if code.startswith('#'):
         matched = next((oid for oid in orders if oid.replace('#', '') == code.replace('#', '')), None)
@@ -758,10 +776,29 @@ def process_scan(code, orders, current_order, counts, extras, errors, no_barcode
             send_fn(f"XXX Unknown order {code}")
             return current_order, photo_pending, photo_start
         
-        if is_order_cancelled(matched):
+        status = get_order_status(matched)
+
+        # ===== cancelled =====
+        if status == "cancelled":
 
             print_fn(f"XXX Cancelled order {matched}")
             send_fn(f"XXX Cancelled order {matched}")
+
+            return current_order, photo_pending, photo_start
+
+        # ===== already completed =====
+        if status == "completed":
+
+            print_fn(f"XXX Order already completed {matched}")
+            send_fn(f"XXX Order already completed {matched}")
+
+            return current_order, photo_pending, photo_start
+
+        # ===== completed + cancelled =====
+        if status == "completed_cancelled":
+
+            print_fn(f"XXX Cancelled completed order {matched}")
+            send_fn(f"XXX Cancelled completed order {matched}")
 
             return current_order, photo_pending, photo_start
 
@@ -991,7 +1028,7 @@ def order_ready(items, counts, extras, errors, no_barcode_items):
                 return False
     return True
 
-def update_order_in_statistics(order_id, add_name=False, add_plus=False, add_cancelled=False):
+def update_order_in_statistics(order_id, add_name=False, add_plus=False, add_cancelled=False, manual_plus=False):
     
     updated = False
 
@@ -1029,8 +1066,12 @@ def update_order_in_statistics(order_id, add_name=False, add_plus=False, add_can
                 if add_name and NAME not in stripped:
                     stripped += f" {NAME}"
 
-                # ===== добавляем + =====
-                if add_plus and "+" not in stripped:
+                # ===== ручное фото =====
+                if manual_plus and "(+)" not in stripped:
+                    stripped += " (+)"
+
+                # ===== автоматическое фото =====
+                elif add_plus and "+" not in stripped and "(+)" not in stripped:
                     stripped += " +"
                 
                 # ===== добавляем Cancelled =====
@@ -1059,6 +1100,8 @@ def cancel_order_manual():
         return
 
     order_id = f"#{order}"
+    
+    status = get_order_status(order_id)
 
     success = update_order_in_statistics(
     order_id,
@@ -1066,15 +1109,26 @@ def cancel_order_manual():
 )
 
     if success:
-        Printer(f"XXX {order_id} Cancelled")
-        send(DISPLAY, f"XXX {order_id} Cancelled")
+
+        # ===== already completed =====
+        if status == "completed":
+
+            Printer(f"XXX Completed order cancelled {order_id}")
+            send(DISPLAY, f"XXX Completed order cancelled {order_id}")
+
+        else:
+
+            Printer(f"XXX {order_id} Cancelled")
+            send(DISPLAY, f"XXX {order_id} Cancelled")
+
     else:
+
         Printer(f"XXX Active order not found {order_id}")
         send(DISPLAY, f"XXX Active order not found {order_id}")
 
 
 
-def is_order_cancelled(order_id):
+def get_order_status(order_id):
 
     today = datetime.datetime.now().strftime("%d.%m.%Y")
 
@@ -1084,7 +1138,7 @@ def is_order_cancelled(order_id):
     )
 
     if not os.path.exists(stat_file):
-        return False
+        return "not_found"
 
     try:
 
@@ -1096,13 +1150,28 @@ def is_order_cancelled(order_id):
 
                 if stripped.startswith(order_id):
 
-                    if "Cancelled" not in stripped:
-                        return False
+                    has_cancelled = "Cancelled" in stripped
+                    has_completed = "+" in stripped or "(+)" in stripped
 
-        return True
+                    # ===== completed + cancelled =====
+                    if has_cancelled and has_completed:
+                        return "completed_cancelled"
+
+                    # ===== cancelled =====
+                    if has_cancelled:
+                        return "cancelled"
+
+                    # ===== completed =====
+                    if has_completed:
+                        return "completed"
+
+                    # ===== active =====
+                    return "active"
+
+        return "not_found"
 
     except:
-        return False
+        return "not_found"
 
 
 
@@ -1152,14 +1221,15 @@ def save_photo(order_id, frame, manually=False):
         
     update_order_in_statistics(
         order_id,
-        add_plus=True
+        add_plus=not manually,
+        manual_plus=manually
     )
 
     # ==== считаем количество уникальных заказов в статистике ====
     global completed_orders
 
-    name_folder = os.path.join(STATISTICS, NAME)
-    date_filename = datetime.datetime.now().strftime("%Y-%m-%d") + ".txt"
+    name_folder = os.path.join(STATISTICS)
+    date_filename = datetime.datetime.now().strftime("%d.%m.%Y") + ".txt"
     stat_file = os.path.join(name_folder, date_filename)
 
     # если файла нет – завершённых заказов 0
