@@ -185,16 +185,17 @@ SCAN_PORT = CONFIG["SCAN_PORT"]
 DISPLAY_PORT = CONFIG["DISPLAY_PORT"]
 OLDER = CONFIG["OLDER"]
 REMOVE_ITEMS = CONFIG["REMOVE_ITEMS"]
+REMOVE_PHRASES = CONFIG["REMOVE_PHRASES"]
 
 with open("PRODUCTS.json", "r", encoding="utf-8") as f:
-    CONFIG = json.load(f)
+    PRODUCTS_CONFIG  = json.load(f)
 
-REMOVE_PHRASES = CONFIG["REMOVE_PHRASES"]
-FEM_BONUS = CONFIG["FEM_BONUS"]
-AUTO_BONUS = CONFIG["AUTO_BONUS"]
-OTHER_BONUS = CONFIG["OTHER_BONUS"]
 
-PRODUCTS = CONFIG["PRODUCTS"]
+FEM_BONUS = PRODUCTS_CONFIG ["FEM_BONUS"]
+AUTO_BONUS = PRODUCTS_CONFIG ["AUTO_BONUS"]
+OTHER_BONUS = PRODUCTS_CONFIG ["OTHER_BONUS"]
+
+PRODUCTS = PRODUCTS_CONFIG ["PRODUCTS"]
 
 
 DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -204,7 +205,7 @@ STATISTICS = os.path.join(DESKTOP, "Statistik")
 SCAN_INTERVAL = 0.2
 scale = 0.15
 
-AUTO_COMPLETE_ITEMS = CONFIG["AUTO_COMPLETE_ITEMS"]
+AUTO_COMPLETE_ITEMS = PRODUCTS_CONFIG ["AUTO_COMPLETE_ITEMS"]
 
 def Printer(text):
     global STATUS_LINES
@@ -505,26 +506,17 @@ def parse_orders(previous=False):
 
         parsed[oid] = list(agg.items())
 
-    filtered_items = []
+    for oid, items in parsed.items():
 
-    for name, qty in items:
+        filtered_items = [
+            (name, qty)
+            for name, qty in items
+            if not any(remove in name for remove in REMOVE_ITEMS)
+        ]
 
-        # проверяем список исключений
-        skip = False
+        filtered_items.sort(key=sort_key)
 
-        for remove_text in REMOVE_ITEMS:
-
-            if remove_text in name:
-                skip = True
-                break
-
-        if not skip:
-            filtered_items.append((name, qty))
-
-    # сортировка позиций
-    filtered_items.sort(key=sort_key)
-
-    parsed[oid] = filtered_items
+        parsed[oid] = filtered_items
         
     # сохраняем информацию о Part
     save_part_to_statistics(latest, parsed)
