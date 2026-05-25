@@ -1420,7 +1420,7 @@ if __name__ == "__main__":
     keyboard.add_hotkey("F1", start_worker2)
 
     try:
-        main()
+        main("Worker1_settings.json")
 
     except Exception as e:
         import traceback
