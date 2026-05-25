@@ -38,6 +38,8 @@ REQUIRED_PACKAGES = [
     ("send2trash", "send2trash"),
     ("numpy", "numpy"),
     ("requests", "requests"),
+    ("keyboard", "keyboard"),
+    ("portalocker", "portalocker"),
 
 ]
 
@@ -61,6 +63,9 @@ from send2trash import send2trash
 import datetime
 import numpy as np
 import requests
+import multiprocessing
+import keyboard
+import portalocker
 
 
 
@@ -70,7 +75,7 @@ import requests
 
 
 
-CURRENT_VERSION = "1.1"
+CURRENT_VERSION = "1.2"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -174,28 +179,19 @@ current_py = os.path.basename(__file__)
 base_name = os.path.splitext(current_py)[0]
 settings_file = f"{base_name}_settings.json"
 
-with open(settings_file, "r", encoding="utf-8") as f:
-    CONFIG = json.load(f)
-
-NAME = CONFIG["NAME"]
-CAMERA_ID = CONFIG["CAMERA_ID"]
-FOCUS = CONFIG["FOCUS"]
-PHOTO_DELAY = CONFIG["PHOTO_DELAY"]
-SCAN_PORT = CONFIG["SCAN_PORT"]
-DISPLAY_PORT = CONFIG["DISPLAY_PORT"]
-OLDER = CONFIG["OLDER"]
-REMOVE_ITEMS = CONFIG["REMOVE_ITEMS"]
-REMOVE_PHRASES = CONFIG["REMOVE_PHRASES"]
-
 with open("PRODUCTS.json", "r", encoding="utf-8") as f:
     PRODUCTS_CONFIG  = json.load(f)
 
 
-FEM_BONUS = PRODUCTS_CONFIG ["FEM_BONUS"]
-AUTO_BONUS = PRODUCTS_CONFIG ["AUTO_BONUS"]
-OTHER_BONUS = PRODUCTS_CONFIG ["OTHER_BONUS"]
+FEM_BONUS = PRODUCTS_CONFIG["FEM_BONUS"]
+AUTO_BONUS = PRODUCTS_CONFIG["AUTO_BONUS"]
+OTHER_BONUS = PRODUCTS_CONFIG["OTHER_BONUS"]
+REMOVE_ITEMS = PRODUCTS_CONFIG["REMOVE_ITEMS"]
+REMOVE_PHRASES = PRODUCTS_CONFIG["REMOVE_PHRASES"]
+PRODUCTS = PRODUCTS_CONFIG["PRODUCTS"]
 
-PRODUCTS = PRODUCTS_CONFIG ["PRODUCTS"]
+worker2_started = False
+worker2_process = None
 
 
 DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -237,20 +233,6 @@ def wait_for_serial(port, baudrate, timeout, name):
         except serial.SerialException:
             print(f"XXX {name} not connected ({port}). Please connect...")
             time.sleep(1)
-
-SCAN = wait_for_serial(
-    port=SCAN_PORT,
-    baudrate=9600,
-    timeout=0.1,
-    name="Scanner"
-)
-
-DISPLAY = wait_for_serial(
-    port=DISPLAY_PORT,
-    baudrate=230400,
-    timeout=0,
-    name="Display"
-)
 
 
 
@@ -446,25 +428,24 @@ def save_part_to_statistics(pdf_path, parsed_orders):
             pass
 
     # читаем содержимое
-    with open(stat_file, "r", encoding="utf-8") as f:
-        content = f.read()
+    content = read_stat_lines(stat_file)
 
     # если такая part уже записана
     if header in content:
         return
 
     # добавляем новую запись
-    with open(stat_file, "a", encoding="utf-8") as f:
+    lines_to_add = [header + "\n"]
 
-        f.write(header + "\n")
+    for order_id in parsed_orders.keys():
+        lines_to_add.append(order_id + "\n")
 
-        for order_id in parsed_orders.keys():
-            f.write(order_id + "\n")
+    lines_to_add.append("\n")
 
-        f.write("\n")
+    append_stat_lines(stat_file, lines_to_add)
 
 
-def parse_orders(previous=False):
+def parse_orders(worker, previous=False):
 
     latest, part = find_latest_pdf(previous)
 
@@ -473,19 +454,19 @@ def parse_orders(previous=False):
         message = "XXX Orders PDF not found. Check Downloads folder"
 
         Printer(message)
-        send(DISPLAY, message)
+        send(worker["DISPLAY"], message)
 
         return {}
 
     Printer(f"*Update PDF | Part {part}")
-    send(DISPLAY, f"*Update PDF | Part {part}")
+    send(worker["DISPLAY"], f"*Update PDF | Part {part}")
 
     with pdfplumber.open(latest) as pdf:
         pages = [page.extract_text() or "" for page in pdf.pages]
 
     text = "\n".join(pages).replace('\r', '\n')
 
-    for p in REMOVE_PHRASES:
+    for p in worker["REMOVE_PHRASES"]:
         text = text.replace(p, "")
     
     text = re.sub(r"\S*1ZR\S*(?=[☐\s-])", "", text)
@@ -516,7 +497,7 @@ def parse_orders(previous=False):
         filtered_items = [
             (name, qty)
             for name, qty in items
-            if not any(remove in name for remove in REMOVE_ITEMS)
+            if not any(remove in name for remove in worker["REMOVE_ITEMS"])
         ]
 
         filtered_items.sort(key=sort_key)
@@ -568,7 +549,59 @@ def find_original_item(order_items, scanned_name):
             return item_name, qty
 
     return None, None
+
+
+def load_config(settings_file):
+
+    with open(settings_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def read_stat_lines(stat_file):
+
+    try:
+
+        with portalocker.Lock(
+            stat_file,
+            mode="r",
+            encoding="utf-8",
+            timeout=10
+        ) as f:
+
+            return f.readlines()
+
+    except:
+        return []
+    
+    
+def write_stat_file(stat_file, lines):
+
+    with portalocker.Lock(
+        stat_file,
+        mode="r+",
+        encoding="utf-8",
+        timeout=10
+    ) as f:
+
+        f.seek(0)
+        f.truncate()
+
+        f.writelines(lines)
+
+        f.flush()
         
+
+def append_stat_lines(stat_file, lines_to_add):
+
+    with portalocker.Lock(
+        stat_file,
+        mode="a",
+        encoding="utf-8",
+        timeout=10
+    ) as f:
+
+        f.writelines(lines_to_add)
+
+        f.flush()
         
 
 
@@ -590,18 +623,54 @@ def find_original_item(order_items, scanned_name):
 
 
 
-def main():
+def main(settings_file):
     os.makedirs(FOTO, exist_ok=True)
     os.makedirs(STATISTICS, exist_ok=True)
     
     today = datetime.datetime.now().day
-
+            
+    CONFIG = load_config(settings_file)
+    
+    NAME = CONFIG["NAME"]
+    CAMERA_ID = CONFIG["CAMERA_ID"]
+    FOCUS = CONFIG["FOCUS"]
+    PHOTO_DELAY = CONFIG["PHOTO_DELAY"]
+    SCAN_PORT = CONFIG["SCAN_PORT"]
+    DISPLAY_PORT = CONFIG["DISPLAY_PORT"]
+    OLDER = CONFIG["OLDER"]
+    
     if today == 5:
         if OLDER > 0:
             cleanup_old_photos(FOTO, OLDER)
+    
+    SCAN = wait_for_serial(
+        port=SCAN_PORT,
+        baudrate=9600,
+        timeout=0.1,
+        name="Scanner"
+    )
+
+    DISPLAY = wait_for_serial(
+        port=DISPLAY_PORT,
+        baudrate=230400,
+        timeout=0,
+        name="Display"
+    )
+    
+    worker = {
+        "NAME": NAME,
+        "CAMERA_ID": CAMERA_ID,
+        "FOCUS": FOCUS,
+        "PHOTO_DELAY": PHOTO_DELAY,
+        "DISPLAY": DISPLAY,
+        "SCAN": SCAN,
+        "FOTO": FOTO,
+        "STATISTICS": STATISTICS,
+        "REMOVE_ITEMS": REMOVE_ITEMS
+    }
 
 
-    orders = parse_orders()
+    orders = parse_orders(worker)
     if not orders:
         return
     cap = cv2.VideoCapture(CAMERA_ID, cv2.CAP_DSHOW)
@@ -651,27 +720,37 @@ def main():
         if now - last_scan_time >= SCAN_INTERVAL:
             last_scan_time = now
             try:
-                if SCAN.in_waiting:
-                    code = SCAN.readline().decode('utf-8', errors='ignore').strip()
+                if worker["SCAN"].in_waiting:
+                    code = worker["SCAN"].readline().decode('utf-8', errors='ignore').strip()
                     if code:
 
-                        current_order, photo_pending, photo_start = process_scan(
+                        current_order, photo_pending, photo_start = process_scan(worker, 
                             code, orders, current_order, counts, extras, errors, no_barcode_items,
-                            Printer, lambda msg: send(DISPLAY, msg),
+                            Printer, lambda msg: send(worker["DISPLAY"], msg),
                             photo_pending, photo_start
                         )
             except Exception as e:
                 print(f"[Ошибка чтения сканера]: {e}")
 
         if photo_pending and (time.time() - photo_start >= PHOTO_DELAY):
-            save_photo(current_order, frame)
+            save_photo(worker, current_order, frame)
             photo_pending = False
 
         key = cv2.waitKey(1)
         if key == 27:
+
+            global worker2_started
+            global worker2_process
+
+            if worker2_process is not None:
+                worker2_process.terminate()
+                worker2_process = None
+
+            worker2_started = False
+
             break
         elif key == ord('x') and current_order:
-            save_photo(current_order, frame)
+            save_photo(worker, current_order, frame)
             Printer("\n*Photo taken (manual)")
             photo_pending = False
 
@@ -681,21 +760,22 @@ def main():
 
             t = threading.Thread(
                 target=manual_photo_with_order,
-                args=(frame_copy,),
+                args=(worker, frame_copy),
                 daemon=True
             )
             t.start()
             
         elif key == ord('u'):
-            orders = parse_orders()
+            orders = parse_orders(worker)
         elif key == ord('U'):
-            orders = parse_orders(previous=True)
+            orders = parse_orders(worker, previous=True)
         elif key == ord('r'):
             check_for_updates()
         elif key == ord('c'):
 
             t = threading.Thread(
                 target=cancel_order_manual,
+                args=(worker,),
                 daemon=True
             )
 
@@ -703,10 +783,10 @@ def main():
             
 
         try:
-            if DISPLAY.in_waiting > 0:
-                message = DISPLAY.read(DISPLAY.in_waiting).decode(errors='ignore').strip()
+            if worker["DISPLAY"].in_waiting > 0:
+                message = worker["DISPLAY"].read(worker["DISPLAY"].in_waiting).decode(errors='ignore').strip()
                 if "x" in message and current_order:
-                    save_photo(current_order, frame, manually=True)
+                    save_photo(worker, current_order, frame, manually=True)
                     # Printer("\n*Photo taken (manual display)")
                     photo_pending = False
                 if "e" in message:
@@ -715,7 +795,7 @@ def main():
 
                     t = threading.Thread(
                         target=manual_photo_with_order,
-                        args=(frame_copy,),
+                        args=(worker, frame_copy),
                         daemon=True
                     )
                     t.start()
@@ -753,7 +833,7 @@ def main():
 
 
 
-def process_scan(code, orders, current_order, counts, extras, errors, no_barcode_items, print_fn, send_fn, photo_pending, photo_start):
+def process_scan(worker, code, orders, current_order, counts, extras, errors, no_barcode_items, print_fn, send_fn, photo_pending, photo_start):
     
     if not orders:
 
@@ -822,6 +902,7 @@ def process_scan(code, orders, current_order, counts, extras, errors, no_barcode
 
 
         update_order_in_statistics(
+            worker,
             current_order,
             add_name=True
         )
@@ -1028,7 +1109,7 @@ def order_ready(items, counts, extras, errors, no_barcode_items):
                 return False
     return True
 
-def update_order_in_statistics(order_id, add_name=False, add_plus=False, add_cancelled=False, manual_plus=False):
+def update_order_in_statistics(worker, order_id, add_name=False, add_plus=False, add_cancelled=False, manual_plus=False):
     
     updated = False
 
@@ -1044,8 +1125,7 @@ def update_order_in_statistics(order_id, add_name=False, add_plus=False, add_can
 
     try:
 
-        with open(stat_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        lines = read_stat_lines(stat_file)
 
         updated_lines = []
 
@@ -1063,8 +1143,8 @@ def update_order_in_statistics(order_id, add_name=False, add_plus=False, add_can
                     continue
 
                 # ===== добавляем NAME =====
-                if add_name and NAME not in stripped:
-                    stripped += f" {NAME}"
+                if add_name and worker["NAME"] not in stripped:
+                    stripped += f" {worker['NAME']}"
 
                 # ===== ручное фото =====
                 if manual_plus and "(+)" not in stripped:
@@ -1083,15 +1163,14 @@ def update_order_in_statistics(order_id, add_name=False, add_plus=False, add_can
 
             updated_lines.append(line)
 
-        with open(stat_file, "w", encoding="utf-8") as f:
-            f.writelines(updated_lines)
+        write_stat_file(stat_file, updated_lines)
 
     except Exception as e:
         Printer(f"XXX Statistics update error: {e}")
         
     return updated
         
-def cancel_order_manual():
+def cancel_order_manual(worker):
 
     order = input("Enter cancelled order number: #").strip()
 
@@ -1104,9 +1183,10 @@ def cancel_order_manual():
     status = get_order_status(order_id)
 
     success = update_order_in_statistics(
-    order_id,
-    add_cancelled=True
-)
+        worker,
+        order_id,
+        add_cancelled=True
+    )
 
     if success:
 
@@ -1114,17 +1194,17 @@ def cancel_order_manual():
         if status == "completed":
 
             Printer(f"XXX Completed order cancelled {order_id}")
-            send(DISPLAY, f"XXX Completed order cancelled {order_id}")
+            send(worker["DISPLAY"], f"XXX Completed order cancelled {order_id}")
 
         else:
 
             Printer(f"XXX {order_id} Cancelled")
-            send(DISPLAY, f"XXX {order_id} Cancelled")
+            send(worker["DISPLAY"], f"XXX {order_id} Cancelled")
 
     else:
 
         Printer(f"XXX Active order not found {order_id}")
-        send(DISPLAY, f"XXX Active order not found {order_id}")
+        send(worker["DISPLAY"], f"XXX Active order not found {order_id}")
 
 
 
@@ -1142,31 +1222,31 @@ def get_order_status(order_id):
 
     try:
 
-        with open(stat_file, "r", encoding="utf-8") as f:
+        lines = read_stat_lines(stat_file)
 
-            for line in f:
+        for line in lines:
 
-                stripped = line.strip()
+            stripped = line.strip()
 
-                if stripped.startswith(order_id):
+            if stripped.startswith(order_id):
 
-                    has_cancelled = "Cancelled" in stripped
-                    has_completed = "+" in stripped or "(+)" in stripped
+                has_cancelled = "Cancelled" in stripped
+                has_completed = "+" in stripped or "(+)" in stripped
 
-                    # ===== completed + cancelled =====
-                    if has_cancelled and has_completed:
-                        return "completed_cancelled"
+                # ===== completed + cancelled =====
+                if has_cancelled and has_completed:
+                    return "completed_cancelled"
 
-                    # ===== cancelled =====
-                    if has_cancelled:
-                        return "cancelled"
+                # ===== cancelled =====
+                if has_cancelled:
+                    return "cancelled"
 
-                    # ===== completed =====
-                    if has_completed:
-                        return "completed"
+                # ===== completed =====
+                if has_completed:
+                    return "completed"
 
-                    # ===== active =====
-                    return "active"
+                # ===== active =====
+                return "active"
 
         return "not_found"
 
@@ -1176,7 +1256,7 @@ def get_order_status(order_id):
 
 
 completed_orders = 0
-def save_photo(order_id, frame, manually=False):
+def save_photo(worker, order_id, frame, manually=False):
 
     if not order_id or frame is None:
         return
@@ -1194,7 +1274,7 @@ def save_photo(order_id, frame, manually=False):
         else:
             filename = f"{order_id}_{photo_number}.jpg"
 
-        path = os.path.join(FOTO, filename)
+        path = os.path.join(worker["FOTO"], filename)
 
         if not os.path.exists(path):
             break
@@ -1216,10 +1296,11 @@ def save_photo(order_id, frame, manually=False):
     else:
         message = f"* {filename} * Photo saved"
 
-    send(DISPLAY, message)
+    send(worker["DISPLAY"], message)
     Printer(message)
         
     update_order_in_statistics(
+        worker,
         order_id,
         add_plus=not manually,
         manual_plus=manually
@@ -1241,26 +1322,26 @@ def save_photo(order_id, frame, manually=False):
 
     try:
 
-        with open(stat_file, 'r', encoding='utf-8') as f:
+        lines = read_stat_lines(stat_file)
 
-            for line in f:
+        for line in lines:
 
-                stripped = line.strip()
+            stripped = line.strip()
 
-                # считаем только:
-                # заказ + NAME + +
-                if (
-                    stripped.startswith("#")
-                    and NAME in stripped
-                    and "+" in stripped
-                ):
-                    completed_orders += 1
+            # считаем только:
+            # заказ + NAME + +
+            if (
+                stripped.startswith("#")
+                and worker["NAME"] in stripped
+                and "+" in stripped
+            ):
+                completed_orders += 1
 
     except:
         pass
 
 
-def manual_photo_with_order(frame):
+def manual_photo_with_order(worker, frame):
     order = input("Enter order number: #").strip()
 
     if not order.isdigit():
@@ -1268,7 +1349,7 @@ def manual_photo_with_order(frame):
         return
 
     order_id = f"#{order}"
-    save_photo(order_id, frame)
+    save_photo(worker, order_id, frame)
 
 
 def draw_error_flash(frame):
@@ -1309,7 +1390,39 @@ def draw_error_flash(frame):
     # Смешиваем с прозрачностью
     return cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
 
+
+
+def start_worker2():
+
+    global worker2_started
+    global worker2_process
+
+    if worker2_started:
+        Printer("XXX Worker2 already started")
+        return
+
+    worker2_process = multiprocessing.Process(
+        target=main,
+        args=("Worker2_settings.json",)
+    )
+
+    worker2_process.start()
+
+    worker2_started = True
+
+    Printer("* Worker2 started")
+
         
+keyboard.add_hotkey("F1", start_worker2)
 
 if __name__ == "__main__":
-    main()
+
+    keyboard.add_hotkey("F1", start_worker2)
+
+    try:
+        main()
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        input("ERROR. Press Enter...")
