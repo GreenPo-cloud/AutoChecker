@@ -75,7 +75,7 @@ import portalocker
 
 
 
-CURRENT_VERSION = "1.2"
+CURRENT_VERSION = "1.3"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -422,27 +422,43 @@ def save_part_to_statistics(pdf_path, parsed_orders):
 
     header = f"----------{pdf_name}----------"
 
-    # если файла нет — создаём
+    # создаем файл если нет
     if not os.path.exists(stat_file):
-        with open(stat_file, "w", encoding="utf-8") as f:
-            pass
+        open(stat_file, "w", encoding="utf-8").close()
 
-    # читаем содержимое
-    content = read_stat_lines(stat_file)
+    try:
 
-    # если такая part уже записана
-    if header in content:
-        return
+        with portalocker.Lock(
+            stat_file,
+            mode="r+",
+            encoding="utf-8",
+            timeout=10
+        ) as f:
 
-    # добавляем новую запись
-    lines_to_add = [header + "\n"]
+            # читаем содержимое
+            content = f.read()
 
-    for order_id in parsed_orders.keys():
-        lines_to_add.append(order_id + "\n")
+            headers = content.splitlines()
 
-    lines_to_add.append("\n")
+            if header in headers:
+                return
 
-    append_stat_lines(stat_file, lines_to_add)
+            # переходим в конец файла
+            f.seek(0, os.SEEK_END)
+
+            # записываем block
+            f.write(header + "\n")
+
+            for order_id in parsed_orders.keys():
+                f.write(order_id + "\n")
+
+            f.write("\n")
+
+            f.flush()
+
+    except Exception as e:
+
+        Printer(f"XXX Statistics write error: {e}")
 
 
 def parse_orders(worker, previous=False):
@@ -466,7 +482,7 @@ def parse_orders(worker, previous=False):
 
     text = "\n".join(pages).replace('\r', '\n')
 
-    for p in worker["REMOVE_PHRASES"]:
+    for p in REMOVE_PHRASES:
         text = text.replace(p, "")
     
     text = re.sub(r"\S*1ZR\S*(?=[☐\s-])", "", text)
@@ -497,7 +513,7 @@ def parse_orders(worker, previous=False):
         filtered_items = [
             (name, qty)
             for name, qty in items
-            if not any(remove in name for remove in worker["REMOVE_ITEMS"])
+            if not any(remove in name for remove in REMOVE_ITEMS)
         ]
 
         filtered_items.sort(key=sort_key)
@@ -1403,7 +1419,7 @@ def start_worker2():
 
     worker2_process = multiprocessing.Process(
         target=main,
-        args=("Worker2_settings.json",)
+        args=("Worker2_settings.json")
     )
 
     worker2_process.start()
@@ -1413,7 +1429,7 @@ def start_worker2():
     Printer("* Worker2 started")
 
         
-keyboard.add_hotkey("F1", start_worker2)
+# keyboard.add_hotkey("F1", start_worker2)
 
 if __name__ == "__main__":
 
