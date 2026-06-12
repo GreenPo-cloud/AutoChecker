@@ -77,7 +77,7 @@ from serial.tools import list_ports
 
 
 
-CURRENT_VERSION = "1.4"
+CURRENT_VERSION = "1.5"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -253,6 +253,8 @@ def get_line_color(line):
         return (134, 134, 255)   # pink
     elif "Stickers" in line:
         return (246, 255, 107)   # light blue
+    elif "Pins" in line:
+        return (255, 0, 0)   # light blue
     elif line.startswith("?"):
         return (0, 255, 255)     # yellow
     elif line.startswith("*"):
