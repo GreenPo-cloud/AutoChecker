@@ -1,11 +1,10 @@
 {
     "NAME": "NoNaMe",
 
-    "CAMERA_ID": 1,
+    "CAMERA_ID": 0,
     "FOCUS": 360,
     "PHOTO_DELAY": 1.5,
-    "SCAN_PORT": "COM3",
-    "DISPLAY_PORT": "COM8",
-    "OLDER": 12,
+    "DISPLAY_NAME": "Ricardo",
+    "OLDER": 12
 
 }

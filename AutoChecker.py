@@ -66,6 +66,8 @@ import requests
 import multiprocessing
 import keyboard
 import portalocker
+from pathlib import Path
+from serial.tools import list_ports
 
 
 
@@ -75,7 +77,7 @@ import portalocker
 
 
 
-CURRENT_VERSION = "1.3"
+CURRENT_VERSION = "1.4"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -179,8 +181,12 @@ current_py = os.path.basename(__file__)
 base_name = os.path.splitext(current_py)[0]
 settings_file = f"{base_name}_settings.json"
 
-with open("PRODUCTS.json", "r", encoding="utf-8") as f:
-    PRODUCTS_CONFIG  = json.load(f)
+BASE_DIR = Path(__file__).parent
+
+PRODUCTS_json_file = BASE_DIR / "PRODUCTS.json"
+
+with open(PRODUCTS_json_file, "r", encoding="utf-8") as f:
+    PRODUCTS_CONFIG = json.load(f)
 
 
 FEM_BONUS = PRODUCTS_CONFIG["FEM_BONUS"]
@@ -189,6 +195,7 @@ OTHER_BONUS = PRODUCTS_CONFIG["OTHER_BONUS"]
 REMOVE_ITEMS = PRODUCTS_CONFIG["REMOVE_ITEMS"]
 REMOVE_PHRASES = PRODUCTS_CONFIG["REMOVE_PHRASES"]
 PRODUCTS = PRODUCTS_CONFIG["PRODUCTS"]
+AUTO_COMPLETE_ITEMS = PRODUCTS_CONFIG ["AUTO_COMPLETE_ITEMS"]
 
 worker2_started = False
 worker2_process = None
@@ -200,8 +207,6 @@ FOTO = os.path.join(DESKTOP, "Foto")
 STATISTICS = os.path.join(DESKTOP, "Statistik")
 SCAN_INTERVAL = 0.2
 scale = 0.15
-
-AUTO_COMPLETE_ITEMS = PRODUCTS_CONFIG ["AUTO_COMPLETE_ITEMS"]
 
 def Printer(text):
     global STATUS_LINES
@@ -244,6 +249,10 @@ def get_line_color(line):
         return (0, 0, 255)       # red
     elif line.startswith("+"):
         return (0, 255, 0)       # green
+    elif "Keychain" in line:
+        return (134, 134, 255)   # pink
+    elif "Stickers" in line:
+        return (246, 255, 107)   # light blue
     elif line.startswith("?"):
         return (0, 255, 255)     # yellow
     elif line.startswith("*"):
@@ -568,8 +577,9 @@ def find_original_item(order_items, scanned_name):
 
 
 def load_config(settings_file):
+    config_path = BASE_DIR / settings_file
 
-    with open(settings_file, "r", encoding="utf-8") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def read_stat_lines(stat_file):
@@ -618,6 +628,78 @@ def append_stat_lines(stat_file, lines_to_add):
         f.writelines(lines_to_add)
 
         f.flush()
+
+
+# def find_displays():
+
+#     displays = {}
+
+#     for port in list_ports.comports():
+#         try:
+
+#             ser = serial.Serial(
+#                 port.device,
+#                 115200,
+#                 timeout=0.5
+#             )
+
+#             time.sleep(0.3)
+
+#             ser.reset_input_buffer()
+
+#             ser.write(b"<WHO>\n")
+
+#             reply = ser.readline().decode().strip()
+
+#             if reply:
+
+#                 displays[reply] = port.device
+#                 print(reply)
+
+#             ser.close()
+#             print("2")
+
+#         except Exception as e:
+#             print(e)
+
+#     return displays
+
+
+# def connect_display(display_name):
+
+#     while True:
+#         print("3")
+
+#         displays = find_displays()
+#         print("4")
+
+#         if display_name in displays:
+
+#             port = displays[display_name]
+#             print("hi")
+
+#             try:
+
+#                 ser = serial.Serial(
+#                     port,
+#                     115200,
+#                     timeout=0
+#                 )
+
+#                 Printer(
+#                     f"* Display {display_name} connected on {port}"
+#                 )
+
+#                 return ser
+
+#             except:
+#                 pass
+
+#         Printer(
+#             f"XXX Display {display_name} not found"
+#         )
+
+#         time.sleep(1)
         
 
 
@@ -1419,7 +1501,7 @@ def start_worker2():
 
     worker2_process = multiprocessing.Process(
         target=main,
-        args=("Worker2_settings.json")
+        args=("Worker2_settings.json",)
     )
 
     worker2_process.start()
