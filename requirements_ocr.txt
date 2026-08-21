@@ -1,0 +1,2 @@
+PyMuPDF>=1.28,<2
+rapidocr-onnxruntime>=1.4,<2
