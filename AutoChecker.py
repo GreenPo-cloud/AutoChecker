@@ -1154,6 +1154,56 @@ def _case_insensitive_file(folder: Path, filename: str) -> Path | None:
     )
 
 
+def B2B_download_directories() -> list[Path]:
+    """Return Windows' configured Downloads folder plus safe fallbacks."""
+    candidates: list[Path] = []
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            ) as key:
+                configured, _ = winreg.QueryValueEx(
+                    key,
+                    "{374DE290-123F-4565-9164-39C4925E467B}",
+                )
+            candidates.append(
+                Path(os.path.expandvars(str(configured))).expanduser()
+            )
+        except (OSError, ValueError):
+            pass
+
+    candidates.append(Path.home() / "Downloads")
+    for variable in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        base = os.environ.get(variable)
+        if base:
+            candidates.append(Path(base) / "Downloads")
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def find_downloaded_B2B_pdf(
+    filename: str,
+    download_directories: list[Path] | None = None,
+) -> tuple[Path | None, list[Path]]:
+    """Find a B2B PDF in the configured Windows Downloads locations."""
+    directories = download_directories or B2B_download_directories()
+    for directory in directories:
+        found = _case_insensitive_file(directory, filename)
+        if found is not None:
+            return found, directories
+    return None, directories
+
+
 def prepare_B2B_order_history(
     worker: dict,
     order_id: str,
@@ -1163,11 +1213,12 @@ def prepare_B2B_order_history(
     if order_name is None:
         return None, "invalid_order"
 
-    history_dir = worker["STATISTICS"].parent / "History"
+    history_dir = worker.get(
+        "B2B_HISTORY", worker["STATISTICS"].parent / "History"
+    )
     history_dir.mkdir(parents=True, exist_ok=True)
     order_dir = history_dir / order_name
     pdf_filename = f"{order_name}.pdf"
-    downloads_dir = Path.home() / "Downloads"
 
     # Two displays may scan the same newly downloaded order nearly
     # simultaneously. Keep folder creation and moving under one lock.
@@ -1175,7 +1226,10 @@ def prepare_B2B_order_history(
     with portalocker.Lock(
         str(history_lock), mode="a+", encoding="utf-8", timeout=30
     ):
-        downloaded_pdf = _case_insensitive_file(downloads_dir, pdf_filename)
+        downloaded_pdf, checked_downloads = find_downloaded_B2B_pdf(
+            pdf_filename,
+            worker.get("DOWNLOAD_DIRECTORIES"),
+        )
         if downloaded_pdf is not None:
             order_dir.mkdir(parents=True, exist_ok=True)
             archived_pdf = order_dir / pdf_filename
@@ -1187,6 +1241,10 @@ def prepare_B2B_order_history(
             except (OSError, shutil.Error):
                 return None, "move_failed"
         else:
+            print(
+                f"? B2B PDF {pdf_filename} was not found; checked: "
+                + ", ".join(str(path) for path in checked_downloads)
+            )
             if not order_dir.is_dir():
                 return None, "unknown_order"
             archived_pdf = _case_insensitive_file(order_dir, pdf_filename)
@@ -1584,12 +1642,12 @@ def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> d
         re.IGNORECASE,
     )
     metadata_pattern = re.compile(
-        r"^(#\d+)(?=[^#]*\u2610)"
+        r"^(?![^\n]*→)(#\d+)(?=[^#]*\u2610)"
         r".*?type( STEALTH)?"
         r"\s*\n(.*?)\s*\u2610"
         r".*?(UPS|Zasilkovna|Postal)"
         r"(.*?)"
-        r"(?=^#\d+|\Z)",
+        r"(?=^(?![^\n]*→)#\d+|\Z)",
         re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
     metadata_by_order = {}
@@ -1609,7 +1667,10 @@ def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> d
     text = restore_RETAIL_wrapped_lines(text, tracking_pattern)
     for phrase in config["REMOVE_PHRASES"]:
         text = text.replace(phrase, "")
-    blocks = re.split(r"(?m)^(?!.*\u2610).*?(#\S+)", text)
+    blocks = re.split(
+        r"(?m)^(?![^\n]*[\u2610→])[^\n]*?(#\S+)",
+        text,
+    )
     contents: OrderedDict[str, str] = OrderedDict()
     for index in range(1, len(blocks), 2):
         order_id = blocks[index].strip()
@@ -1634,9 +1695,8 @@ def find_B2B_pdf(pdf_reference: str) -> Path | None:
     order_name = B2B_order_name(pdf_reference)
     if order_name is None:
         return None
-    return _case_insensitive_file(
-        Path.home() / "Downloads", f"{order_name}.pdf"
-    )
+    found, _ = find_downloaded_B2B_pdf(f"{order_name}.pdf")
+    return found
 
 
 def parse_orders_B2B(
@@ -2230,6 +2290,10 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "HAS_CAMERA": cap is not None,
             "PERFORMANCE_STATS": performance_stats,
         }
+        if identity.department.upper() == "B2B":
+            B2B_history = statistics_dir.parent / "History"
+            B2B_history.mkdir(parents=True, exist_ok=True)
+            worker["B2B_HISTORY"] = B2B_history
         # RETAIL uses the PDF order list. B2B will load its order PDF when it
         # receives Scan:<pdf filename>; it never parses a retail PDF here.
         orders = parse_orders_RETAIL(worker, config) if identity.department.upper() == "RETAIL" else {}
