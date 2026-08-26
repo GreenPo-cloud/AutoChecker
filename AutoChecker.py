@@ -96,7 +96,6 @@ import win32gui
 import win32print
 from PIL import Image, ImageWin
 from pygrabber.dshow_graph import FilterGraph
-from pdf_label_ocr import process_pending_label_pdfs
 from send2trash import send2trash
 from serial.tools import list_ports
 
@@ -121,11 +120,13 @@ OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.1"
+CURRENT_VERSION = "2.2"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/AutoChecker.py"
+
+PDF_LABEL_OCR_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/pdf_label_ocr.py"
 
 DISPLAY_VERSION_URL = (
     "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
@@ -198,31 +199,42 @@ def check_for_updates() -> None:
 
 
 def update_program() -> None:
-    """Download validated Python code and replace this file after shutdown."""
+    """Download and install one validated AutoChecker/OCR code bundle."""
     try:
-        response = requests.get(PYTHON_URL, timeout=10)
-        if response.status_code != 200:
-            print("XXX Cannot download update")
-            return
-
-        downloaded_code = response.text
-        # Never replace the running checker with an HTML/error response or
-        # otherwise invalid Python source.
-        compile(downloaded_code, PYTHON_URL, "exec")
-
         current_file = Path(__file__).resolve()
-        temp_file = Path(str(current_file) + ".new")
-        bat_path = Path(str(current_file) + ".bat")
-        temp_file.write_text(downloaded_code, encoding="utf-8")
-
-        bat_path.write_text(
-            "@echo off\n"
-            "timeout /t 2 >nul\n"
-            f'move /Y "{temp_file}" "{current_file}"\n'
-            f'start "" "{sys.executable}" "{current_file}"\n'
-            'del "%~f0"\n',
-            encoding="utf-8",
+        update_files = (
+            (current_file, PYTHON_URL),
+            (BASE_DIR / "pdf_label_ocr.py", PDF_LABEL_OCR_URL),
         )
+        downloaded_files: list[tuple[Path, str]] = []
+        for target_file, url in update_files:
+            response = requests.get(url, timeout=10)
+            if response.status_code != 200:
+                print(f"XXX Cannot download update file: {target_file.name}")
+                return
+            downloaded_code = response.text
+            # Validate the complete bundle before writing either temporary
+            # file, so incompatible partial downloads are never installed.
+            compile(downloaded_code, url, "exec")
+            downloaded_files.append((target_file, downloaded_code))
+
+        temp_files = []
+        for target_file, downloaded_code in downloaded_files:
+            temp_file = Path(str(target_file) + ".new")
+            temp_file.write_text(downloaded_code, encoding="utf-8")
+            temp_files.append((temp_file, target_file))
+
+        bat_path = Path(str(current_file) + ".bat")
+        commands = ["@echo off", "timeout /t 2 >nul"]
+        commands.extend(
+            f'move /Y "{temp_file}" "{target_file}"'
+            for temp_file, target_file in temp_files
+        )
+        commands.extend((
+            f'start "" "{sys.executable}" "{current_file}"',
+            'del "%~f0"',
+        ))
+        bat_path.write_text("\n".join(commands) + "\n", encoding="utf-8")
 
         print("* Updating program...")
         os.startfile(str(bat_path))
@@ -231,6 +243,13 @@ def update_program() -> None:
         raise
     except Exception as error:
         print(f"XXX Update failed: {error}")
+
+
+def load_label_ocr_processor():
+    """Import the OCR module lazily, after the launcher update check."""
+    from pdf_label_ocr import process_pending_label_pdfs
+
+    return process_pending_label_pdfs
 
 
 def get_latest_display_version() -> str | None:
@@ -355,6 +374,7 @@ def update_display_firmware(port: str, display_mac: str,
 def run_pending_label_ocr(department: str) -> None:
     """Create missing label JSON files in an isolated, serialized process."""
     try:
+        process_pending_label_pdfs = load_label_ocr_processor()
         # Launcher startup and NextPDF can request OCR at nearly the same time.
         # Serialize them so a label PDF is never recognized twice concurrently.
         with portalocker.Lock(
@@ -1525,6 +1545,7 @@ def current_RETAIL_UP_label_files(
 
 def prepare_RETAIL_UP_label_data() -> list[tuple[Path, Path, int]]:
     """OCR today's pending Label PDFs and return all usable JSON/PDF pairs."""
+    process_pending_label_pdfs = load_label_ocr_processor()
     today = datetime.date.today()
     with portalocker.Lock(
         str(LABEL_OCR_LOCK_FILE),
