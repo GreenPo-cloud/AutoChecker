@@ -163,18 +163,32 @@ def is_label_pdf_name(filename: str) -> bool:
     return int(match.group(2)) >= 1
 
 
-def find_pending_label_pdfs(downloads_dir: str | Path = DOWNLOADS_DIR) -> list[Path]:
+def find_pending_label_pdfs(
+    downloads_dir: str | Path = DOWNLOADS_DIR,
+    label_date: datetime.date | None = None,
+) -> list[Path]:
     """Find correctly named label PDFs which do not have sibling JSON files."""
     directory = Path(downloads_dir).expanduser().resolve()
     if not directory.is_dir():
         return []
-    pending = [
-        path
-        for path in directory.iterdir()
-        if path.is_file()
-        and is_label_pdf_name(path.name)
-        and not path.with_suffix(".json").exists()
-    ]
+    pending = []
+    for path in directory.iterdir():
+        if (
+            not path.is_file()
+            or not is_label_pdf_name(path.name)
+            or path.with_suffix(".json").exists()
+        ):
+            continue
+        match = LABEL_PDF_PATTERN.fullmatch(path.name)
+        if (
+            label_date is not None
+            and match is not None
+            and datetime.datetime.strptime(
+                match.group(1), "%d.%m.%Y"
+            ).date() != label_date
+        ):
+            continue
+        pending.append(path)
     return sorted(pending, key=lambda path: path.name.lower())
 
 
@@ -228,13 +242,14 @@ def process_label_pdf(pdf_path: str | Path) -> Path | None:
 def process_pending_label_pdfs(
     department: str,
     downloads_dir: str | Path = DOWNLOADS_DIR,
+    label_date: datetime.date | None = None,
 ) -> list[Path]:
-    """Process pending label PDFs only when the department is RETAIL."""
-    if department.strip().upper() != "RETAIL":
+    """Process pending label PDFs for RETAIL workflows."""
+    if department.strip().upper() not in {"RETAIL", "RETAIL_UP"}:
         return []
 
     created: list[Path] = []
-    for pdf_path in find_pending_label_pdfs(downloads_dir):
+    for pdf_path in find_pending_label_pdfs(downloads_dir, label_date=label_date):
         result = process_label_pdf(pdf_path)
         if result is not None:
             created.append(result)
@@ -255,8 +270,8 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        if args.department.strip().upper() != "RETAIL":
-            print("OCR этикеток пропущен: department != RETAIL")
+        if args.department.strip().upper() not in {"RETAIL", "RETAIL_UP"}:
+            print("OCR этикеток пропущен: department не RETAIL/RETAIL_UP")
             return 0
         if args.pdf is not None:
             result = process_label_pdf(args.pdf)

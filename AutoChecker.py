@@ -13,10 +13,16 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+
+
+PACKAGES_INSTALLED = False
+DEPENDENCY_RESTART_MARKER = "AUTOCHECKER_DEPENDENCIES_RESTARTED"
 
 
 def ensure_package(module_name: str, pip_name: str | None = None) -> None:
     """Install a missing third-party module for the current Python."""
+    global PACKAGES_INSTALLED
     if pip_name is None:
         pip_name = module_name
 
@@ -32,6 +38,7 @@ def ensure_package(module_name: str, pip_name: str | None = None) -> None:
             pip_name,
         ])
         print(f"{pip_name} installed")
+        PACKAGES_INSTALLED = True
 
 
 REQUIRED_PACKAGES = [
@@ -46,10 +53,25 @@ REQUIRED_PACKAGES = [
     ("pygrabber", "pygrabber"),
     ("pymupdf", "PyMuPDF>=1.28,<2"),
     ("rapidocr_onnxruntime", "rapidocr-onnxruntime>=1.4,<2"),
+    ("esptool", "esptool>=4.8,<6"),
+    ("PIL", "Pillow>=10"),
+    ("win32print", "pywin32>=306"),
 ]
 
 for required_module, required_pip_name in REQUIRED_PACKAGES:
     ensure_package(required_module, required_pip_name)
+
+if PACKAGES_INSTALLED:
+    if os.environ.get(DEPENDENCY_RESTART_MARKER) == "1":
+        raise RuntimeError(
+            "Installed packages are still unavailable after restart; "
+            "restart Python manually"
+        )
+    print("* Restarting AutoChecker after package installation")
+    os.environ[DEPENDENCY_RESTART_MARKER] = "1"
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+else:
+    os.environ.pop(DEPENDENCY_RESTART_MARKER, None)
 
 
 import json
@@ -65,8 +87,14 @@ from pathlib import Path
 
 import cv2
 import portalocker
+import pymupdf
+import pywintypes
 import requests
 import serial
+import win32con
+import win32gui
+import win32print
+from PIL import Image, ImageWin
 from pygrabber.dshow_graph import FilterGraph
 from pdf_label_ocr import process_pending_label_pdfs
 from send2trash import send2trash
@@ -99,11 +127,40 @@ VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/
 
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/AutoChecker.py"
 
+DISPLAY_VERSION_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+    "main/Display_version.txt"
+)
+DISPLAY_BUILD_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+    "main/build/esp32.esp32.esp32s3"
+)
+DISPLAY_APP_FILENAME = "Display.ino.bin"
+DISPLAY_PARTITIONS_FILENAME = "Display.ino.partitions.bin"
+DISPLAY_FLASH_BAUDRATE = 460800
+DISPLAY_UPDATE_TIMEOUT = 180
+DISPLAY_RESTART_TIMEOUT = 12.0
+RETAIL_UP_DEPARTMENT = "RETAIL_UP"
+RETAIL_UP_PRINTER_DPI = 200
+RETAIL_UP_PAPER_WIDTH_TENTHS_MM = 1016
+RETAIL_UP_PAPER_HEIGHT_TENTHS_MM = 1524
+RETAIL_UP_PRINT_SCALE = 1.0
+DEFAULT_RETAIL_UP_PRINTER = "Zebra ZP 450 200 dpi"
+EXPECTED_DISPLAY_APP_SLOTS = (
+    (0x10000, 0x140000, "app0"),
+    (0x150000, 0x140000, "app1"),
+)
+DISPLAY_HANDSHAKE_PATTERN = re.compile(
+    r"Display:([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5});([^;\s]+)",
+    re.IGNORECASE,
+)
+
 # The cursor makes repeated `previous=True` calls move backwards through all
 # PDF parts, including parts from previous days.
 PDF_HISTORY_CURSOR: Path | None = None
 OTHER_CACHE_SIGNATURE: tuple[int, int] | None = None
 OTHER_CACHE_RULES: list[tuple[str, str]] = []
+DISPLAY_FIRMWARE_CACHE: tuple[bytes, bytes] | None = None
 
 
 def _version_key(version: str) -> tuple[int, ...] | None:
@@ -174,6 +231,125 @@ def update_program() -> None:
         raise
     except Exception as error:
         print(f"XXX Update failed: {error}")
+
+
+def get_latest_display_version() -> str | None:
+    """Return the published display firmware version, or None when offline."""
+    try:
+        response = requests.get(DISPLAY_VERSION_URL, timeout=5)
+        response.raise_for_status()
+        version = response.text.strip()
+        if _version_key(version) is None:
+            print(f"XXX Invalid display update version: {version!r}")
+            return None
+        print(f"* Latest display firmware version: {version}")
+        return version
+    except requests.RequestException as error:
+        print(f"XXX Display update check failed: {error}")
+        return None
+
+
+def normalise_display_mac(value: str) -> str | None:
+    """Return a stable uppercase colon-separated ESP32 MAC address."""
+    compact = re.sub(r"[^0-9A-Fa-f]", "", value)
+    if len(compact) != 12:
+        return None
+    return ":".join(compact[index:index + 2] for index in range(0, 12, 2)).upper()
+
+
+def _download_display_firmware() -> tuple[bytes, bytes]:
+    """Download and validate the application image and its partition table once."""
+    global DISPLAY_FIRMWARE_CACHE
+    if DISPLAY_FIRMWARE_CACHE is not None:
+        return DISPLAY_FIRMWARE_CACHE
+
+    downloaded: list[bytes] = []
+    for filename in (DISPLAY_APP_FILENAME, DISPLAY_PARTITIONS_FILENAME):
+        response = requests.get(f"{DISPLAY_BUILD_URL}/{filename}", timeout=30)
+        response.raise_for_status()
+        if not response.content:
+            raise RuntimeError(f"Downloaded firmware file is empty: {filename}")
+        downloaded.append(response.content)
+
+    application, partitions = downloaded
+    if application[0] != 0xE9:
+        raise RuntimeError("Display.ino.bin is not an ESP application image")
+    if len(partitions) < 32 or partitions[:2] != b"\xAA\x50":
+        raise RuntimeError("Display partition table has an invalid format")
+
+    DISPLAY_FIRMWARE_CACHE = application, partitions
+    return DISPLAY_FIRMWARE_CACHE
+
+
+def _application_partitions(partitions: bytes) -> list[tuple[int, int, str]]:
+    """Extract application offsets and sizes from an ESP partition-table BIN."""
+    result: list[tuple[int, int, str]] = []
+    for position in range(0, len(partitions) - 31, 32):
+        entry = partitions[position:position + 32]
+        if entry[:2] != b"\xAA\x50":
+            break
+        if entry[2] != 0x00:
+            continue
+        offset = int.from_bytes(entry[4:8], "little")
+        size = int.from_bytes(entry[8:12], "little")
+        label = entry[12:28].split(b"\0", 1)[0].decode("ascii", errors="replace")
+        if offset > 0 and size > 0:
+            result.append((offset, size, label))
+    return result
+
+
+def update_display_firmware(port: str, display_mac: str,
+                            latest_version: str) -> bool:
+    """Flash the application into every app slot without erasing NVS."""
+    try:
+        application, partition_data = _download_display_firmware()
+        app_slots = _application_partitions(partition_data)
+        if not app_slots:
+            raise RuntimeError("No application slots found in partition table")
+        if tuple(app_slots) != EXPECTED_DISPLAY_APP_SLOTS:
+            raise RuntimeError(
+                "Display partition layout changed; perform one manual full flash "
+                "before enabling automatic updates"
+            )
+        oversized = [label for _, size, label in app_slots if len(application) > size]
+        if oversized:
+            raise RuntimeError(
+                "Display firmware does not fit app slot(s): " + ", ".join(oversized)
+            )
+
+        with tempfile.TemporaryDirectory(prefix="AutoChecker-display-") as temp_dir:
+            firmware_path = Path(temp_dir) / DISPLAY_APP_FILENAME
+            firmware_path.write_bytes(application)
+            command = [
+                sys.executable,
+                "-m",
+                "esptool",
+                "--chip",
+                "esp32s3",
+                "--port",
+                port,
+                "--baud",
+                str(DISPLAY_FLASH_BAUDRATE),
+                "--before",
+                "default-reset",
+                "--after",
+                "hard-reset",
+                "write-flash",
+            ]
+            for offset, _size, _label in app_slots:
+                command.extend((hex(offset), str(firmware_path)))
+
+            print(
+                f"* Updating display {display_mac} on {port} "
+                f"to firmware {latest_version}"
+            )
+            subprocess.run(command, check=True, timeout=DISPLAY_UPDATE_TIMEOUT)
+        print(f"* Display {display_mac} firmware update completed")
+        return True
+    except (requests.RequestException, OSError, subprocess.SubprocessError,
+            RuntimeError) as error:
+        print(f"XXX Display {display_mac} firmware update failed: {error}")
+        return False
 
 
 def run_pending_label_ocr(department: str) -> None:
@@ -254,12 +430,12 @@ def close_serial_safely(display) -> None:
         pass
 
 
-def update_display_last_identity(display_number: int, identity: CheckerIdentity) -> None:
+def update_display_last_identity(display_mac: str, identity: CheckerIdentity) -> None:
     """Persist the last name, department and camera selected on one display."""
     with portalocker.Lock(str(SETTINGS_FILE), mode="r+", encoding="utf-8", timeout=30) as file:
         file.seek(0)
         settings = json.load(file)
-        settings.setdefault("DISPLAY", {})[str(display_number)] = [
+        settings.setdefault("DISPLAY", {})[display_mac] = [
             identity.name,
             identity.department,
             identity.camera_number if identity.camera_number is not None else "",
@@ -428,21 +604,37 @@ def apply_other_colours(colours: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
-def ensure_detected_settings(cameras: dict[int, int], displays: dict[int, str]) -> dict:
+def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) -> dict:
     """Create default settings for every newly discovered camera/display."""
     settings = load_settings()
     focus = settings.setdefault("FOCUS", {})
     display_settings = settings.setdefault("DISPLAY", {})
     _, changed = ensure_other_slots(settings)
 
+    departments = settings.setdefault("DEPARTMENT", [])
+    if (
+        isinstance(departments, list)
+        and RETAIL_UP_DEPARTMENT not in departments
+    ):
+        departments.append(RETAIL_UP_DEPARTMENT)
+        changed = True
+
+    printers = settings.setdefault("PRINTER", {})
+    if (
+        isinstance(printers, dict)
+        and RETAIL_UP_DEPARTMENT not in printers
+    ):
+        printers[RETAIL_UP_DEPARTMENT] = [DEFAULT_RETAIL_UP_PRINTER]
+        changed = True
+
     for camera_number in cameras:
         if str(camera_number) not in focus:
             focus[str(camera_number)] = 540
             changed = True
 
-    for display_number in displays:
-        if str(display_number) not in display_settings:
-            display_settings[str(display_number)] = ["", "", ""]
+    for display_mac in displays:
+        if display_mac not in display_settings:
+            display_settings[display_mac] = ["", "", ""]
             changed = True
 
     if changed:
@@ -450,8 +642,8 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[int, str]) 
     return settings
 
 
-def identify_autochecker_display(port: str) -> int | None:
-    """Probe one newly appeared COM port and return its AutoChecker number."""
+def _probe_autochecker_display(port: str) -> tuple[str, str] | None:
+    """Ask one COM device for its MAC and firmware version."""
     display = None
     try:
         print(f"? Checking display port: {port}")
@@ -468,13 +660,39 @@ def identify_autochecker_display(port: str) -> int | None:
         display.write(b"<WHO?>\n")
         display.flush()
 
-        answer = display.readline().decode("utf-8", errors="ignore").strip()
-        match = re.fullmatch(r"AutoChecker\s+(\d+)", answer, re.IGNORECASE)
-        if match:
-            display_number = int(match.group(1))
-            print(f"* Display found: AutoChecker {display_number} ({port})")
-            return display_number
-        print(f"? {port} replied: {answer!r}")
+        deadline = time.monotonic() + HANDSHAKE_TIMEOUT
+        answers: list[str] = []
+        while time.monotonic() < deadline:
+            answer = display.readline().decode("utf-8", errors="ignore").strip()
+            if not answer:
+                continue
+            answers.append(answer)
+            match = DISPLAY_HANDSHAKE_PATTERN.fullmatch(answer)
+            if match:
+                display_mac = normalise_display_mac(match.group(1))
+                if display_mac is None:
+                    break
+                version = match.group(2).strip()
+                if _version_key(version) is None:
+                    print(f"XXX {port} returned invalid firmware version: {version!r}")
+                    return None
+                print(
+                    f"* Display found: {display_mac} ({port}), firmware {version}"
+                )
+                return display_mac, version
+
+            legacy = re.fullmatch(r"AutoChecker\s+(\d+)", answer, re.IGNORECASE)
+            if legacy:
+                print(
+                    f"XXX Display on {port} uses the old AutoChecker "
+                    f"{legacy.group(1)} handshake; flash firmware that replies "
+                    "Display:{MAC};{version}"
+                )
+                return None
+        if answers:
+            print(f"? {port} replied: {answers[-1]!r}")
+        else:
+            print(f"? {port} did not answer <WHO?>")
     except (serial.SerialException, OSError) as error:
         print(f"? Cannot check {port}: {error}")
     finally:
@@ -482,13 +700,67 @@ def identify_autochecker_display(port: str) -> int | None:
     return None
 
 
-def find_autochecker_displays() -> dict[int, str]:
-    """Return {display number: COM port} from the <WHO?> display handshake."""
-    displays: dict[int, str] = {}
+def identify_autochecker_display(port: str,
+                                 latest_version: str | None) -> str | None:
+    """Identify a display, update old firmware, and return its stable MAC."""
+    identity = _probe_autochecker_display(port)
+    if identity is None:
+        return None
+
+    display_mac, installed_version = identity
+    installed_key = _version_key(installed_version)
+    latest_key = _version_key(latest_version) if latest_version is not None else None
+    if (
+        installed_key is not None
+        and latest_key is not None
+        and latest_key > installed_key
+    ):
+        if update_display_firmware(port, display_mac, latest_version):
+            # esptool resets the board. Confirm both its identity and the version
+            # before the launcher hands the port to normal serial processing.
+            deadline = time.monotonic() + DISPLAY_RESTART_TIMEOUT
+            updated_identity = None
+            while time.monotonic() < deadline and updated_identity is None:
+                try:
+                    updated_identity = _probe_autochecker_display(port)
+                except Exception:
+                    updated_identity = None
+                if updated_identity is None:
+                    time.sleep(0.5)
+            if updated_identity is None:
+                print(
+                    f"XXX Display {display_mac} did not answer after firmware update"
+                )
+                return None
+            updated_mac, updated_version = updated_identity
+            if updated_mac != display_mac:
+                print(
+                    f"XXX Display MAC changed after update: "
+                    f"{display_mac} -> {updated_mac}"
+                )
+                return None
+            if _version_key(updated_version) < latest_key:
+                print(
+                    f"XXX Display {display_mac} still reports firmware "
+                    f"{updated_version}; expected {latest_version}"
+                )
+            else:
+                print(
+                    f"* Display {display_mac} now uses firmware {updated_version}"
+                )
+    return display_mac
+
+
+def find_autochecker_displays(latest_version: str | None) -> dict[str, str]:
+    """Return {display MAC: COM port} from the <WHO?> handshake."""
+    displays: dict[str, str] = {}
     for port_info in list_ports.comports():
-        display_number = identify_autochecker_display(port_info.device)
-        if display_number is not None:
-            displays[display_number] = port_info.device
+        display_mac = identify_autochecker_display(
+            port_info.device,
+            latest_version,
+        )
+        if display_mac is not None:
+            displays[display_mac] = port_info.device
     return displays
 
 
@@ -519,10 +791,10 @@ def _prioritise(values: list, preferred) -> list:
     return values
 
 
-def upload_display_data(display: serial.Serial, display_number: int, settings: dict,
+def upload_display_data(display: serial.Serial, display_mac: str, settings: dict,
                         cameras: dict[int, int]) -> None:
     """Upload menu options, placing the display's last selection first."""
-    last_values = settings.get("DISPLAY", {}).get(str(display_number), ["", "", ""])
+    last_values = settings.get("DISPLAY", {}).get(display_mac, ["", "", ""])
     last_values = (list(last_values) + ["", "", ""])[:3]
     names = _prioritise(list(settings.get("NAME", [])), last_values[0])
     departments = _prioritise(list(settings.get("DEPARTMENT", [])), last_values[1])
@@ -558,19 +830,50 @@ def upload_display_data(display: serial.Serial, display_number: int, settings: d
     display.flush()
 
 
-def broadcast_display_data(settings: dict, cameras: dict[int, int],
-                           idle_displays: dict[int, serial.Serial],
-                           worker_update_queues: dict[int, multiprocessing.Queue]) -> None:
-    """Refresh every idle display and ask every worker to refresh its own display."""
+def cameras_available_for_selection(
+        cameras: dict[int, int],
+        worker_identities: dict[str, CheckerIdentity],
+) -> dict[int, int]:
+    """Exclude cameras currently owned by running checker processes."""
+    reserved = {
+        identity.camera_number
+        for identity in worker_identities.values()
+        if identity.camera_number is not None
+    }
+    return {
+        camera_number: camera_id
+        for camera_number, camera_id in cameras.items()
+        if camera_number not in reserved
+    }
+
+
+def refresh_idle_display_data(settings: dict, cameras: dict[int, int],
+                              idle_displays: dict[str, serial.Serial]) -> None:
+    """Send current menu data to every display still owned by the launcher."""
     for display_number, display in idle_displays.items():
         try:
             upload_display_data(display, display_number, settings, cameras)
         except (serial.SerialException, OSError) as error:
             print(f"XXX Cannot upload data to AutoChecker {display_number}: {error}")
 
+
+def broadcast_display_data(
+        settings: dict,
+        cameras: dict[int, int],
+        idle_displays: dict[str, serial.Serial],
+        worker_update_queues: dict[str, multiprocessing.Queue],
+        worker_identities: dict[str, CheckerIdentity],
+) -> None:
+    """Refresh displays using only cameras not reserved by active workers."""
+    available_cameras = cameras_available_for_selection(
+        cameras,
+        worker_identities,
+    )
+    refresh_idle_display_data(settings, available_cameras, idle_displays)
+
     for display_number, update_queue in worker_update_queues.items():
         try:
-            update_queue.put_nowait(("uploadData", dict(cameras)))
+            update_queue.put_nowait(("uploadData", dict(available_cameras)))
         except (OSError, ValueError, queue.Full) as error:
             print(f"XXX Cannot notify AutoChecker {display_number}: {error}")
 
@@ -1189,6 +1492,319 @@ def B2B_download_directories() -> list[Path]:
             seen.add(key)
             unique.append(candidate)
     return unique
+
+
+def current_RETAIL_UP_label_files(
+    day: datetime.date | None = None,
+) -> list[tuple[Path, Path, int]]:
+    """Return today's existing (JSON, PDF, part number) label file pairs."""
+    day = day or datetime.date.today()
+    pattern = re.compile(
+        rf"^{re.escape(day.strftime('%d.%m.%Y'))} Part (\d+) "
+        r"\(Label\)\.json$",
+        re.IGNORECASE,
+    )
+    result: list[tuple[Path, Path, int]] = []
+    for directory in B2B_download_directories():
+        if not directory.is_dir():
+            continue
+        for json_path in directory.iterdir():
+            if not json_path.is_file():
+                continue
+            match = pattern.fullmatch(json_path.name)
+            if match is None:
+                continue
+            pdf_path = _case_insensitive_file(
+                directory,
+                json_path.with_suffix(".pdf").name,
+            )
+            if pdf_path is not None:
+                result.append((json_path, pdf_path, int(match.group(1))))
+    return sorted(result, key=lambda item: item[2], reverse=True)
+
+
+def prepare_RETAIL_UP_label_data() -> list[tuple[Path, Path, int]]:
+    """OCR today's pending Label PDFs and return all usable JSON/PDF pairs."""
+    today = datetime.date.today()
+    with portalocker.Lock(
+        str(LABEL_OCR_LOCK_FILE),
+        mode="a+",
+        encoding="utf-8",
+        timeout=3600,
+    ):
+        for directory in B2B_download_directories():
+            process_pending_label_pdfs(
+                RETAIL_UP_DEPARTMENT,
+                downloads_dir=directory,
+                label_date=today,
+            )
+
+    label_files = current_RETAIL_UP_label_files(today)
+    if not label_files:
+        raise FileNotFoundError(
+            f"Label PDF/JSON for {today:%d.%m.%Y} was not found in Downloads"
+        )
+    return label_files
+
+
+def RETAIL_UP_tracking_from_statistics(order_id: str) -> str:
+    """Validate one completed RETAIL order and return its tracking number."""
+    normalized_order = order_id.strip()
+    if not re.fullmatch(r"#\d+", normalized_order):
+        raise ValueError(f"Invalid order number {order_id}")
+
+    stat_file = (
+        DESKTOP_DIR
+        / "RETAIL"
+        / "Statistik"
+        / f"{datetime.date.today():%d.%m.%Y}.txt"
+    )
+    if not stat_file.is_file():
+        raise FileNotFoundError("Today's RETAIL statistics file was not found")
+
+    matching_line = None
+    for line in read_stat_lines(stat_file):
+        stored_order = retail_order_id_from_stat_line(line)
+        if stored_order == normalized_order:
+            matching_line = line.rstrip("\r\n")
+            break
+    if matching_line is None:
+        raise LookupError(f"Unknown order {normalized_order}")
+
+    status = retail_stat_order_suffix(matching_line)
+    if "cancelled" in status.casefold():
+        raise ValueError(f"Cancelled order {normalized_order}")
+    if "+" not in status:
+        raise ValueError(f"Order is not completed {normalized_order}")
+
+    order_position = matching_line.find(normalized_order)
+    prefix = matching_line[:order_position].strip()
+    tracking_number = prefix.split(maxsplit=1)[0] if prefix else ""
+    tracking_number = re.sub(r"[^A-Za-z0-9]", "", tracking_number).upper()
+    if not tracking_number:
+        raise LookupError(f"Tracking number is missing for {normalized_order}")
+    return tracking_number
+
+
+def append_RETAIL_UP_print_name(order_id: str, name: str) -> None:
+    """Append the printing worker name to today's RETAIL order line."""
+    normalized_order = order_id.strip()
+    stat_file = (
+        DESKTOP_DIR
+        / "RETAIL"
+        / "Statistik"
+        / f"{datetime.date.today():%d.%m.%Y}.txt"
+    )
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        for index, line in enumerate(lines):
+            if retail_order_id_from_stat_line(line) != normalized_order:
+                continue
+            lines[index] = line.rstrip("\r\n") + f" {name}\n"
+            file.seek(0)
+            file.truncate()
+            file.writelines(lines)
+            file.flush()
+            return
+    raise LookupError(f"Unknown order {normalized_order}")
+
+
+def find_RETAIL_UP_label_page(
+    tracking_number: str,
+) -> tuple[Path, int]:
+    """Find a tracking number in today's Label JSON files."""
+    expected = re.sub(r"[^A-Za-z0-9]", "", tracking_number).upper()
+    for json_path, pdf_path, _part_number in current_RETAIL_UP_label_files():
+        with json_path.open("r", encoding="utf-8") as file:
+            document = json.load(file)
+        if not isinstance(document, dict):
+            continue
+        actual_key = next(
+            (
+                key
+                for key in document
+                if re.sub(r"[^A-Za-z0-9]", "", str(key)).upper() == expected
+            ),
+            None,
+        )
+        if actual_key is None:
+            continue
+        label_data = document.get(actual_key)
+        if not isinstance(label_data, dict):
+            raise ValueError(f"Invalid Label JSON entry for {tracking_number}")
+        try:
+            page_number = int(label_data["PageNumber"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Invalid PageNumber for {tracking_number}"
+            ) from error
+        if page_number < 1:
+            raise ValueError(f"Invalid PageNumber for {tracking_number}")
+        return pdf_path, page_number
+    raise LookupError(f"Tracking number not found in Label JSON: {tracking_number}")
+
+
+def configured_RETAIL_UP_printer(settings: dict) -> str:
+    """Resolve the first configured RETAIL_UP printer installed in Windows."""
+    configured = settings.get("PRINTER", {}).get(RETAIL_UP_DEPARTMENT, [])
+    if isinstance(configured, str):
+        configured = [configured]
+    if not isinstance(configured, list):
+        raise ValueError("PRINTER.RETAIL_UP must be a string or list")
+    requested = [str(name).strip() for name in configured if str(name).strip()]
+    if not requested:
+        raise ValueError("No printer configured for RETAIL_UP")
+
+    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+    installed = {
+        str(printer[2]).casefold(): str(printer[2])
+        for printer in win32print.EnumPrinters(flags)
+    }
+    for name in requested:
+        actual_name = installed.get(name.casefold())
+        if actual_name is not None:
+            return actual_name
+    raise LookupError("Configured RETAIL_UP printer is not installed: " + ", ".join(requested))
+
+
+def print_pdf_page(pdf_path: Path, page_number: int, printer_name: str) -> None:
+    """Print one PDF page on 4x6-inch paper from the top-left at 100%."""
+    document = pymupdf.open(pdf_path)
+    printer_handle = None
+    printer_dc = None
+    document_started = False
+    try:
+        if page_number < 1 or page_number > len(document):
+            raise ValueError(
+                f"Page {page_number} is outside PDF range 1..{len(document)}"
+            )
+        page = document[page_number - 1]
+        pixmap = page.get_pixmap(
+            dpi=RETAIL_UP_PRINTER_DPI,
+            colorspace=pymupdf.csRGB,
+            alpha=False,
+        )
+        image = Image.frombytes(
+            "RGB",
+            (pixmap.width, pixmap.height),
+            pixmap.samples,
+        )
+
+        printer_handle = win32print.OpenPrinter(printer_name)
+        printer_info = win32print.GetPrinter(printer_handle, 2)
+        devmode_size = win32print.DocumentProperties(
+            0,
+            printer_handle,
+            printer_name,
+            None,
+            None,
+            0,
+        )
+        if devmode_size <= 0:
+            raise RuntimeError("Cannot read printer DEVMODE size")
+        driver_extra = max(
+            0,
+            devmode_size - pywintypes.DEVMODEType().Size,
+        )
+        devmode = pywintypes.DEVMODEType(driver_extra)
+        devmode.Fields |= (
+            win32con.DM_ORIENTATION
+            | win32con.DM_PAPERSIZE
+            | win32con.DM_PAPERWIDTH
+            | win32con.DM_PAPERLENGTH
+        )
+        devmode.Orientation = win32con.DMORIENT_PORTRAIT
+        devmode.PaperSize = getattr(win32con, "DMPAPER_USER", 256)
+        devmode.PaperWidth = RETAIL_UP_PAPER_WIDTH_TENTHS_MM
+        devmode.PaperLength = RETAIL_UP_PAPER_HEIGHT_TENTHS_MM
+        properties_result = win32print.DocumentProperties(
+            0,
+            printer_handle,
+            printer_name,
+            devmode,
+            devmode,
+            win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
+        )
+        if properties_result < 0:
+            raise RuntimeError("Printer rejected 4x6-inch paper settings")
+
+        printer_dc = win32gui.CreateDC(
+            printer_info["pPrintProcessor"],
+            printer_name,
+            devmode,
+        )
+        printable_width = win32print.GetDeviceCaps(
+            printer_dc,
+            win32con.HORZRES,
+        )
+        printable_height = win32print.GetDeviceCaps(
+            printer_dc,
+            win32con.VERTRES,
+        )
+        if printable_width <= 0 or printable_height <= 0:
+            raise RuntimeError("Printer returned an invalid printable area")
+
+        scale = min(
+            printable_width / image.width,
+            printable_height / image.height,
+        ) * RETAIL_UP_PRINT_SCALE
+        target_width = max(1, round(image.width * scale))
+        target_height = max(1, round(image.height * scale))
+        left = 0
+        top = 0
+
+        win32print.StartDoc(
+            printer_dc,
+            (
+                f"AutoChecker {pdf_path.name} page {page_number}",
+                None,
+                None,
+                0,
+            ),
+        )
+        document_started = True
+        win32print.StartPage(printer_dc)
+        ImageWin.Dib(image).draw(
+            printer_dc,
+            (left, top, left + target_width, top + target_height),
+        )
+        win32print.EndPage(printer_dc)
+        win32print.EndDoc(printer_dc)
+        document_started = False
+    except Exception:
+        if document_started and printer_dc is not None:
+            try:
+                win32print.AbortDoc(printer_dc)
+            except Exception:
+                pass
+        raise
+    finally:
+        if printer_dc is not None:
+            win32gui.DeleteDC(printer_dc)
+        if printer_handle is not None:
+            win32print.ClosePrinter(printer_handle)
+        document.close()
+
+
+def process_RETAIL_UP_scan(worker: dict, settings: dict, order_id: str) -> bool:
+    """Validate an order, locate its label page and submit it for printing."""
+    try:
+        tracking_number = RETAIL_UP_tracking_from_statistics(order_id)
+        pdf_path, page_number = find_RETAIL_UP_label_page(tracking_number)
+        printer_name = configured_RETAIL_UP_printer(settings)
+        print_pdf_page(pdf_path, page_number, printer_name)
+        append_RETAIL_UP_print_name(order_id, worker["NAME"])
+        message = (
+            f"+ Label printed {order_id.lstrip('#')} page {page_number}"
+        )
+        success = True
+    except Exception as error:
+        message = f"XXX {error}"
+        success = False
+    Printer(message)
+    send(worker["DISPLAY"], message)
+    return success
 
 
 def find_downloaded_B2B_pdf(
@@ -1919,9 +2535,9 @@ def cancel_order(worker: dict, order_id: str) -> bool:
         return changed
 
 
-def cancel_order_from_launcher(display_number: int, order_id: str, settings: dict) -> bool:
+def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) -> bool:
     """Cancel an order while its display is idle, preferring its last department."""
-    last_values = settings.get("DISPLAY", {}).get(str(display_number), ["", "", ""])
+    last_values = settings.get("DISPLAY", {}).get(display_mac, ["", "", ""])
     preferred_department = (
         str(last_values[1]).upper()
         if isinstance(last_values, (list, tuple)) and len(last_values) > 1
@@ -2209,6 +2825,37 @@ def draw_RETAIL_order_counters(frame, completed: int, total: int) -> None:
         )
 
 
+def RETAIL_daily_order_counts(worker: dict) -> tuple[int, int]:
+    """Count completed and total orders in today's RETAIL statistics file."""
+    stat_file = statistics_file(worker)
+    try:
+        stat = stat_file.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        worker.pop("RETAIL_ORDER_COUNTER_CACHE", None)
+        return 0, 0
+
+    cached = worker.get("RETAIL_ORDER_COUNTER_CACHE")
+    if cached and cached[0] == signature:
+        return cached[1], cached[2]
+
+    completed = 0
+    total = 0
+    for line in read_stat_lines(stat_file):
+        if retail_order_id_from_stat_line(line) is None:
+            continue
+        total += 1
+        if "+" in line:
+            completed += 1
+
+    worker["RETAIL_ORDER_COUNTER_CACHE"] = (
+        signature,
+        completed,
+        total,
+    )
+    return completed, total
+
+
 
 
 
@@ -2240,7 +2887,7 @@ def draw_RETAIL_order_counters(frame, completed: int, total: int) -> None:
 
 
 def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | None,
-         display_port: str, display_number: int, cameras: dict[int, int],
+         display_port: str, display_number: str, cameras: dict[int, int],
          settings_update_requests: multiprocessing.Queue,
          display_update_queue: multiprocessing.Queue,
          display_reset_event: multiprocessing.Event,
@@ -2290,6 +2937,18 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "HAS_CAMERA": cap is not None,
             "PERFORMANCE_STATS": performance_stats,
         }
+        if identity.department.upper() == RETAIL_UP_DEPARTMENT:
+            message = "* Label OCR started"
+            Printer(message)
+            send(display, message)
+            try:
+                label_files = prepare_RETAIL_UP_label_data()
+                message = f"* Label data ready: {len(label_files)} file(s)"
+            except Exception as error:
+                message = f"XXX {error}"
+            Printer(message)
+            send(display, message)
+
         if identity.department.upper() == "B2B":
             B2B_history = statistics_dir.parent / "History"
             B2B_history.mkdir(parents=True, exist_ok=True)
@@ -2378,10 +3037,11 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             if cap is not None and ok:
                 preview = cv2.resize(frame, None, fx=0.15, fy=0.15)
                 if identity.department.upper() == "RETAIL":
+                    completed_orders, total_orders = RETAIL_daily_order_counts(worker)
                     draw_RETAIL_order_counters(
                         preview,
-                        performance_stats.completed_count(),
-                        len(orders),
+                        completed_orders,
+                        total_orders,
                     )
                 cv2.imshow(window_name, preview)
 
@@ -2520,7 +3180,11 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     else line.strip()
                 )
                 if code:
-                    if identity.department.upper() == "B2B" and code.startswith("#"):
+                    if identity.department.upper() == RETAIL_UP_DEPARTMENT:
+                        performance_stats.record_scan()
+                        if not process_RETAIL_UP_scan(worker, config, code):
+                            performance_stats.record_mistake()
+                    elif identity.department.upper() == "B2B" and code.startswith("#"):
                         is_cancelled = B2B_order_is_cancelled(worker, code)
                         if is_cancelled:
                             performance_stats.record_scan()
@@ -2652,13 +3316,15 @@ def open_display(port: str) -> serial.Serial:
     return serial.Serial(port, baudrate=DISPLAY_BAUDRATE, timeout=DISPLAY_TIMEOUT)
 
 
+def notify_launcher_ready(display: serial.Serial) -> None:
+    """Tell the display that the launcher is ready to accept commands."""
+    display.write(b"</Ready>\n")
+    display.flush()
+
+
 def dispatcher() -> None:
     """Own idle display ports and hand each busy port to its worker process."""
-    launcher_ocr_process = None
-    try:
-        launcher_ocr_process = start_label_ocr_process("RETAIL")
-    except Exception as error:
-        print(f"XXX Cannot start label OCR process: {error}")
+    latest_display_version = get_latest_display_version()
 
     cleanup_launcher_photos()
     cameras = find_autochecker_cameras()
@@ -2667,7 +3333,7 @@ def dispatcher() -> None:
 
     # Camera focus defaults do not depend on whether a display is currently on.
     settings = ensure_detected_settings(cameras, {})
-    display_ports = find_autochecker_displays()
+    display_ports = find_autochecker_displays(latest_display_version)
     if not display_ports:
         print("? No AutoChecker displays found; monitoring new COM ports")
 
@@ -2675,13 +3341,13 @@ def dispatcher() -> None:
     settings = ensure_detected_settings(cameras, display_ports)
     ensure_worker_statistics_files(settings)
 
-    idle_displays: dict[int, serial.Serial] = {}
-    workers: dict[int, multiprocessing.Process] = {}
-    worker_identities: dict[int, CheckerIdentity] = {}
-    worker_update_queues: dict[int, multiprocessing.Queue] = {}
-    worker_reset_events: dict[int, multiprocessing.Event] = {}
-    worker_disconnect_events: dict[int, multiprocessing.Event] = {}
-    reset_recovery_deadlines: dict[int, float] = {}
+    idle_displays: dict[str, serial.Serial] = {}
+    workers: dict[str, multiprocessing.Process] = {}
+    worker_identities: dict[str, CheckerIdentity] = {}
+    worker_update_queues: dict[str, multiprocessing.Queue] = {}
+    worker_reset_events: dict[str, multiprocessing.Event] = {}
+    worker_disconnect_events: dict[str, multiprocessing.Event] = {}
+    reset_recovery_deadlines: dict[str, float] = {}
     settings_update_requests: multiprocessing.Queue = multiprocessing.Queue()
     observed_ports = {port_info.device for port_info in list_ports.comports()}
     disconnected_ports_waiting_removal: set[str] = set()
@@ -2700,6 +3366,7 @@ def dispatcher() -> None:
                     settings,
                     cameras,
                 )
+                notify_launcher_ready(idle_displays[display_number])
             except (serial.SerialException, OSError) as error:
                 print(f"XXX Cannot open AutoChecker {display_number} on {port}: {error}")
                 close_serial_safely(idle_displays.pop(display_number, None))
@@ -2713,13 +3380,6 @@ def dispatcher() -> None:
             print("* Dispatcher ready; waiting for AutoChecker displays")
 
         while True:
-            if (
-                launcher_ocr_process is not None
-                and not launcher_ocr_process.is_alive()
-            ):
-                launcher_ocr_process.join()
-                launcher_ocr_process = None
-
             # A stopped worker releases its port; the dispatcher can listen to it again.
             for display_number, process in list(workers.items()):
                 if not process.is_alive():
@@ -2737,6 +3397,15 @@ def dispatcher() -> None:
                         if port is not None:
                             display_ports.pop(display_number, None)
                             disconnected_ports_waiting_removal.add(port)
+                        settings = load_settings()
+                        refresh_idle_display_data(
+                            settings,
+                            cameras_available_for_selection(
+                                cameras,
+                                worker_identities,
+                            ),
+                            idle_displays,
+                        )
                         print(
                             f"? AutoChecker {display_number} disconnected; "
                             "monitoring COM ports"
@@ -2749,12 +3418,15 @@ def dispatcher() -> None:
                             time.sleep(DISPLAY_BOOT_DELAY)
                             idle_displays[display_number].reset_input_buffer()
                         settings = load_settings()
-                        upload_display_data(
-                            idle_displays[display_number],
-                            display_number,
+                        refresh_idle_display_data(
                             settings,
-                            cameras,
+                            cameras_available_for_selection(
+                                cameras,
+                                worker_identities,
+                            ),
+                            idle_displays,
                         )
+                        notify_launcher_ready(idle_displays[display_number])
                         print(
                             f"* AutoChecker {display_number} is ready for a new Start command"
                         )
@@ -2787,7 +3459,10 @@ def dispatcher() -> None:
                 )
                 for port in sorted(new_ports):
                     observed_ports.add(port)
-                    display_number = identify_autochecker_display(port)
+                    display_number = identify_autochecker_display(
+                        port,
+                        latest_display_version,
+                    )
                     if display_number is None:
                         continue
                     if display_number in display_ports:
@@ -2808,8 +3483,12 @@ def dispatcher() -> None:
                             display,
                             display_number,
                             current_settings,
-                            cameras,
+                            cameras_available_for_selection(
+                                cameras,
+                                worker_identities,
+                            ),
                         )
+                        notify_launcher_ready(display)
                     except (serial.SerialException, OSError) as error:
                         print(
                             f"XXX Cannot activate AutoChecker {display_number} "
@@ -2897,6 +3576,7 @@ def dispatcher() -> None:
                         cameras,
                         idle_displays,
                         worker_update_queues,
+                        worker_identities,
                     )
 
                 next_camera_scan = time.monotonic() + CAMERA_SCAN_INTERVAL
@@ -2916,6 +3596,7 @@ def dispatcher() -> None:
                     cameras,
                     idle_displays,
                     worker_update_queues,
+                    worker_identities,
                 )
 
             for display_number, display in list(idle_displays.items()):
@@ -2925,7 +3606,16 @@ def dispatcher() -> None:
                     try:
                         display.reset_input_buffer()
                         settings = load_settings()
-                        upload_display_data(display, display_number, settings, cameras)
+                        upload_display_data(
+                            display,
+                            display_number,
+                            settings,
+                            cameras_available_for_selection(
+                                cameras,
+                                worker_identities,
+                            ),
+                        )
+                        notify_launcher_ready(display)
                         print(f"* AutoChecker {display_number} recovered after reset")
                         reset_recovery_deadlines.pop(display_number, None)
                     except (serial.SerialException, OSError) as error:
@@ -2985,6 +3675,7 @@ def dispatcher() -> None:
                                     cameras,
                                     idle_displays,
                                     worker_update_queues,
+                                    worker_identities,
                                 )
                         else:
                             message = f"XXX {error}"
@@ -3006,6 +3697,7 @@ def dispatcher() -> None:
                                 cameras,
                                 idle_displays,
                                 worker_update_queues,
+                                worker_identities,
                             )
                     else:
                         message = f"XXX {error}"
@@ -3046,13 +3738,37 @@ def dispatcher() -> None:
                     camera_id = None
                     focus = None
                 else:
+                    camera_owner = next(
+                        (
+                            worker_display
+                            for worker_display, worker_identity
+                            in worker_identities.items()
+                            if worker_identity.camera_number
+                            == identity.camera_number
+                        ),
+                        None,
+                    )
+                    if camera_owner is not None:
+                        message = (
+                            f"XXX Camera {identity.camera_number} is already in use"
+                        )
+                        Printer(message)
+                        send(display, message)
+                        notify_launcher_ready(display)
+                        continue
+
                     current_settings = load_settings()
                     camera_id = cameras.get(identity.camera_number)
                     focus = current_settings.get("FOCUS", {}).get(
                         str(identity.camera_number)
                     )
                     if camera_id is None or focus is None:
-                        print(f"XXX Camera or focus settings missing for AutoChecker {identity.camera_number}")
+                        message = (
+                            f"XXX Camera {identity.camera_number} is unavailable"
+                        )
+                        Printer(message)
+                        send(display, message)
+                        notify_launcher_ready(display)
                         continue
 
                 # Windows locks COM ports exclusively. Close it before the child opens it.
@@ -3090,6 +3806,16 @@ def dispatcher() -> None:
                 worker_reset_events[display_number] = display_reset_event
                 worker_disconnect_events[display_number] = display_disconnect_event
 
+                settings = load_settings()
+                refresh_idle_display_data(
+                    settings,
+                    cameras_available_for_selection(
+                        cameras,
+                        worker_identities,
+                    ),
+                    idle_displays,
+                )
+
             time.sleep(0.01)
 
     except KeyboardInterrupt:
@@ -3112,7 +3838,6 @@ def dispatcher() -> None:
             update_queue.join_thread()
         settings_update_requests.close()
         settings_update_requests.join_thread()
-        stop_label_ocr_process(launcher_ocr_process)
 
 
 if __name__ == "__main__":

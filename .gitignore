@@ -1,0 +1,4 @@
+*.json
+__pycache__/
+*.py[cod]
+.pdf_label_ocr.lock
