@@ -86,6 +86,16 @@ def _is_packeta_label(lines: list[str]) -> bool:
     return any(line.casefold() == "packeta.com" for line in lines)
 
 
+def _label_type_from_text(text: str) -> str | None:
+    """Classify a page using the mutually exclusive label markers."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if _is_packeta_label(lines):
+        return "Packeta"
+    if "UPS " in text.upper():
+        return "UPS"
+    return None
+
+
 def _parse_packeta_label(lines: list[str]) -> dict[str, str | None]:
     """Parse obj/order and the validated Packeta tracking/name sequence."""
     order_number = None
@@ -233,6 +243,7 @@ def _json_document(pages: list[dict[str, Any]]) -> dict[str, dict[str, str | int
             "PageNumber": page["page"],
             "Order Number": page["order_number"],
             "CustomerName": page["customer_name"],
+            "LabelType": _label_type_from_text(page["full_text"]),
         }
         for page in pages
         if page["tracking_number"]

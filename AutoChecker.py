@@ -120,7 +120,7 @@ OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.3"
+CURRENT_VERSION = "2.4"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -146,6 +146,7 @@ RETAIL_UP_PRINTER_DPI = 200
 RETAIL_UP_PAPER_WIDTH_TENTHS_MM = 1016
 RETAIL_UP_PAPER_HEIGHT_TENTHS_MM = 1524
 RETAIL_UP_PRINT_SCALE = 1.0
+RETAIL_UP_PACKETA_PRINT_SCALE = 1.45
 DEFAULT_RETAIL_UP_PRINTER = "Zebra ZP 450 200 dpi"
 EXPECTED_DISPLAY_APP_SLOTS = (
     (0x10000, 0x140000, "app0"),
@@ -1633,8 +1634,8 @@ def append_RETAIL_UP_print_name(order_id: str, name: str) -> None:
 
 def find_RETAIL_UP_label_page(
     tracking_number: str,
-) -> tuple[Path, int]:
-    """Find a tracking number in today's Label JSON files."""
+) -> tuple[Path, int, str]:
+    """Find a tracking number and its label type in today's Label JSON."""
     expected = re.sub(r"[^A-Za-z0-9]", "", tracking_number).upper()
     for json_path, pdf_path, _part_number in current_RETAIL_UP_label_files():
         with json_path.open("r", encoding="utf-8") as file:
@@ -1662,7 +1663,18 @@ def find_RETAIL_UP_label_page(
             ) from error
         if page_number < 1:
             raise ValueError(f"Invalid PageNumber for {tracking_number}")
-        return pdf_path, page_number
+        label_type = str(label_data.get("LabelType", "")).strip().casefold()
+        if label_type == "packeta":
+            normalized_label_type = "Packeta"
+        elif label_type == "ups":
+            normalized_label_type = "UPS"
+        else:
+            # JSON files created by older OCR versions have no LabelType.
+            # Their tracking-number formats still distinguish both layouts.
+            normalized_label_type = (
+                "Packeta" if expected.startswith("Z") else "UPS"
+            )
+        return pdf_path, page_number, normalized_label_type
     raise LookupError(f"Tracking number not found in Label JSON: {tracking_number}")
 
 
@@ -1689,8 +1701,33 @@ def configured_RETAIL_UP_printer(settings: dict) -> str:
     raise LookupError("Configured RETAIL_UP printer is not installed: " + ", ".join(requested))
 
 
-def print_pdf_page(pdf_path: Path, page_number: int, printer_name: str) -> None:
-    """Print one PDF page on 4x6-inch paper from the top-left at 100%."""
+def RETAIL_UP_print_rectangle(
+    image_size: tuple[int, int],
+    printable_size: tuple[int, int],
+    label_type: str,
+) -> tuple[int, int, int, int]:
+    """Return a label-specific DIB rectangle inside the printable area."""
+    image_width, image_height = image_size
+    printable_width, printable_height = printable_size
+    is_packeta = label_type.casefold() == "packeta"
+    scale = min(
+        printable_width / image_width,
+        printable_height / image_height,
+    ) * (RETAIL_UP_PACKETA_PRINT_SCALE if is_packeta else RETAIL_UP_PRINT_SCALE)
+    target_width = max(1, round(image_width * scale))
+    target_height = max(1, round(image_height * scale))
+    left = printable_width - target_width
+    top = 0 if is_packeta else printable_height - target_height
+    return left, top, left + target_width, top + target_height
+
+
+def print_pdf_page(
+    pdf_path: Path,
+    page_number: int,
+    printer_name: str,
+    label_type: str,
+) -> None:
+    """Print UPS bottom-right/rotated or Packeta top-right/landscape."""
     document = pymupdf.open(pdf_path)
     printer_handle = None
     printer_dc = None
@@ -1711,6 +1748,9 @@ def print_pdf_page(pdf_path: Path, page_number: int, printer_name: str) -> None:
             (pixmap.width, pixmap.height),
             pixmap.samples,
         )
+        is_packeta = label_type.casefold() == "packeta"
+        if not is_packeta:
+            image = image.transpose(Image.Transpose.ROTATE_180)
 
         printer_handle = win32print.OpenPrinter(printer_name)
         printer_info = win32print.GetPrinter(printer_handle, 2)
@@ -1735,7 +1775,11 @@ def print_pdf_page(pdf_path: Path, page_number: int, printer_name: str) -> None:
             | win32con.DM_PAPERWIDTH
             | win32con.DM_PAPERLENGTH
         )
-        devmode.Orientation = win32con.DMORIENT_PORTRAIT
+        devmode.Orientation = (
+            win32con.DMORIENT_LANDSCAPE
+            if is_packeta
+            else win32con.DMORIENT_PORTRAIT
+        )
         devmode.PaperSize = getattr(win32con, "DMPAPER_USER", 256)
         devmode.PaperWidth = RETAIL_UP_PAPER_WIDTH_TENTHS_MM
         devmode.PaperLength = RETAIL_UP_PAPER_HEIGHT_TENTHS_MM
@@ -1766,14 +1810,11 @@ def print_pdf_page(pdf_path: Path, page_number: int, printer_name: str) -> None:
         if printable_width <= 0 or printable_height <= 0:
             raise RuntimeError("Printer returned an invalid printable area")
 
-        scale = min(
-            printable_width / image.width,
-            printable_height / image.height,
-        ) * RETAIL_UP_PRINT_SCALE
-        target_width = max(1, round(image.width * scale))
-        target_height = max(1, round(image.height * scale))
-        left = 0
-        top = 0
+        print_rectangle = RETAIL_UP_print_rectangle(
+            image.size,
+            (printable_width, printable_height),
+            label_type,
+        )
 
         win32print.StartDoc(
             printer_dc,
@@ -1788,7 +1829,7 @@ def print_pdf_page(pdf_path: Path, page_number: int, printer_name: str) -> None:
         win32print.StartPage(printer_dc)
         ImageWin.Dib(image).draw(
             printer_dc,
-            (left, top, left + target_width, top + target_height),
+            print_rectangle,
         )
         win32print.EndPage(printer_dc)
         win32print.EndDoc(printer_dc)
@@ -1812,9 +1853,11 @@ def process_RETAIL_UP_scan(worker: dict, settings: dict, order_id: str) -> bool:
     """Validate an order, locate its label page and submit it for printing."""
     try:
         tracking_number = RETAIL_UP_tracking_from_statistics(order_id)
-        pdf_path, page_number = find_RETAIL_UP_label_page(tracking_number)
+        pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
+            tracking_number
+        )
         printer_name = configured_RETAIL_UP_printer(settings)
-        print_pdf_page(pdf_path, page_number, printer_name)
+        print_pdf_page(pdf_path, page_number, printer_name, label_type)
         append_RETAIL_UP_print_name(order_id, worker["NAME"])
         message = (
             f"+ Label printed {order_id.lstrip('#')} page {page_number}"
@@ -2247,7 +2290,9 @@ def restore_RETAIL_wrapped_lines(text: str, tracking_pattern: re.Pattern) -> str
         if cut_positions:
             # Everything through the rightmost delivery marker belongs to the
             # PDF label/address prefix, not to an order position.
-            line = line[max(cut_positions):].lstrip(" \t-–")
+            # Preserve a leading "- xN" quantity continuation. Removing its
+            # dash makes the product regex consume the next item's quantity.
+            line = line[max(cut_positions):].lstrip()
             if not line:
                 continue
             if "☐" not in line and restored_lines:
