@@ -120,7 +120,7 @@ OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.4"
+CURRENT_VERSION = "2.5"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -1705,8 +1705,9 @@ def RETAIL_UP_print_rectangle(
     image_size: tuple[int, int],
     printable_size: tuple[int, int],
     label_type: str,
+    content_bbox: tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int, int, int]:
-    """Return a label-specific DIB rectangle inside the printable area."""
+    """Align visible label content, allowing only white margins to be clipped."""
     image_width, image_height = image_size
     printable_width, printable_height = printable_size
     is_packeta = label_type.casefold() == "packeta"
@@ -1716,9 +1717,28 @@ def RETAIL_UP_print_rectangle(
     ) * (RETAIL_UP_PACKETA_PRINT_SCALE if is_packeta else RETAIL_UP_PRINT_SCALE)
     target_width = max(1, round(image_width * scale))
     target_height = max(1, round(image_height * scale))
-    left = printable_width - target_width
-    top = 0 if is_packeta else printable_height - target_height
+    bbox_left, bbox_top, bbox_right, bbox_bottom = content_bbox or (
+        0,
+        0,
+        image_width,
+        image_height,
+    )
+    # Position the full bitmap so the non-white content, rather than its PDF
+    # canvas, reaches the requested printable corner. Any overflow consists of
+    # the page's white margin and can be safely clipped by the printer.
+    left = printable_width - round(bbox_right * scale)
+    top = (
+        -round(bbox_top * scale)
+        if is_packeta
+        else printable_height - round(bbox_bottom * scale)
+    )
     return left, top, left + target_width, top + target_height
+
+
+def RETAIL_UP_content_bbox(image: Image.Image) -> tuple[int, int, int, int]:
+    """Return the bounding box of pixels that are not effectively white."""
+    mask = image.convert("L").point(lambda value: 255 if value < 245 else 0)
+    return mask.getbbox() or (0, 0, image.width, image.height)
 
 
 def print_pdf_page(
@@ -1749,8 +1769,13 @@ def print_pdf_page(
             pixmap.samples,
         )
         is_packeta = label_type.casefold() == "packeta"
-        if not is_packeta:
+        if is_packeta:
+            # Rotate the pixels explicitly: some Zebra drivers ignore or add
+            # their own rotation for landscape requests on custom 4x6 media.
+            image = image.transpose(Image.Transpose.ROTATE_270)
+        else:
             image = image.transpose(Image.Transpose.ROTATE_180)
+        content_bbox = RETAIL_UP_content_bbox(image)
 
         printer_handle = win32print.OpenPrinter(printer_name)
         printer_info = win32print.GetPrinter(printer_handle, 2)
@@ -1775,11 +1800,7 @@ def print_pdf_page(
             | win32con.DM_PAPERWIDTH
             | win32con.DM_PAPERLENGTH
         )
-        devmode.Orientation = (
-            win32con.DMORIENT_LANDSCAPE
-            if is_packeta
-            else win32con.DMORIENT_PORTRAIT
-        )
+        devmode.Orientation = win32con.DMORIENT_PORTRAIT
         devmode.PaperSize = getattr(win32con, "DMPAPER_USER", 256)
         devmode.PaperWidth = RETAIL_UP_PAPER_WIDTH_TENTHS_MM
         devmode.PaperLength = RETAIL_UP_PAPER_HEIGHT_TENTHS_MM
@@ -1814,6 +1835,7 @@ def print_pdf_page(
             image.size,
             (printable_width, printable_height),
             label_type,
+            content_bbox,
         )
 
         win32print.StartDoc(
