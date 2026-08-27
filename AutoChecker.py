@@ -120,7 +120,7 @@ OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.2"
+CURRENT_VERSION = "2.3"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 

@@ -1,4 +1,4 @@
-"""Local OCR extraction for RETAIL UPS label PDFs."""
+"""Local OCR extraction for RETAIL UPS and Packeta label PDFs."""
 
 from __future__ import annotations
 
@@ -81,9 +81,43 @@ def _extract_order_number(text: str) -> str | None:
     return f"#{match.group(1)}" if match else None
 
 
+def _is_packeta_label(lines: list[str]) -> bool:
+    """Identify the second label layout by its standalone service line."""
+    return any(line.casefold() == "packeta.com" for line in lines)
+
+
+def _parse_packeta_label(lines: list[str]) -> dict[str, str | None]:
+    """Parse obj/order and the validated Packeta tracking/name sequence."""
+    order_number = None
+    for line in lines:
+        match = re.fullmatch(r"obj\.\s*(\d+)", line, flags=re.IGNORECASE)
+        if match:
+            order_number = f"#{match.group(1)}"
+            break
+
+    tracking_number = None
+    customer_name = None
+    for index, line in enumerate(lines[:-2]):
+        if not re.fullmatch(r"Z\d{3,}", line, flags=re.IGNORECASE):
+            continue
+        if lines[index + 1].casefold() != "crassula group s":
+            continue
+        tracking_number = line.upper()
+        customer_name = lines[index + 2]
+        break
+
+    return {
+        "tracking_number": tracking_number,
+        "customer_name": customer_name,
+        "order_number": order_number,
+    }
+
+
 def parse_label_text(text: str) -> dict[str, str | None]:
     """Parse the fields needed by AutoChecker from recognized label text."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if _is_packeta_label(lines):
+        return _parse_packeta_label(lines)
     return {
         "tracking_number": _normalize_tracking_number(text),
         "customer_name": _extract_customer_name(lines),
