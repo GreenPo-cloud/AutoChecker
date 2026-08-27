@@ -120,7 +120,7 @@ OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.5"
+CURRENT_VERSION = "2.6"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -146,7 +146,6 @@ RETAIL_UP_PRINTER_DPI = 200
 RETAIL_UP_PAPER_WIDTH_TENTHS_MM = 1016
 RETAIL_UP_PAPER_HEIGHT_TENTHS_MM = 1524
 RETAIL_UP_PRINT_SCALE = 1.0
-RETAIL_UP_PACKETA_PRINT_SCALE = 1.45
 DEFAULT_RETAIL_UP_PRINTER = "Zebra ZP 450 200 dpi"
 EXPECTED_DISPLAY_APP_SLOTS = (
     (0x10000, 0x140000, "app0"),
@@ -1701,53 +1700,13 @@ def configured_RETAIL_UP_printer(settings: dict) -> str:
     raise LookupError("Configured RETAIL_UP printer is not installed: " + ", ".join(requested))
 
 
-def RETAIL_UP_print_rectangle(
-    image_size: tuple[int, int],
-    printable_size: tuple[int, int],
-    label_type: str,
-    content_bbox: tuple[int, int, int, int] | None = None,
-) -> tuple[int, int, int, int]:
-    """Align visible label content, allowing only white margins to be clipped."""
-    image_width, image_height = image_size
-    printable_width, printable_height = printable_size
-    is_packeta = label_type.casefold() == "packeta"
-    scale = min(
-        printable_width / image_width,
-        printable_height / image_height,
-    ) * (RETAIL_UP_PACKETA_PRINT_SCALE if is_packeta else RETAIL_UP_PRINT_SCALE)
-    target_width = max(1, round(image_width * scale))
-    target_height = max(1, round(image_height * scale))
-    bbox_left, bbox_top, bbox_right, bbox_bottom = content_bbox or (
-        0,
-        0,
-        image_width,
-        image_height,
-    )
-    # Position the full bitmap so the non-white content, rather than its PDF
-    # canvas, reaches the requested printable corner. Any overflow consists of
-    # the page's white margin and can be safely clipped by the printer.
-    left = printable_width - round(bbox_right * scale)
-    top = (
-        -round(bbox_top * scale)
-        if is_packeta
-        else printable_height - round(bbox_bottom * scale)
-    )
-    return left, top, left + target_width, top + target_height
-
-
-def RETAIL_UP_content_bbox(image: Image.Image) -> tuple[int, int, int, int]:
-    """Return the bounding box of pixels that are not effectively white."""
-    mask = image.convert("L").point(lambda value: 255 if value < 245 else 0)
-    return mask.getbbox() or (0, 0, image.width, image.height)
-
-
 def print_pdf_page(
     pdf_path: Path,
     page_number: int,
     printer_name: str,
     label_type: str,
 ) -> None:
-    """Print UPS bottom-right/rotated or Packeta top-right/landscape."""
+    """Print UPS unchanged or rotate a Packeta page 90 degrees clockwise."""
     document = pymupdf.open(pdf_path)
     printer_handle = None
     printer_dc = None
@@ -1770,12 +1729,7 @@ def print_pdf_page(
         )
         is_packeta = label_type.casefold() == "packeta"
         if is_packeta:
-            # Rotate the pixels explicitly: some Zebra drivers ignore or add
-            # their own rotation for landscape requests on custom 4x6 media.
             image = image.transpose(Image.Transpose.ROTATE_270)
-        else:
-            image = image.transpose(Image.Transpose.ROTATE_180)
-        content_bbox = RETAIL_UP_content_bbox(image)
 
         printer_handle = win32print.OpenPrinter(printer_name)
         printer_info = win32print.GetPrinter(printer_handle, 2)
@@ -1831,12 +1785,13 @@ def print_pdf_page(
         if printable_width <= 0 or printable_height <= 0:
             raise RuntimeError("Printer returned an invalid printable area")
 
-        print_rectangle = RETAIL_UP_print_rectangle(
-            image.size,
-            (printable_width, printable_height),
-            label_type,
-            content_bbox,
-        )
+        scale = min(
+            printable_width / image.width,
+            printable_height / image.height,
+        ) * RETAIL_UP_PRINT_SCALE
+        target_width = max(1, round(image.width * scale))
+        target_height = max(1, round(image.height * scale))
+        print_rectangle = (0, 0, target_width, target_height)
 
         win32print.StartDoc(
             printer_dc,
