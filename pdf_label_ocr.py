@@ -86,6 +86,12 @@ def _is_packeta_label(lines: list[str]) -> bool:
     return any(line.casefold() == "packeta.com" for line in lines)
 
 
+def _normalize_packeta_tracking_number(text: str) -> str | None:
+    """Accept Packeta Z numbers with optional OCR whitespace after the Z."""
+    normalized = re.sub(r"\s+", "", text).upper()
+    return normalized if re.fullmatch(r"Z\d{3,}", normalized) else None
+
+
 def _label_type_from_text(text: str) -> str | None:
     """Classify a page using the mutually exclusive label markers."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -108,11 +114,12 @@ def _parse_packeta_label(lines: list[str]) -> dict[str, str | None]:
     tracking_number = None
     customer_name = None
     for index, line in enumerate(lines[:-2]):
-        if not re.fullmatch(r"Z\d{3,}", line, flags=re.IGNORECASE):
+        normalized_tracking = _normalize_packeta_tracking_number(line)
+        if normalized_tracking is None:
             continue
         if lines[index + 1].casefold() != "crassula group s":
             continue
-        tracking_number = line.upper()
+        tracking_number = normalized_tracking
         customer_name = lines[index + 2]
         break
 

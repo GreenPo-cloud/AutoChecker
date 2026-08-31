@@ -1,9 +1,9 @@
-"""AutoChecker v2: dynamic discovery of displays and cameras.
+"""AutoChecker v2: dynamic discovery of displays, cameras and printers.
 
 Protocol received from a display (one command per line):
-    Start:<name>;<department>;<camera>\n
-    Stop:<name>;<department>;<camera>\n
-The combination name/department/camera identifies one running checker.
+    Start:<name>;<department>;<camera>;<printer>\n
+    Stop:<name>;<department>;<camera>;<printer>\n
+The printer field is optional for compatibility with existing displays.
 """
 
 from __future__ import annotations
@@ -113,14 +113,17 @@ ESP_ROM_PREFIX = "ESP-ROM:"
 PORT_SCAN_INTERVAL = 1.5
 CAMERA_SCAN_INTERVAL = 1.5
 CAMERA_STABLE_POLLS = 2
+PRINTER_SCAN_INTERVAL = 1.5
+PRINTER_STABLE_POLLS = 2
 SCAN_INTERVAL = 0.2
 PHOTO_DELAY = 2.5
 B2B_INDEX_FILENAME = "B2B_Order_Index.txt"
+RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.6"
+CURRENT_VERSION = "2.7"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -146,7 +149,6 @@ RETAIL_UP_PRINTER_DPI = 200
 RETAIL_UP_PAPER_WIDTH_TENTHS_MM = 1016
 RETAIL_UP_PAPER_HEIGHT_TENTHS_MM = 1524
 RETAIL_UP_PRINT_SCALE = 1.0
-DEFAULT_RETAIL_UP_PRINTER = "Zebra ZP 450 200 dpi"
 EXPECTED_DISPLAY_APP_SLOTS = (
     (0x10000, 0x140000, "app0"),
     (0x150000, 0x140000, "app1"),
@@ -423,6 +425,7 @@ class CheckerIdentity:
     name: str
     department: str
     camera_number: int | None
+    printer_name: str | None = None
 
 
 def load_settings() -> dict:
@@ -451,7 +454,7 @@ def close_serial_safely(display) -> None:
 
 
 def update_display_last_identity(display_mac: str, identity: CheckerIdentity) -> None:
-    """Persist the last name, department and camera selected on one display."""
+    """Persist the last name, department, camera and printer selection."""
     with portalocker.Lock(str(SETTINGS_FILE), mode="r+", encoding="utf-8", timeout=30) as file:
         file.seek(0)
         settings = json.load(file)
@@ -459,6 +462,7 @@ def update_display_last_identity(display_mac: str, identity: CheckerIdentity) ->
             identity.name,
             identity.department,
             identity.camera_number if identity.camera_number is not None else "",
+            identity.printer_name or "",
         ]
         file.seek(0)
         file.truncate()
@@ -522,11 +526,16 @@ def add_setting_value(selector: str, value: str, key: str) -> tuple[bool, str]:
     """Apply one ADD:<selector>;<value>;<key> command to Settings.json."""
     # The display uses `/` as a convenient input character, while settings
     # names use `|`. Apply this to every ADD parameter in one common place so
-    # launcher and worker commands behave identically.
+    # launcher and worker commands behave identically. A Merch key beginning
+    # with https: is a URL, so its slashes must remain untouched.
+    keep_url_key = (
+        selector.strip().casefold() == "merch"
+        and key.strip().casefold().startswith("https:")
+    )
     selector = selector.replace("/", "|").strip()
     raw_value = value.replace("/", "|")
     value = raw_value.strip()
-    key = key.replace("/", "|").strip()
+    key = key.strip() if keep_url_key else key.replace("/", "|").strip()
 
     with portalocker.Lock(str(SETTINGS_FILE), mode="r+", encoding="utf-8", timeout=30) as file:
         file.seek(0)
@@ -631,6 +640,25 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
     display_settings = settings.setdefault("DISPLAY", {})
     _, changed = ensure_other_slots(settings)
 
+    # Migrate the former global PRINTER.RETAIL_UP value to the per-display
+    # last selection, then remove the obsolete dictionary.
+    legacy_printers = settings.pop("PRINTER", None)
+    legacy_printer = ""
+    if isinstance(legacy_printers, dict):
+        configured = legacy_printers.get(RETAIL_UP_DEPARTMENT, [])
+        if isinstance(configured, str):
+            configured = [configured]
+        if isinstance(configured, list):
+            legacy_printer = next(
+                (
+                    str(printer).strip()
+                    for printer in configured
+                    if str(printer).strip()
+                ),
+                "",
+            )
+        changed = True
+
     departments = settings.setdefault("DEPARTMENT", [])
     if (
         isinstance(departments, list)
@@ -639,12 +667,8 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
         departments.append(RETAIL_UP_DEPARTMENT)
         changed = True
 
-    printers = settings.setdefault("PRINTER", {})
-    if (
-        isinstance(printers, dict)
-        and RETAIL_UP_DEPARTMENT not in printers
-    ):
-        printers[RETAIL_UP_DEPARTMENT] = [DEFAULT_RETAIL_UP_PRINTER]
+    if settings.get("CHECK") is None:
+        settings["CHECK"] = {}
         changed = True
 
     for camera_number in cameras:
@@ -652,9 +676,24 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
             focus[str(camera_number)] = 540
             changed = True
 
+    for display_mac, values in list(display_settings.items()):
+        if not isinstance(values, list):
+            values = ["", "", "", ""]
+        else:
+            values = (values + ["", "", "", ""])[:4]
+        if (
+            not values[3]
+            and str(values[1]).upper() == RETAIL_UP_DEPARTMENT
+            and legacy_printer
+        ):
+            values[3] = legacy_printer
+        if display_settings.get(display_mac) != values:
+            display_settings[display_mac] = values
+            changed = True
+
     for display_mac in displays:
         if display_mac not in display_settings:
-            display_settings[display_mac] = ["", "", ""]
+            display_settings[display_mac] = ["", "", "", ""]
             changed = True
 
     if changed:
@@ -803,6 +842,48 @@ def find_autochecker_cameras(*, announce: bool = True) -> dict[int, int]:
     return cameras
 
 
+def find_available_printers(*, announce: bool = False) -> list[str]:
+    """Return installed Windows printer queues that are not marked offline."""
+    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+    offline_status = (
+        getattr(win32print, "PRINTER_STATUS_OFFLINE", 0x80)
+        | getattr(win32print, "PRINTER_STATUS_NOT_AVAILABLE", 0x1000)
+    )
+    work_offline = getattr(
+        win32print,
+        "PRINTER_ATTRIBUTE_WORK_OFFLINE",
+        0x400,
+    )
+    printers: dict[str, str] = {}
+    for printer in win32print.EnumPrinters(flags):
+        printer_name = str(printer[2]).strip()
+        if not printer_name:
+            continue
+        handle = None
+        try:
+            handle = win32print.OpenPrinter(printer_name)
+            printer_info = win32print.GetPrinter(handle, 2)
+            status = int(printer_info.get("Status", 0) or 0)
+            attributes = int(printer_info.get("Attributes", 0) or 0)
+            if status & offline_status or attributes & work_offline:
+                continue
+        except pywintypes.error:
+            continue
+        finally:
+            if handle is not None:
+                try:
+                    win32print.ClosePrinter(handle)
+                except pywintypes.error:
+                    pass
+        printers.setdefault(printer_name.casefold(), printer_name)
+
+    result = sorted(printers.values(), key=str.casefold)
+    if announce:
+        for printer_name in result:
+            print(f"* Printer found: {printer_name}")
+    return result
+
+
 def _prioritise(values: list, preferred) -> list:
     """Move a stored value to the front, only when it is still available."""
     for index, value in enumerate(values):
@@ -811,23 +892,33 @@ def _prioritise(values: list, preferred) -> list:
     return values
 
 
-def upload_display_data(display: serial.Serial, display_mac: str, settings: dict,
-                        cameras: dict[int, int]) -> None:
+def upload_display_data(
+    display: serial.Serial,
+    display_mac: str,
+    settings: dict,
+    cameras: dict[int, int],
+    printers: list[str],
+) -> None:
     """Upload menu options, placing the display's last selection first."""
-    last_values = settings.get("DISPLAY", {}).get(display_mac, ["", "", ""])
-    last_values = (list(last_values) + ["", "", ""])[:3]
+    last_values = settings.get("DISPLAY", {}).get(
+        display_mac,
+        ["", "", "", ""],
+    )
+    last_values = (list(last_values) + ["", "", "", ""])[:4]
     names = _prioritise(list(settings.get("NAME", [])), last_values[0])
     departments = _prioritise(list(settings.get("DEPARTMENT", [])), last_values[1])
     camera_numbers = _prioritise(sorted(cameras), last_values[2])
+    printer_names = _prioritise(list(printers), last_values[3])
 
     fields = [
         ",".join(map(str, names)),
         ",".join(map(str, departments)),
         ",".join(map(str, camera_numbers)),
+        ",".join(printer_names),
         "*ORDER*",
     ]
     for setting_name, setting_value in settings.items():
-        if setting_name in {"DEPARTMENT", "DISPLAY", "OTHER"}:
+        if setting_name in {"DEPARTMENT", "DISPLAY", "OTHER", "PRINTER"}:
             continue
         if setting_name == "FOCUS":
             if isinstance(setting_value, dict):
@@ -867,12 +958,39 @@ def cameras_available_for_selection(
     }
 
 
-def refresh_idle_display_data(settings: dict, cameras: dict[int, int],
-                              idle_displays: dict[str, serial.Serial]) -> None:
+def printers_available_for_selection(
+    printers: list[str],
+    worker_identities: dict[str, CheckerIdentity],
+) -> list[str]:
+    """Exclude printers currently owned by running checker processes."""
+    reserved = {
+        identity.printer_name.casefold()
+        for identity in worker_identities.values()
+        if identity.printer_name
+    }
+    return [
+        printer_name
+        for printer_name in printers
+        if printer_name.casefold() not in reserved
+    ]
+
+
+def refresh_idle_display_data(
+    settings: dict,
+    cameras: dict[int, int],
+    printers: list[str],
+    idle_displays: dict[str, serial.Serial],
+) -> None:
     """Send current menu data to every display still owned by the launcher."""
     for display_number, display in idle_displays.items():
         try:
-            upload_display_data(display, display_number, settings, cameras)
+            upload_display_data(
+                display,
+                display_number,
+                settings,
+                cameras,
+                printers,
+            )
         except (serial.SerialException, OSError) as error:
             print(f"XXX Cannot upload data to AutoChecker {display_number}: {error}")
 
@@ -880,41 +998,80 @@ def refresh_idle_display_data(settings: dict, cameras: dict[int, int],
 def broadcast_display_data(
         settings: dict,
         cameras: dict[int, int],
+        printers: list[str],
         idle_displays: dict[str, serial.Serial],
         worker_update_queues: dict[str, multiprocessing.Queue],
         worker_identities: dict[str, CheckerIdentity],
 ) -> None:
-    """Refresh displays using only cameras not reserved by active workers."""
+    """Refresh displays using devices not reserved by active workers."""
     available_cameras = cameras_available_for_selection(
         cameras,
         worker_identities,
     )
-    refresh_idle_display_data(settings, available_cameras, idle_displays)
+    available_printers = printers_available_for_selection(
+        printers,
+        worker_identities,
+    )
+    refresh_idle_display_data(
+        settings,
+        available_cameras,
+        available_printers,
+        idle_displays,
+    )
 
     for display_number, update_queue in worker_update_queues.items():
         try:
-            update_queue.put_nowait(("uploadData", dict(available_cameras)))
+            update_queue.put_nowait((
+                "uploadData",
+                dict(available_cameras),
+                list(available_printers),
+            ))
         except (OSError, ValueError, queue.Full) as error:
             print(f"XXX Cannot notify AutoChecker {display_number}: {error}")
 
 
 def parse_command(line: str) -> tuple[str, CheckerIdentity] | None:
     """Parse one Start or Stop line; reject malformed data."""
-    match = re.fullmatch(r"(Start|Stop):([^;\r\n]+);([^;\r\n]+);(\d*)", line.strip())
+    match = re.fullmatch(
+        r"(Start|Stop):([^;\r\n]+);([^;\r\n]+);(\d*)"
+        r"(?:;([^;\r\n]*))?",
+        line.strip(),
+    )
     if not match:
         return None
 
-    action, name, department, camera_number = match.groups()
+    action, name, department, camera_number, printer_name = match.groups()
     identity = CheckerIdentity(
         name.strip(),
         department.strip(),
         int(camera_number) if camera_number else None,
+        printer_name.strip() if printer_name and printer_name.strip() else None,
     )
 
     if not identity.name or not identity.department:
         return None
 
     return action, identity
+
+
+def stop_matches_identity(
+    stop_identity: CheckerIdentity,
+    running_identity: CheckerIdentity,
+) -> bool:
+    """Match legacy three-field Stop commands and new four-field commands."""
+    return (
+        stop_identity.name == running_identity.name
+        and stop_identity.department == running_identity.department
+        and stop_identity.camera_number == running_identity.camera_number
+        and (
+            stop_identity.printer_name is None
+            or (
+                running_identity.printer_name is not None
+                and stop_identity.printer_name.casefold()
+                == running_identity.printer_name.casefold()
+            )
+        )
+    )
 
 
 def department_paths(department: str) -> tuple[Path, Path]:
@@ -1568,8 +1725,8 @@ def prepare_RETAIL_UP_label_data() -> list[tuple[Path, Path, int]]:
     return label_files
 
 
-def RETAIL_UP_tracking_from_statistics(order_id: str) -> str:
-    """Validate one completed RETAIL order and return its tracking number."""
+def RETAIL_UP_ready_statistics_line(order_id: str) -> str:
+    """Return one completed, non-cancelled RETAIL statistics line."""
     normalized_order = order_id.strip()
     if not re.fullmatch(r"#\d+", normalized_order):
         raise ValueError(f"Invalid order number {order_id}")
@@ -1598,6 +1755,14 @@ def RETAIL_UP_tracking_from_statistics(order_id: str) -> str:
     if "+" not in status:
         raise ValueError(f"Order is not completed {normalized_order}")
 
+    return matching_line
+
+
+def RETAIL_UP_tracking_from_statistics(order_id: str) -> str:
+    """Validate one completed RETAIL order and return its tracking number."""
+    normalized_order = order_id.strip()
+    matching_line = RETAIL_UP_ready_statistics_line(normalized_order)
+
     order_position = matching_line.find(normalized_order)
     prefix = matching_line[:order_position].strip()
     tracking_number = prefix.split(maxsplit=1)[0] if prefix else ""
@@ -1605,6 +1770,47 @@ def RETAIL_UP_tracking_from_statistics(order_id: str) -> str:
     if not tracking_number:
         raise LookupError(f"Tracking number is missing for {normalized_order}")
     return tracking_number
+
+
+def RETAIL_UP_today_orders() -> dict[str, str]:
+    """Return today's RETAIL statistics lines indexed by order number."""
+    stat_file = (
+        DESKTOP_DIR
+        / "RETAIL"
+        / "Statistik"
+        / f"{datetime.date.today():%d.%m.%Y}.txt"
+    )
+    if not stat_file.is_file():
+        raise FileNotFoundError("Today's RETAIL statistics file was not found")
+
+    orders: dict[str, str] = {}
+    for line in read_stat_lines(stat_file):
+        order_id = retail_order_id_from_stat_line(line)
+        if order_id is not None and order_id not in orders:
+            orders[order_id] = line.rstrip("\r\n")
+    return orders
+
+
+def parse_RETAIL_UP_print_label_command(
+    line: str,
+) -> tuple[str, str | None]:
+    """Parse Print_Label:first[;last], keeping an empty last value optional."""
+    prefix = "Print_Label:"
+    if not line.startswith(prefix):
+        raise ValueError("Invalid Print_Label command")
+
+    parameters = [value.strip() for value in line[len(prefix):].split(";")]
+    if len(parameters) not in {1, 2} or not parameters[0]:
+        raise ValueError(
+            "Print_Label command must contain one or two order numbers"
+        )
+
+    first_order = parameters[0]
+    last_order = parameters[1] if len(parameters) == 2 else ""
+    for order_id in (first_order, last_order):
+        if order_id and not re.fullmatch(r"#\d+", order_id):
+            raise ValueError(f"Invalid order number {order_id}")
+    return first_order, last_order or None
 
 
 def append_RETAIL_UP_print_name(order_id: str, name: str) -> None:
@@ -1629,6 +1835,103 @@ def append_RETAIL_UP_print_name(order_id: str, name: str) -> None:
             file.flush()
             return
     raise LookupError(f"Unknown order {normalized_order}")
+
+
+def RETAIL_UP_shipping_progress_from_lines(
+    lines: list[str],
+) -> tuple[int, int, int]:
+    """Count orders and those having a printer name after + or (+)."""
+    total = 0
+    completed = 0
+    for line in lines:
+        if retail_order_id_from_stat_line(line) is None:
+            continue
+        total += 1
+        status = retail_stat_order_suffix(line)
+        printed_name = re.search(r"(?:\(\+\)|\+)\s+(.+?)\s*$", status)
+        if (
+            "cancelled" not in status.casefold()
+            and printed_name is not None
+            and printed_name.group(1).strip()
+        ):
+            completed += 1
+    return completed, total - completed, total
+
+
+def RETAIL_UP_shipping_progress() -> tuple[int, int, int]:
+    """Return completed-for-shipping, left and all RETAIL orders for today."""
+    stat_file = (
+        DESKTOP_DIR
+        / "RETAIL"
+        / "Statistik"
+        / f"{datetime.date.today():%d.%m.%Y}.txt"
+    )
+    if not stat_file.is_file():
+        return 0, 0, 0
+    return RETAIL_UP_shipping_progress_from_lines(read_stat_lines(stat_file))
+
+
+def RETAIL_check_fragments(settings: dict) -> list[str]:
+    """Read CHECK fragments from either a dictionary, list or single string."""
+    configured = settings.get("CHECK", {})
+    if isinstance(configured, dict):
+        values = [
+            value.strip()
+            for value in configured.values()
+            if isinstance(value, str) and value.strip()
+        ]
+        candidates = values or [str(key).strip() for key in configured]
+    elif isinstance(configured, list):
+        candidates = [str(value).strip() for value in configured]
+    elif isinstance(configured, str):
+        candidates = [configured.strip()]
+    else:
+        candidates = []
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = candidate.casefold()
+        if candidate and key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def RETAIL_UP_check_lines(order_id: str, settings: dict) -> list[str]:
+    """Return quantity/name lines whose products match configured CHECK text."""
+    fragments = RETAIL_check_fragments(settings)
+    if not fragments:
+        return []
+    fragment_keys = [fragment.casefold() for fragment in fragments]
+    today = datetime.date.today()
+    for pdf_date, _part, pdf_path in reversed(_available_order_pdfs()):
+        if pdf_date != today:
+            continue
+        try:
+            orders, _metadata = load_or_create_RETAIL_order_cache(
+                pdf_path, settings
+            )
+        except Exception as error:
+            Printer(f"XXX Cannot load {pdf_path.name} for CHECK: {error}")
+            continue
+        matched_order = next(
+            (
+                items
+                for stored_order, items in orders.items()
+                if stored_order.lstrip("#") == order_id.lstrip("#")
+            ),
+            None,
+        )
+        if matched_order is None:
+            continue
+        return [
+            f"{quantity} {name}"
+            for name, quantity in matched_order
+            if any(fragment in name.casefold() for fragment in fragment_keys)
+        ]
+    Printer(f"? Order data for CHECK not found: {order_id}")
+    return []
 
 
 def find_RETAIL_UP_label_page(
@@ -1675,29 +1978,6 @@ def find_RETAIL_UP_label_page(
             )
         return pdf_path, page_number, normalized_label_type
     raise LookupError(f"Tracking number not found in Label JSON: {tracking_number}")
-
-
-def configured_RETAIL_UP_printer(settings: dict) -> str:
-    """Resolve the first configured RETAIL_UP printer installed in Windows."""
-    configured = settings.get("PRINTER", {}).get(RETAIL_UP_DEPARTMENT, [])
-    if isinstance(configured, str):
-        configured = [configured]
-    if not isinstance(configured, list):
-        raise ValueError("PRINTER.RETAIL_UP must be a string or list")
-    requested = [str(name).strip() for name in configured if str(name).strip()]
-    if not requested:
-        raise ValueError("No printer configured for RETAIL_UP")
-
-    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-    installed = {
-        str(printer[2]).casefold(): str(printer[2])
-        for printer in win32print.EnumPrinters(flags)
-    }
-    for name in requested:
-        actual_name = installed.get(name.casefold())
-        if actual_name is not None:
-            return actual_name
-    raise LookupError("Configured RETAIL_UP printer is not installed: " + ", ".join(requested))
 
 
 def print_pdf_page(
@@ -1826,26 +2106,142 @@ def print_pdf_page(
         document.close()
 
 
-def process_RETAIL_UP_scan(worker: dict, settings: dict, order_id: str) -> bool:
-    """Validate an order, locate its label page and submit it for printing."""
-    try:
+def submit_RETAIL_UP_label(
+    worker: dict,
+    settings: dict,
+    order_id: str,
+    *,
+    parenthesize_print_name: bool = False,
+) -> tuple[str, bool]:
+    """Validate one order, optionally print it, and record the worker name."""
+    printer_name = str(worker.get("PRINTER", "")).strip()
+    if printer_name:
         tracking_number = RETAIL_UP_tracking_from_statistics(order_id)
         pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
             tracking_number
         )
-        printer_name = configured_RETAIL_UP_printer(settings)
         print_pdf_page(pdf_path, page_number, printer_name, label_type)
-        append_RETAIL_UP_print_name(order_id, worker["NAME"])
-        message = (
+        status_message = (
             f"+ Label printed {order_id.lstrip('#')} page {page_number}"
         )
+        physically_printed = True
+    else:
+        RETAIL_UP_ready_statistics_line(order_id)
+        status_message = (
+            f"+ Order {order_id.lstrip('#')} recorded without printing"
+        )
+        physically_printed = False
+    recorded_name = worker["NAME"]
+    if physically_printed and parenthesize_print_name:
+        recorded_name = f"({recorded_name})"
+    append_RETAIL_UP_print_name(order_id, recorded_name)
+    return status_message, physically_printed
+
+
+def process_RETAIL_UP_scan(
+    worker: dict,
+    settings: dict,
+    order_id: str,
+    *,
+    parenthesize_print_name: bool = False,
+) -> bool:
+    """Validate an order, print its label and show configured CHECK items."""
+    check_lines = []
+    try:
+        status_message, _physically_printed = submit_RETAIL_UP_label(
+            worker,
+            settings,
+            order_id,
+            parenthesize_print_name=parenthesize_print_name,
+        )
+        check_lines = RETAIL_UP_check_lines(order_id, settings)
         success = True
     except Exception as error:
-        message = f"XXX {error}"
+        status_message = f"XXX {error}"
         success = False
+    completed, left, total = RETAIL_UP_shipping_progress()
+    message = "\n".join((
+        f"* Completed: {completed}, Left: {left}, All: {total}",
+        status_message,
+        *check_lines,
+    ))
     Printer(message)
     send(worker["DISPLAY"], message)
     return success
+
+
+def process_RETAIL_UP_label_range(
+    worker: dict,
+    settings: dict,
+    first_order: str,
+    last_order: str,
+) -> int:
+    """Print every ready order in an inclusive numeric statistics range."""
+    try:
+        orders = RETAIL_UP_today_orders()
+        missing_endpoints = [
+            order_id
+            for order_id in (first_order, last_order)
+            if order_id not in orders
+        ]
+        if missing_endpoints:
+            missing = ", ".join(dict.fromkeys(missing_endpoints))
+            raise LookupError(f"Unknown order {missing}")
+
+        first_number = int(first_order[1:])
+        last_number = int(last_order[1:])
+        lower, upper = sorted((first_number, last_number))
+        selected_orders = sorted(
+            (
+                order_id
+                for order_id in orders
+                if lower <= int(order_id[1:]) <= upper
+            ),
+            key=lambda order_id: int(order_id[1:]),
+        )
+
+        status_lines = []
+        processed_count = 0
+        printed_count = 0
+        for order_id in selected_orders:
+            status = retail_stat_order_suffix(orders[order_id])
+            if "cancelled" in status.casefold():
+                status_lines.append(f"XXX {order_id} is Cancelled")
+                continue
+            if "+" not in status:
+                status_lines.append(f"XXX {order_id} not ready for packing")
+                continue
+            try:
+                _status_message, physically_printed = submit_RETAIL_UP_label(
+                    worker,
+                    settings,
+                    order_id,
+                    parenthesize_print_name=True,
+                )
+                processed_count += 1
+                if physically_printed:
+                    printed_count += 1
+            except Exception as error:
+                status_lines.append(f"XXX {order_id}: {error}")
+    except Exception as error:
+        processed_count = 0
+        printed_count = 0
+        status_lines = [f"XXX {error}"]
+
+    completed, left, total = RETAIL_UP_shipping_progress()
+    result_line = (
+        f"+ Labels printed: {printed_count}"
+        if worker.get("PRINTER")
+        else f"+ Orders recorded: {processed_count}"
+    )
+    message = "\n".join((
+        f"* Completed: {completed}, Left: {left}, All: {total}",
+        result_line,
+        *status_lines,
+    ))
+    Printer(message)
+    send(worker["DISPLAY"], message)
+    return processed_count
 
 
 def find_downloaded_B2B_pdf(
@@ -2282,17 +2678,18 @@ def restore_RETAIL_wrapped_lines(text: str, tracking_pattern: re.Pattern) -> str
     return "\n".join(restored_lines)
 
 
-def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> dict:
-    pdf_path, _ = find_latest_pdf(previous)
-    if pdf_path is None:
-        message = "XXX Orders PDF not found in Downloads"
-        Printer(message)
-        send(worker["DISPLAY"], message)
-        return {}
-    message = f"* Update PDF | {pdf_path.name}"
-    Printer(message)
-    send(worker["DISPLAY"], message)
+def RETAIL_order_cache_path(pdf_path: Path) -> Path:
+    """Return the sibling `PDF stem (Order).json` cache path."""
+    return pdf_path.with_name(pdf_path.stem + RETAIL_ORDER_CACHE_SUFFIX)
+
+
+def parse_RETAIL_pdf_document(
+    pdf_path: Path,
+    config: dict,
+) -> tuple[OrderedDict[str, list[tuple[str, int]]], dict[str, dict]]:
+    """Extract RETAIL orders and metadata from one source PDF."""
     import pdfplumber
+
     with pdfplumber.open(pdf_path) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages).replace("\r", "\n")
 
@@ -2321,6 +2718,7 @@ def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> d
         metadata_by_order[order_id] = {
             "tracking_number": tracking_match.group(0) if tracking_match else "",
             "customer_name": re.sub(r"\s+", " ", match.group(3)).strip(),
+            "stealth": "YES" if match.group(2) else "NO",
         }
 
     text = restore_RETAIL_wrapped_lines(text, tracking_pattern)
@@ -2334,7 +2732,7 @@ def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> d
     for index in range(1, len(blocks), 2):
         order_id = blocks[index].strip()
         contents[order_id] = contents.get(order_id, "") + " " + (blocks[index + 1] if index + 1 < len(blocks) else "")
-    parsed = {}
+    parsed: OrderedDict[str, list[tuple[str, int]]] = OrderedDict()
     for order_id, block in contents.items():
         matches = re.findall(r"\u2610\s+(.*?)\s*[-–]\s*x(\d+)", block, flags=re.DOTALL)
         aggregated: OrderedDict[str, int] = OrderedDict()
@@ -2344,6 +2742,130 @@ def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> d
         items = [(name, qty) for name, qty in aggregated.items() if not any(remove in name for remove in config["REMOVE_ITEMS"])]
         items.sort(key=lambda item: sort_key(item, config))
         parsed[order_id] = items
+        metadata_by_order.setdefault(
+            order_id,
+            {
+                "tracking_number": "",
+                "customer_name": "",
+                "stealth": "NO",
+            },
+        )
+    return parsed, metadata_by_order
+
+
+def RETAIL_order_cache_document(
+    parsed: dict[str, list[tuple[str, int]]],
+    metadata_by_order: dict[str, dict],
+) -> OrderedDict[str, dict]:
+    """Build the public Order JSON schema from internal RETAIL structures."""
+    document: OrderedDict[str, dict] = OrderedDict()
+    for order_id, items in parsed.items():
+        metadata = metadata_by_order.get(order_id, {})
+        stealth = str(metadata.get("stealth", "NO")).strip().upper()
+        document[order_id] = {
+            "TrackNumber": str(metadata.get("tracking_number", "")),
+            "CustomerName": str(metadata.get("customer_name", "")),
+            "Stealth": "YES" if stealth == "YES" else "NO",
+            "Order": [
+                {"Name": name, "Quantity": quantity}
+                for name, quantity in items
+            ],
+        }
+    return document
+
+
+def decode_RETAIL_order_cache(
+    document: object,
+) -> tuple[OrderedDict[str, list[tuple[str, int]]], dict[str, dict]]:
+    """Validate and convert one Order JSON document to internal structures."""
+    if not isinstance(document, dict):
+        raise ValueError("Order JSON root must be an object")
+
+    parsed: OrderedDict[str, list[tuple[str, int]]] = OrderedDict()
+    metadata_by_order: dict[str, dict] = {}
+    for order_id, entry in document.items():
+        if not re.fullmatch(r"#\d+", str(order_id)) or not isinstance(entry, dict):
+            raise ValueError("Invalid order entry in Order JSON")
+        if not {"TrackNumber", "CustomerName", "Stealth", "Order"} <= entry.keys():
+            raise ValueError(f"Incomplete Order JSON entry: {order_id}")
+        stealth = str(entry["Stealth"]).strip().upper()
+        if stealth not in {"YES", "NO"} or not isinstance(entry["Order"], list):
+            raise ValueError(f"Invalid Order JSON entry: {order_id}")
+
+        items = []
+        for item in entry["Order"]:
+            if (
+                not isinstance(item, dict)
+                or not {"Name", "Quantity"} <= item.keys()
+            ):
+                raise ValueError(f"Invalid item in Order JSON: {order_id}")
+            name = str(item["Name"]).strip()
+            quantity = item["Quantity"]
+            if not name or isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+                raise ValueError(f"Invalid item in Order JSON: {order_id}")
+            items.append((name, quantity))
+
+        normalized_order_id = str(order_id)
+        parsed[normalized_order_id] = items
+        metadata_by_order[normalized_order_id] = {
+            "tracking_number": str(entry["TrackNumber"]).strip(),
+            "customer_name": str(entry["CustomerName"]).strip(),
+            "stealth": stealth,
+        }
+    return parsed, metadata_by_order
+
+
+def load_or_create_RETAIL_order_cache(
+    pdf_path: Path,
+    config: dict,
+) -> tuple[OrderedDict[str, list[tuple[str, int]]], dict[str, dict]]:
+    """Load a validated Order JSON or rebuild it once from its sibling PDF."""
+    cache_path = RETAIL_order_cache_path(pdf_path)
+    with portalocker.Lock(
+        str(cache_path), mode="a+", encoding="utf-8", timeout=120
+    ) as file:
+        file.seek(0)
+        raw = file.read().strip()
+        if raw:
+            try:
+                result = decode_RETAIL_order_cache(json.loads(raw))
+                Printer(f"* Order JSON loaded | {cache_path.name}")
+                return result
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                Printer(f"? Rebuilding invalid Order JSON {cache_path.name}: {error}")
+
+        parsed, metadata_by_order = parse_RETAIL_pdf_document(pdf_path, config)
+        if not parsed:
+            raise ValueError(f"No RETAIL orders found in {pdf_path.name}")
+        document = RETAIL_order_cache_document(parsed, metadata_by_order)
+        file.seek(0)
+        file.truncate()
+        json.dump(document, file, ensure_ascii=False, indent=4)
+        file.write("\n")
+        file.flush()
+        Printer(f"* Order JSON created | {cache_path.name}")
+        return parsed, metadata_by_order
+
+
+def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> dict:
+    pdf_path, _ = find_latest_pdf(previous)
+    if pdf_path is None:
+        message = "XXX Orders PDF not found in Downloads"
+        Printer(message)
+        send(worker["DISPLAY"], message)
+        return {}
+    message = f"* Update PDF | {pdf_path.name}"
+    Printer(message)
+    send(worker["DISPLAY"], message)
+    try:
+        parsed, metadata_by_order = load_or_create_RETAIL_order_cache(
+            pdf_path, config
+        )
+    except Exception as error:
+        message = f"XXX Cannot load orders from {pdf_path.name}: {error}"
+        Printer(message)
+        send(worker["DISPLAY"], message)
+        return {}
     worker["RETAIL_ORDER_META"] = metadata_by_order
     save_part_to_statistics(worker, pdf_path, parsed)
     return parsed
@@ -2931,6 +3453,7 @@ def RETAIL_daily_order_counts(worker: dict) -> tuple[int, int]:
 
 def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | None,
          display_port: str, display_number: str, cameras: dict[int, int],
+         printers: list[str],
          settings_update_requests: multiprocessing.Queue,
          display_update_queue: multiprocessing.Queue,
          display_reset_event: multiprocessing.Event,
@@ -2978,9 +3501,13 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "FOTO": photo_dir,
             "STATISTICS": statistics_dir,
             "HAS_CAMERA": cap is not None,
+            "PRINTER": identity.printer_name or "",
             "PERFORMANCE_STATS": performance_stats,
         }
-        if identity.department.upper() == RETAIL_UP_DEPARTMENT:
+        if (
+            identity.department.upper() == RETAIL_UP_DEPARTMENT
+            and identity.printer_name
+        ):
             message = "* Label OCR started"
             Printer(message)
             send(display, message)
@@ -3031,13 +3558,14 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
 
             display_update_requested = False
             updated_cameras = None
+            updated_printers = None
             camera_stop_reason = None
             while True:
                 try:
                     update_message = display_update_queue.get_nowait()
                     if (
                         isinstance(update_message, tuple)
-                        and len(update_message) == 2
+                        and len(update_message) in {2, 3}
                     ):
                         if (
                             update_message[0] == "uploadData"
@@ -3045,6 +3573,11 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         ):
                             display_update_requested = True
                             updated_cameras = update_message[1]
+                            if (
+                                len(update_message) == 3
+                                and isinstance(update_message[2], list)
+                            ):
+                                updated_printers = update_message[2]
                         elif update_message[0] == "stop":
                             camera_stop_reason = str(update_message[1])
                 except queue.Empty:
@@ -3063,9 +3596,17 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             if display_update_requested:
                 if updated_cameras is not None:
                     cameras = updated_cameras
+                if updated_printers is not None:
+                    printers = updated_printers
                 config = load_settings()
                 try:
-                    upload_display_data(display, display_number, config, cameras)
+                    upload_display_data(
+                        display,
+                        display_number,
+                        config,
+                        cameras,
+                        printers,
+                    )
                 except serial.SerialTimeoutException as error:
                     # A settings refresh must not stop order processing merely
                     # because the display consumed a large packet too slowly.
@@ -3095,7 +3636,11 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                 break
 
             command = parse_command(line) if line else None
-            if command == ("Stop", identity):
+            if (
+                command is not None
+                and command[0] == "Stop"
+                and stop_matches_identity(command[1], identity)
+            ):
                 print(f"* Stop received for {identity}")
                 break
 
@@ -3111,6 +3656,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         new_name,
                         identity.department,
                         identity.camera_number,
+                        identity.printer_name,
                     )
                     worker["NAME"] = new_name
                     update_display_last_identity(display_number, identity)
@@ -3211,6 +3757,38 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         performance_stats.stop_tracking()
                         display.write(b"<Ready>\n")
                         display.flush()
+
+            if line.startswith("Print_Label:"):
+                if identity.department.upper() != RETAIL_UP_DEPARTMENT:
+                    message = (
+                        "XXX Print_Label is available only for RETAIL_UP"
+                    )
+                    Printer(message)
+                    send(worker["DISPLAY"], message)
+                else:
+                    try:
+                        first_order, last_order = (
+                            parse_RETAIL_UP_print_label_command(line)
+                        )
+                    except ValueError as error:
+                        message = f"XXX {error}"
+                        Printer(message)
+                        send(worker["DISPLAY"], message)
+                    else:
+                        if last_order is None:
+                            process_RETAIL_UP_scan(
+                                worker,
+                                config,
+                                first_order,
+                                parenthesize_print_name=True,
+                            )
+                        else:
+                            process_RETAIL_UP_label_range(
+                                worker,
+                                config,
+                                first_order,
+                                last_order,
+                            )
 
             is_direct_B2B_order = (
                 identity.department.upper() == "B2B"
@@ -3373,6 +3951,13 @@ def dispatcher() -> None:
     cameras = find_autochecker_cameras()
     if not cameras:
         print("? No AutoChecker cameras found; launcher will continue without cameras")
+    try:
+        printers = find_available_printers(announce=True)
+    except Exception as error:
+        printers = []
+        print(f"XXX Cannot enumerate printers: {error}")
+    if not printers:
+        print("? No available printers found; launcher will continue without printers")
 
     # Camera focus defaults do not depend on whether a display is currently on.
     settings = ensure_detected_settings(cameras, {})
@@ -3398,6 +3983,9 @@ def dispatcher() -> None:
     next_camera_scan = time.monotonic() + CAMERA_SCAN_INTERVAL
     pending_camera_snapshot: dict[int, int] | None = None
     pending_camera_polls = 0
+    next_printer_scan = time.monotonic() + PRINTER_SCAN_INTERVAL
+    pending_printer_snapshot: list[str] | None = None
+    pending_printer_polls = 0
 
     try:
         for display_number, port in list(display_ports.items()):
@@ -3408,6 +3996,7 @@ def dispatcher() -> None:
                     display_number,
                     settings,
                     cameras,
+                    printers,
                 )
                 notify_launcher_ready(idle_displays[display_number])
             except (serial.SerialException, OSError) as error:
@@ -3447,6 +4036,10 @@ def dispatcher() -> None:
                                 cameras,
                                 worker_identities,
                             ),
+                            printers_available_for_selection(
+                                printers,
+                                worker_identities,
+                            ),
                             idle_displays,
                         )
                         print(
@@ -3465,6 +4058,10 @@ def dispatcher() -> None:
                             settings,
                             cameras_available_for_selection(
                                 cameras,
+                                worker_identities,
+                            ),
+                            printers_available_for_selection(
+                                printers,
                                 worker_identities,
                             ),
                             idle_displays,
@@ -3528,6 +4125,10 @@ def dispatcher() -> None:
                             current_settings,
                             cameras_available_for_selection(
                                 cameras,
+                                worker_identities,
+                            ),
+                            printers_available_for_selection(
+                                printers,
                                 worker_identities,
                             ),
                         )
@@ -3617,12 +4218,65 @@ def dispatcher() -> None:
                     broadcast_display_data(
                         settings,
                         cameras,
+                        printers,
                         idle_displays,
                         worker_update_queues,
                         worker_identities,
                     )
 
                 next_camera_scan = time.monotonic() + CAMERA_SCAN_INTERVAL
+
+            if time.monotonic() >= next_printer_scan:
+                try:
+                    detected_printers = find_available_printers()
+                except Exception as error:
+                    print(f"XXX Cannot enumerate printers: {error}")
+                    detected_printers = printers
+
+                if detected_printers == printers:
+                    pending_printer_snapshot = None
+                    pending_printer_polls = 0
+                elif detected_printers == pending_printer_snapshot:
+                    pending_printer_polls += 1
+                else:
+                    pending_printer_snapshot = detected_printers
+                    pending_printer_polls = 1
+
+                if (
+                    pending_printer_snapshot is not None
+                    and pending_printer_polls >= PRINTER_STABLE_POLLS
+                ):
+                    stable_printers = pending_printer_snapshot
+                    previous_by_key = {
+                        printer.casefold(): printer for printer in printers
+                    }
+                    stable_by_key = {
+                        printer.casefold(): printer for printer in stable_printers
+                    }
+                    for key in sorted(
+                        stable_by_key.keys() - previous_by_key.keys()
+                    ):
+                        print(f"* Printer connected: {stable_by_key[key]}")
+                    for key in sorted(
+                        previous_by_key.keys() - stable_by_key.keys()
+                    ):
+                        print(f"? Printer disconnected: {previous_by_key[key]}")
+
+                    printers = stable_printers
+                    pending_printer_snapshot = None
+                    pending_printer_polls = 0
+                    broadcast_display_data(
+                        settings,
+                        cameras,
+                        printers,
+                        idle_displays,
+                        worker_update_queues,
+                        worker_identities,
+                    )
+
+                next_printer_scan = (
+                    time.monotonic() + PRINTER_SCAN_INTERVAL
+                )
 
             settings_changed = False
             while True:
@@ -3637,6 +4291,7 @@ def dispatcher() -> None:
                 broadcast_display_data(
                     settings,
                     cameras,
+                    printers,
                     idle_displays,
                     worker_update_queues,
                     worker_identities,
@@ -3655,6 +4310,10 @@ def dispatcher() -> None:
                             settings,
                             cameras_available_for_selection(
                                 cameras,
+                                worker_identities,
+                            ),
+                            printers_available_for_selection(
+                                printers,
                                 worker_identities,
                             ),
                         )
@@ -3716,6 +4375,7 @@ def dispatcher() -> None:
                                 broadcast_display_data(
                                     settings,
                                     cameras,
+                                    printers,
                                     idle_displays,
                                     worker_update_queues,
                                     worker_identities,
@@ -3738,6 +4398,7 @@ def dispatcher() -> None:
                             broadcast_display_data(
                                 settings,
                                 cameras,
+                                printers,
                                 idle_displays,
                                 worker_update_queues,
                                 worker_identities,
@@ -3814,6 +4475,51 @@ def dispatcher() -> None:
                         notify_launcher_ready(display)
                         continue
 
+                if identity.printer_name:
+                    requested_printer = identity.printer_name.casefold()
+                    printer_owner = next(
+                        (
+                            worker_display
+                            for worker_display, worker_identity
+                            in worker_identities.items()
+                            if worker_identity.printer_name
+                            and worker_identity.printer_name.casefold()
+                            == requested_printer
+                        ),
+                        None,
+                    )
+                    if printer_owner is not None:
+                        message = (
+                            f"XXX Printer {identity.printer_name} is already in use"
+                        )
+                        Printer(message)
+                        send(display, message)
+                        notify_launcher_ready(display)
+                        continue
+
+                    actual_printer = next(
+                        (
+                            printer_name
+                            for printer_name in printers
+                            if printer_name.casefold() == requested_printer
+                        ),
+                        None,
+                    )
+                    if actual_printer is None:
+                        message = (
+                            f"XXX Printer {identity.printer_name} is unavailable"
+                        )
+                        Printer(message)
+                        send(display, message)
+                        notify_launcher_ready(display)
+                        continue
+                    identity = CheckerIdentity(
+                        identity.name,
+                        identity.department,
+                        identity.camera_number,
+                        actual_printer,
+                    )
+
                 # Windows locks COM ports exclusively. Close it before the child opens it.
                 display.close()
                 del idle_displays[display_number]
@@ -3831,6 +4537,7 @@ def dispatcher() -> None:
                         port,
                         display_number,
                         cameras,
+                        printers,
                         settings_update_requests,
                         display_update_queue,
                         display_reset_event,
@@ -3854,6 +4561,10 @@ def dispatcher() -> None:
                     settings,
                     cameras_available_for_selection(
                         cameras,
+                        worker_identities,
+                    ),
+                    printers_available_for_selection(
+                        printers,
                         worker_identities,
                     ),
                     idle_displays,
