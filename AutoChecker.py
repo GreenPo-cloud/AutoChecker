@@ -123,7 +123,7 @@ OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.7"
+CURRENT_VERSION = "2.8"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -1725,8 +1725,8 @@ def prepare_RETAIL_UP_label_data() -> list[tuple[Path, Path, int]]:
     return label_files
 
 
-def RETAIL_UP_ready_statistics_line(order_id: str) -> str:
-    """Return one completed, non-cancelled RETAIL statistics line."""
+def RETAIL_UP_statistics_line(order_id: str) -> str:
+    """Return one RETAIL statistics line without checking its order status."""
     normalized_order = order_id.strip()
     if not re.fullmatch(r"#\d+", normalized_order):
         raise ValueError(f"Invalid order number {order_id}")
@@ -1749,6 +1749,14 @@ def RETAIL_UP_ready_statistics_line(order_id: str) -> str:
     if matching_line is None:
         raise LookupError(f"Unknown order {normalized_order}")
 
+    return matching_line
+
+
+def RETAIL_UP_ready_statistics_line(order_id: str) -> str:
+    """Return one completed, non-cancelled RETAIL statistics line."""
+    normalized_order = order_id.strip()
+    matching_line = RETAIL_UP_statistics_line(normalized_order)
+
     status = retail_stat_order_suffix(matching_line)
     if "cancelled" in status.casefold():
         raise ValueError(f"Cancelled order {normalized_order}")
@@ -1758,18 +1766,35 @@ def RETAIL_UP_ready_statistics_line(order_id: str) -> str:
     return matching_line
 
 
-def RETAIL_UP_tracking_from_statistics(order_id: str) -> str:
-    """Validate one completed RETAIL order and return its tracking number."""
+def RETAIL_UP_tracking_from_order_line(order_id: str, line: str) -> str:
+    """Extract and normalize the tracking prefix from one statistics line."""
     normalized_order = order_id.strip()
-    matching_line = RETAIL_UP_ready_statistics_line(normalized_order)
-
-    order_position = matching_line.find(normalized_order)
-    prefix = matching_line[:order_position].strip()
+    order_position = line.find(normalized_order)
+    if order_position < 0:
+        raise LookupError(
+            f"Order {normalized_order} is missing from its statistics line"
+        )
+    prefix = line[:order_position].strip()
     tracking_number = prefix.split(maxsplit=1)[0] if prefix else ""
     tracking_number = re.sub(r"[^A-Za-z0-9]", "", tracking_number).upper()
     if not tracking_number:
         raise LookupError(f"Tracking number is missing for {normalized_order}")
     return tracking_number
+
+
+def RETAIL_UP_tracking_from_statistics(
+    order_id: str,
+    *,
+    require_ready: bool = True,
+) -> str:
+    """Return an order's tracking number, optionally requiring ready status."""
+    normalized_order = order_id.strip()
+    matching_line = (
+        RETAIL_UP_ready_statistics_line(normalized_order)
+        if require_ready
+        else RETAIL_UP_statistics_line(normalized_order)
+    )
+    return RETAIL_UP_tracking_from_order_line(normalized_order, matching_line)
 
 
 def RETAIL_UP_today_orders() -> dict[str, str]:
@@ -1934,11 +1959,66 @@ def RETAIL_UP_check_lines(order_id: str, settings: dict) -> list[str]:
     return []
 
 
+def normalize_RETAIL_UP_tracking_number(tracking_number: str) -> str:
+    """Normalize a tracking value for statistics/Label JSON comparisons."""
+    return re.sub(r"[^A-Za-z0-9]", "", str(tracking_number)).upper()
+
+
+def RETAIL_UP_label_tracking_sequence() -> list[str]:
+    """Return today's Label tracking numbers in PDF part/page order."""
+    sequence = []
+    label_files = sorted(
+        current_RETAIL_UP_label_files(),
+        key=lambda item: item[2],
+    )
+    if not label_files:
+        raise FileNotFoundError("Today's Label PDF/JSON was not found")
+
+    for json_path, _pdf_path, _part_number in label_files:
+        with json_path.open("r", encoding="utf-8") as file:
+            document = json.load(file)
+        if not isinstance(document, dict):
+            raise ValueError(f"Invalid Label JSON document: {json_path.name}")
+
+        page_entries = []
+        for position, (tracking_number, label_data) in enumerate(
+            document.items()
+        ):
+            if not isinstance(label_data, dict):
+                raise ValueError(
+                    f"Invalid Label JSON entry for {tracking_number}"
+                )
+            try:
+                page_number = int(label_data["PageNumber"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Invalid PageNumber for {tracking_number}"
+                ) from error
+            if page_number < 1:
+                raise ValueError(f"Invalid PageNumber for {tracking_number}")
+            normalized_tracking = normalize_RETAIL_UP_tracking_number(
+                tracking_number
+            )
+            if not normalized_tracking:
+                raise ValueError(
+                    f"Empty tracking number in {json_path.name}"
+                )
+            page_entries.append(
+                (page_number, position, normalized_tracking)
+            )
+
+        sequence.extend(
+            tracking_number
+            for _page, _position, tracking_number in sorted(page_entries)
+        )
+    return sequence
+
+
 def find_RETAIL_UP_label_page(
     tracking_number: str,
 ) -> tuple[Path, int, str]:
     """Find a tracking number and its label type in today's Label JSON."""
-    expected = re.sub(r"[^A-Za-z0-9]", "", tracking_number).upper()
+    expected = normalize_RETAIL_UP_tracking_number(tracking_number)
     for json_path, pdf_path, _part_number in current_RETAIL_UP_label_files():
         with json_path.open("r", encoding="utf-8") as file:
             document = json.load(file)
@@ -1948,7 +2028,7 @@ def find_RETAIL_UP_label_page(
             (
                 key
                 for key in document
-                if re.sub(r"[^A-Za-z0-9]", "", str(key)).upper() == expected
+                if normalize_RETAIL_UP_tracking_number(key) == expected
             ),
             None,
         )
@@ -2176,34 +2256,62 @@ def process_RETAIL_UP_label_range(
     first_order: str,
     last_order: str,
 ) -> int:
-    """Print every ready order in an inclusive numeric statistics range."""
+    """Print an inclusive range in Label JSON part/page order."""
     try:
         orders = RETAIL_UP_today_orders()
-        missing_endpoints = [
-            order_id
-            for order_id in (first_order, last_order)
-            if order_id not in orders
-        ]
-        if missing_endpoints:
-            missing = ", ".join(dict.fromkeys(missing_endpoints))
-            raise LookupError(f"Unknown order {missing}")
-
-        first_number = int(first_order[1:])
-        last_number = int(last_order[1:])
-        lower, upper = sorted((first_number, last_number))
-        selected_orders = sorted(
-            (
-                order_id
-                for order_id in orders
-                if lower <= int(order_id[1:]) <= upper
-            ),
-            key=lambda order_id: int(order_id[1:]),
+        first_tracking = normalize_RETAIL_UP_tracking_number(
+            RETAIL_UP_tracking_from_statistics(
+                first_order,
+                require_ready=False,
+            )
         )
+        last_tracking = normalize_RETAIL_UP_tracking_number(
+            RETAIL_UP_tracking_from_statistics(
+                last_order,
+                require_ready=False,
+            )
+        )
+
+        label_sequence = RETAIL_UP_label_tracking_sequence()
+        try:
+            first_position = label_sequence.index(first_tracking)
+        except ValueError as error:
+            raise LookupError(
+                f"Tracking number not found in Label JSON: {first_tracking}"
+            ) from error
+        try:
+            last_position = label_sequence.index(last_tracking)
+        except ValueError as error:
+            raise LookupError(
+                f"Tracking number not found in Label JSON: {last_tracking}"
+            ) from error
+
+        range_start, range_end = sorted((first_position, last_position))
+        selected_trackings = label_sequence[range_start:range_end + 1]
+        orders_by_tracking = {}
+        for order_id, order_line in orders.items():
+            try:
+                tracking_number = RETAIL_UP_tracking_from_order_line(
+                    order_id,
+                    order_line,
+                )
+            except LookupError:
+                continue
+            orders_by_tracking.setdefault(
+                normalize_RETAIL_UP_tracking_number(tracking_number),
+                order_id,
+            )
 
         status_lines = []
         processed_count = 0
         printed_count = 0
-        for order_id in selected_orders:
+        for tracking_number in selected_trackings:
+            order_id = orders_by_tracking.get(tracking_number)
+            if order_id is None:
+                status_lines.append(
+                    f"XXX Tracking {tracking_number} not found in statistics"
+                )
+                continue
             status = retail_stat_order_suffix(orders[order_id])
             if "cancelled" in status.casefold():
                 status_lines.append(f"XXX {order_id} is Cancelled")
