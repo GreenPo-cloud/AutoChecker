@@ -128,7 +128,7 @@ OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "3.0"
+CURRENT_VERSION = "3.1"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -2446,8 +2446,13 @@ def print_RETAIL_order_label(worker: dict, order_id: str) -> int:
     template_path = (
         STEALTH_ORDER_LABEL_TEMPLATE if is_stealth else ORDER_LABEL_TEMPLATE
     )
+    customer_name = re.sub(
+        r"\s+", " ", str(metadata.get("customer_name", ""))
+    ).strip()
+    if not customer_name:
+        raise LookupError(f"Customer name not found: {order_id}")
     data = {
-        "NAME": str(worker.get("NAME", "")),
+        "NAME": customer_name,
         "OrderNumber": order_id,
         "Delivery": normalize_RETAIL_delivery(metadata.get("delivery", "")),
         "Date": f"{datetime.date.today():%d.%m.%Y}",
