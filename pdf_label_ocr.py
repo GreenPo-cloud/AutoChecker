@@ -10,7 +10,9 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+import portalocker
 
 
 DOWNLOADS_DIR = Path.home() / "Downloads"
@@ -148,6 +150,7 @@ def extract_pdf_labels(
     page_numbers: Iterable[int] | None = None,
     render_scale: float = 3.0,
     min_confidence: float = 0.45,
+    page_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """OCR label pages and return full text plus parsed fields.
 
@@ -190,13 +193,14 @@ def extract_pdf_labels(
                 if item[1].strip() and float(item[2]) >= min_confidence
             ]
             full_text = "\n".join(recognized)
-            pages.append(
-                {
-                    "page": page_number,
-                    **parse_label_text(full_text),
-                    "full_text": full_text,
-                }
-            )
+            page_result = {
+                "page": page_number,
+                **parse_label_text(full_text),
+                "full_text": full_text,
+            }
+            pages.append(page_result)
+            if page_callback is not None:
+                page_callback(page_result)
     finally:
         document.close()
     return pages
@@ -257,8 +261,53 @@ def _json_document(pages: list[dict[str, Any]]) -> dict[str, dict[str, str | int
     }
 
 
-def process_label_pdf(pdf_path: str | Path) -> Path | None:
-    """OCR one eligible label PDF and atomically create its sibling JSON.
+def _save_label_page(
+    destination: Path,
+    page: dict[str, Any],
+) -> None:
+    """Create or update one Label JSON after a page has been recognized."""
+    page_document = _json_document([page])
+    if not destination.exists():
+        temporary = destination.with_name(
+            f".{destination.name}.{os.getpid()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(page_document, ensure_ascii=False, indent=4) + "\n",
+                encoding="utf-8",
+            )
+            # The first visible version is already a complete, valid JSON file.
+            if not destination.exists():
+                temporary.replace(destination)
+                return
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    # Later pages merge into the existing document under an exclusive lock.
+    with portalocker.Lock(
+        str(destination),
+        mode="r+",
+        encoding="utf-8",
+        timeout=3600,
+    ) as file:
+        document = json.load(file)
+        if not isinstance(document, dict):
+            raise ValueError(f"Некорректный Label JSON: {destination}")
+        document.update(page_document)
+        file.seek(0)
+        file.truncate()
+        json.dump(document, file, ensure_ascii=False, indent=4)
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+
+
+def process_label_pdf(
+    pdf_path: str | Path,
+    *,
+    page_saved_callback: Callable[[Path, int], None] | None = None,
+) -> Path | None:
+    """OCR one eligible label PDF and publish each completed page immediately.
 
     Returns the JSON path, or ``None`` when it already exists.
     """
@@ -274,20 +323,12 @@ def process_label_pdf(pdf_path: str | Path) -> Path | None:
     if destination.exists():
         return None
 
-    pages = extract_pdf_labels(source)
-    document = _json_document(pages)
-    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(document, ensure_ascii=False, indent=4) + "\n",
-            encoding="utf-8",
-        )
-        # Do not overwrite a JSON that may have appeared while OCR was running.
-        if destination.exists():
-            return None
-        temporary.replace(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+    def save_page(page: dict[str, Any]) -> None:
+        _save_label_page(destination, page)
+        if page_saved_callback is not None:
+            page_saved_callback(destination, int(page["page"]))
+
+    extract_pdf_labels(source, page_callback=save_page)
     return destination
 
 
@@ -295,6 +336,7 @@ def process_pending_label_pdfs(
     department: str,
     downloads_dir: str | Path = DOWNLOADS_DIR,
     label_date: datetime.date | None = None,
+    page_saved_callback: Callable[[Path, int], None] | None = None,
 ) -> list[Path]:
     """Process pending label PDFs for RETAIL workflows."""
     if department.strip().upper() not in {"RETAIL", "RETAIL_UP"}:
@@ -302,7 +344,10 @@ def process_pending_label_pdfs(
 
     created: list[Path] = []
     for pdf_path in find_pending_label_pdfs(downloads_dir, label_date=label_date):
-        result = process_label_pdf(pdf_path)
+        result = process_label_pdf(
+            pdf_path,
+            page_saved_callback=page_saved_callback,
+        )
         if result is not None:
             created.append(result)
     return created

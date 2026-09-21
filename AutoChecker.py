@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 
 PACKAGES_INSTALLED = False
@@ -55,6 +56,7 @@ REQUIRED_PACKAGES = [
     ("rapidocr_onnxruntime", "rapidocr-onnxruntime>=1.4,<2"),
     ("esptool", "esptool>=4.8,<6"),
     ("PIL", "Pillow>=10"),
+    ("qrcode", "qrcode[pil]>=7.4,<9"),
     ("win32print", "pywin32>=306"),
 ]
 
@@ -89,11 +91,13 @@ import cv2
 import portalocker
 import pymupdf
 import pywintypes
+import qrcode
 import requests
 import serial
 import win32con
 import win32gui
 import win32print
+import win32ui
 from PIL import Image, ImageWin
 from pygrabber.dshow_graph import FilterGraph
 from send2trash import send2trash
@@ -119,17 +123,26 @@ SCAN_INTERVAL = 0.2
 PHOTO_DELAY = 2.5
 B2B_INDEX_FILENAME = "B2B_Order_Index.txt"
 RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
+RETAIL_DELIVERY_ORDER = ("UPS", "Zasilkovna", "Postal")
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.8"
+CURRENT_VERSION = "2.9"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/AutoChecker.py"
 
 PDF_LABEL_OCR_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/pdf_label_ocr.py"
+ORDER_LABEL_SVG_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+    "main/Etiketka.svg"
+)
+STEALTH_ORDER_LABEL_SVG_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+    "main/STEALTH%20Etiketka.svg"
+)
 
 DISPLAY_VERSION_URL = (
     "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
@@ -149,6 +162,11 @@ RETAIL_UP_PRINTER_DPI = 200
 RETAIL_UP_PAPER_WIDTH_TENTHS_MM = 1016
 RETAIL_UP_PAPER_HEIGHT_TENTHS_MM = 1524
 RETAIL_UP_PRINT_SCALE = 1.0
+ORDER_LABEL_WIDTH_MM = 80.0
+ORDER_LABEL_HEIGHT_MM = 40.0
+ORDER_LABEL_SVG_NS = "http://www.w3.org/2000/svg"
+ORDER_LABEL_TEMPLATE = BASE_DIR / "Etiketka.svg"
+STEALTH_ORDER_LABEL_TEMPLATE = BASE_DIR / "STEALTH Etiketka.svg"
 EXPECTED_DISPLAY_APP_SLOTS = (
     (0x10000, 0x140000, "app0"),
     (0x150000, 0x140000, "app1"),
@@ -201,29 +219,41 @@ def check_for_updates() -> None:
 
 
 def update_program() -> None:
-    """Download and install one validated AutoChecker/OCR code bundle."""
+    """Download and install one validated AutoChecker code/asset bundle."""
     try:
         current_file = Path(__file__).resolve()
         update_files = (
-            (current_file, PYTHON_URL),
-            (BASE_DIR / "pdf_label_ocr.py", PDF_LABEL_OCR_URL),
+            (current_file, PYTHON_URL, True),
+            (BASE_DIR / "pdf_label_ocr.py", PDF_LABEL_OCR_URL, True),
+            (ORDER_LABEL_TEMPLATE, ORDER_LABEL_SVG_URL, False),
+            (
+                STEALTH_ORDER_LABEL_TEMPLATE,
+                STEALTH_ORDER_LABEL_SVG_URL,
+                False,
+            ),
         )
-        downloaded_files: list[tuple[Path, str]] = []
-        for target_file, url in update_files:
+        downloaded_files: list[tuple[Path, bytes]] = []
+        for target_file, url, validate_python in update_files:
             response = requests.get(url, timeout=10)
             if response.status_code != 200:
                 print(f"XXX Cannot download update file: {target_file.name}")
                 return
-            downloaded_code = response.text
-            # Validate the complete bundle before writing either temporary
-            # file, so incompatible partial downloads are never installed.
-            compile(downloaded_code, url, "exec")
-            downloaded_files.append((target_file, downloaded_code))
+            downloaded_data = response.content
+            if validate_python:
+                downloaded_code = downloaded_data.decode("utf-8-sig")
+                # Validate the complete bundle before writing any temporary
+                # file, so incompatible partial downloads are never installed.
+                compile(downloaded_code, url, "exec")
+                downloaded_data = downloaded_code.encode("utf-8")
+            elif target_file.suffix.casefold() == ".svg":
+                # Do not install a broken or incomplete label template.
+                ET.fromstring(downloaded_data)
+            downloaded_files.append((target_file, downloaded_data))
 
         temp_files = []
-        for target_file, downloaded_code in downloaded_files:
+        for target_file, downloaded_data in downloaded_files:
             temp_file = Path(str(target_file) + ".new")
-            temp_file.write_text(downloaded_code, encoding="utf-8")
+            temp_file.write_bytes(downloaded_data)
             temp_files.append((temp_file, target_file))
 
         bat_path = Path(str(current_file) + ".bat")
@@ -373,10 +403,20 @@ def update_display_firmware(port: str, display_mac: str,
         return False
 
 
-def run_pending_label_ocr(department: str) -> None:
+def run_pending_label_ocr(
+    department: str,
+    ready_event=None,
+    downloads_dirs=None,
+    label_date: datetime.date | None = None,
+) -> None:
     """Create missing label JSON files in an isolated, serialized process."""
     try:
         process_pending_label_pdfs = load_label_ocr_processor()
+
+        def page_saved(_json_path: Path, _page_number: int) -> None:
+            if ready_event is not None:
+                ready_event.set()
+
         # Launcher startup and NextPDF can request OCR at nearly the same time.
         # Serialize them so a label PDF is never recognized twice concurrently.
         with portalocker.Lock(
@@ -385,7 +425,21 @@ def run_pending_label_ocr(department: str) -> None:
             encoding="utf-8",
             timeout=3600,
         ):
-            created_json_files = process_pending_label_pdfs(department)
+            created_json_files = []
+            if downloads_dirs is None:
+                created_json_files.extend(process_pending_label_pdfs(
+                    department,
+                    label_date=label_date,
+                    page_saved_callback=page_saved,
+                ))
+            else:
+                for downloads_dir in downloads_dirs:
+                    created_json_files.extend(process_pending_label_pdfs(
+                        department,
+                        downloads_dir=downloads_dir,
+                        label_date=label_date,
+                        page_saved_callback=page_saved,
+                    ))
         if created_json_files:
             print(
                 "* Label OCR created: "
@@ -398,11 +452,16 @@ def run_pending_label_ocr(department: str) -> None:
         print(f"XXX Label OCR failed for {department}: {error}")
 
 
-def start_label_ocr_process(department: str) -> multiprocessing.Process:
+def start_label_ocr_process(
+    department: str,
+    ready_event=None,
+    downloads_dirs=None,
+    label_date: datetime.date | None = None,
+) -> multiprocessing.Process:
     """Start non-blocking label OCR and return its short-lived process."""
     process = multiprocessing.Process(
         target=run_pending_label_ocr,
-        args=(department,),
+        args=(department, ready_event, downloads_dirs, label_date),
         name=f"AutoChecker-label-OCR-{department.upper()}",
         daemon=True,
     )
@@ -843,7 +902,7 @@ def find_autochecker_cameras(*, announce: bool = True) -> dict[int, int]:
 
 
 def find_available_printers(*, announce: bool = False) -> list[str]:
-    """Return installed Windows printer queues that are not marked offline."""
+    """Return connected USB printer queues that are not marked offline."""
     flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
     offline_status = (
         getattr(win32print, "PRINTER_STATUS_OFFLINE", 0x80)
@@ -863,9 +922,16 @@ def find_available_printers(*, announce: bool = False) -> list[str]:
         try:
             handle = win32print.OpenPrinter(printer_name)
             printer_info = win32print.GetPrinter(handle, 2)
+            port_name = str(
+                printer_info.get("pPortName", printer_info.get("PortName", "")) or ""
+            ).strip()
             status = int(printer_info.get("Status", 0) or 0)
             attributes = int(printer_info.get("Attributes", 0) or 0)
-            if status & offline_status or attributes & work_offline:
+            if (
+                "USB" not in port_name.upper()
+                or status & offline_status
+                or attributes & work_offline
+            ):
                 continue
         except pywintypes.error:
             continue
@@ -1700,29 +1766,61 @@ def current_RETAIL_UP_label_files(
     return sorted(result, key=lambda item: item[2], reverse=True)
 
 
-def prepare_RETAIL_UP_label_data() -> list[tuple[Path, Path, int]]:
-    """OCR today's pending Label PDFs and return all usable JSON/PDF pairs."""
-    process_pending_label_pdfs = load_label_ocr_processor()
+def pending_RETAIL_UP_label_pdfs(
+    day: datetime.date | None = None,
+) -> list[Path]:
+    """Return today's Label PDFs which do not yet have a JSON document."""
+    from pdf_label_ocr import find_pending_label_pdfs
+
     today = datetime.date.today()
-    with portalocker.Lock(
-        str(LABEL_OCR_LOCK_FILE),
-        mode="a+",
-        encoding="utf-8",
-        timeout=3600,
-    ):
-        for directory in B2B_download_directories():
-            process_pending_label_pdfs(
-                RETAIL_UP_DEPARTMENT,
-                downloads_dir=directory,
-                label_date=today,
+    if day is not None:
+        today = day
+    pending = []
+    for directory in B2B_download_directories():
+        pending.extend(find_pending_label_pdfs(directory, label_date=today))
+    return pending
+
+
+def wait_for_RETAIL_UP_label_data(
+    process: multiprocessing.Process,
+    ready_event,
+    day: datetime.date | None = None,
+) -> list[tuple[Path, Path, int]]:
+    """Wait only for the first usable page, not for the complete OCR run."""
+    day = day or datetime.date.today()
+    while True:
+        label_files = current_RETAIL_UP_label_files(day)
+        if label_files:
+            return label_files
+        if ready_event.wait(timeout=0.1):
+            label_files = current_RETAIL_UP_label_files(day)
+            if label_files:
+                return label_files
+        if not process.is_alive():
+            process.join()
+            raise FileNotFoundError(
+                f"Label PDF/JSON for {day:%d.%m.%Y} was not found in Downloads"
             )
 
-    label_files = current_RETAIL_UP_label_files(today)
-    if not label_files:
-        raise FileNotFoundError(
-            f"Label PDF/JSON for {today:%d.%m.%Y} was not found in Downloads"
-        )
-    return label_files
+
+def read_RETAIL_UP_label_document(json_path: Path) -> dict:
+    """Wait for the writer lock, then read a progressive Label JSON."""
+    while True:
+        try:
+            with portalocker.Lock(
+                str(json_path),
+                mode="r",
+                encoding="utf-8",
+                timeout=1,
+            ) as file:
+                document = json.load(file)
+            break
+        except portalocker.exceptions.LockException:
+            # Keep the original scan pending until OCR finishes updating JSON.
+            continue
+    if not isinstance(document, dict):
+        raise ValueError(f"Invalid Label JSON document: {json_path.name}")
+    return document
 
 
 def RETAIL_UP_statistics_line(order_id: str) -> str:
@@ -1924,11 +2022,17 @@ def RETAIL_check_fragments(settings: dict) -> list[str]:
 
 
 def RETAIL_UP_check_lines(order_id: str, settings: dict) -> list[str]:
-    """Return quantity/name lines whose products match configured CHECK text."""
+    """Return CHECK positions and yellow merchandise positions for packing."""
     fragments = RETAIL_check_fragments(settings)
-    if not fragments:
-        return []
     fragment_keys = [fragment.casefold() for fragment in fragments]
+    merchandise = settings.get("Merch", {})
+    merchandise_names = {
+        re.sub(r"\s+", " ", value).strip().casefold()
+        for value in merchandise.values()
+        if isinstance(value, str) and value.strip()
+    } if isinstance(merchandise, dict) else set()
+    if not fragment_keys and not merchandise_names:
+        return []
     today = datetime.date.today()
     for pdf_date, _part, pdf_path in reversed(_available_order_pdfs()):
         if pdf_date != today:
@@ -1950,12 +2054,22 @@ def RETAIL_UP_check_lines(order_id: str, settings: dict) -> list[str]:
         )
         if matched_order is None:
             continue
-        return [
-            f"{quantity} {name}"
-            for name, quantity in matched_order
-            if any(fragment in name.casefold() for fragment in fragment_keys)
-        ]
-    Printer(f"? Order data for CHECK not found: {order_id}")
+        result = []
+        for name, quantity in matched_order:
+            name_key = re.sub(r"\s+", " ", name).strip().casefold()
+            is_merchandise = name_key in merchandise_names
+            matches_check = any(
+                fragment in name.casefold() for fragment in fragment_keys
+            )
+            if not is_merchandise and not matches_check:
+                continue
+            line = f"{quantity} {name}"
+            # An explicit tag keeps merchandise yellow even if OTHER colour
+            # rules contain a matching fragment. If CHECK also matches the
+            # same item, it is still emitted only once as merchandise.
+            result.append(f"#ffff00 {line}" if is_merchandise else line)
+        return result
+    Printer(f"? Order data for CHECK/Merch not found: {order_id}")
     return []
 
 
@@ -1975,10 +2089,7 @@ def RETAIL_UP_label_tracking_sequence() -> list[str]:
         raise FileNotFoundError("Today's Label PDF/JSON was not found")
 
     for json_path, _pdf_path, _part_number in label_files:
-        with json_path.open("r", encoding="utf-8") as file:
-            document = json.load(file)
-        if not isinstance(document, dict):
-            raise ValueError(f"Invalid Label JSON document: {json_path.name}")
+        document = read_RETAIL_UP_label_document(json_path)
 
         page_entries = []
         for position, (tracking_number, label_data) in enumerate(
@@ -2020,10 +2131,7 @@ def find_RETAIL_UP_label_page(
     """Find a tracking number and its label type in today's Label JSON."""
     expected = normalize_RETAIL_UP_tracking_number(tracking_number)
     for json_path, pdf_path, _part_number in current_RETAIL_UP_label_files():
-        with json_path.open("r", encoding="utf-8") as file:
-            document = json.load(file)
-        if not isinstance(document, dict):
-            continue
+        document = read_RETAIL_UP_label_document(json_path)
         actual_key = next(
             (
                 key
@@ -2058,6 +2166,265 @@ def find_RETAIL_UP_label_page(
             )
         return pdf_path, page_number, normalized_label_type
     raise LookupError(f"Tracking number not found in Label JSON: {tracking_number}")
+
+
+def find_order_label_browser() -> Path:
+    """Find a Chromium browser capable of rendering the SVG label."""
+    candidates = []
+    for variable, relative_paths in (
+        (
+            "ProgramFiles",
+            (
+                Path("Google/Chrome/Application/chrome.exe"),
+                Path("Microsoft/Edge/Application/msedge.exe"),
+            ),
+        ),
+        (
+            "ProgramFiles(x86)",
+            (
+                Path("Google/Chrome/Application/chrome.exe"),
+                Path("Microsoft/Edge/Application/msedge.exe"),
+            ),
+        ),
+        (
+            "LOCALAPPDATA",
+            (Path("Google/Chrome/Application/chrome.exe"),),
+        ),
+    ):
+        base = os.environ.get(variable)
+        if base:
+            candidates.extend(Path(base) / relative for relative in relative_paths)
+    browser = next((path for path in candidates if path.is_file()), None)
+    if browser is None:
+        raise FileNotFoundError("Google Chrome or Microsoft Edge was not found")
+    return browser
+
+
+def open_order_label_printer(printer_name: str):
+    """Create an 80x40-mm Windows printer DC without changing its defaults."""
+    handle = win32print.OpenPrinter(printer_name)
+    try:
+        mode = win32print.GetPrinter(handle, 2).get("pDevMode")
+        if mode is None:
+            raise RuntimeError(f"Cannot read printer settings: {printer_name}")
+        mode.Orientation = win32con.DMORIENT_PORTRAIT
+        mode.Copies = 1
+        mode.PaperSize = win32con.DMPAPER_USER
+        mode.PaperWidth = round(ORDER_LABEL_WIDTH_MM * 10)
+        mode.PaperLength = round(ORDER_LABEL_HEIGHT_MM * 10)
+        mode.Fields &= ~win32con.DM_FORMNAME
+        mode.Fields |= (
+            win32con.DM_ORIENTATION
+            | win32con.DM_COPIES
+            | win32con.DM_PAPERSIZE
+            | win32con.DM_PAPERWIDTH
+            | win32con.DM_PAPERLENGTH
+        )
+        result = win32print.DocumentProperties(
+            0,
+            handle,
+            printer_name,
+            mode,
+            mode,
+            win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
+        )
+        if result != win32con.IDOK:
+            raise RuntimeError(f"Printer rejected 80x40-mm settings: {result}")
+        dc = win32ui.CreateDCFromHandle(
+            win32gui.CreateDC("WINSPOOL", printer_name, mode)
+        )
+    finally:
+        win32print.ClosePrinter(handle)
+
+    dpi_x = dc.GetDeviceCaps(88)
+    dpi_y = dc.GetDeviceCaps(90)
+    actual_width = dc.GetDeviceCaps(110) * 25.4 / dpi_x
+    actual_height = dc.GetDeviceCaps(111) * 25.4 / dpi_y
+    if (
+        abs(actual_width - ORDER_LABEL_WIDTH_MM) > 1
+        or abs(actual_height - ORDER_LABEL_HEIGHT_MM) > 1
+    ):
+        dc.DeleteDC()
+        raise RuntimeError(
+            "Printer did not accept 80x40-mm paper "
+            f"({actual_width:.2f}x{actual_height:.2f} mm)"
+        )
+    return dc, dpi_x, dpi_y
+
+
+def render_order_label(
+    template_path: Path,
+    data: dict[str, str],
+    dpi_x: int,
+    dpi_y: int,
+) -> Image.Image:
+    """Fill one SVG template and return its printer-resolution bitmap."""
+    if not template_path.is_file():
+        raise FileNotFoundError(f"Order label template not found: {template_path.name}")
+    root = ET.parse(template_path).getroot()
+    elements = {}
+    expected_ids = {*data, "QR-code"}
+    for node in root.iter():
+        node_id = node.get("id")
+        if node_id not in expected_ids:
+            continue
+        if node_id in elements:
+            raise ValueError(f"Duplicate SVG field: {node_id}")
+        elements[node_id] = node
+    missing = expected_ids - elements.keys()
+    if missing:
+        raise ValueError("Missing SVG fields: " + ", ".join(sorted(missing)))
+
+    for key, value in data.items():
+        node = elements[key]
+        spans = node.findall(f"{{{ORDER_LABEL_SVG_NS}}}tspan")
+        if len(spans) != 1:
+            raise ValueError(f"Expected one SVG text span in {key}")
+        spans[0].text = value
+        node.set("font-family", "Arial")
+
+    qr_group = elements["QR-code"]
+    qr_box = qr_group.find(f"{{{ORDER_LABEL_SVG_NS}}}rect")
+    if qr_box is None:
+        raise ValueError("QR-code must contain a rectangle")
+    transform_match = re.fullmatch(
+        r"translate\(([-\d.]+)[ ,]+([-\d.]+)\)",
+        qr_box.get("transform", ""),
+    )
+    if transform_match is None:
+        raise ValueError("Unexpected QR rectangle transform")
+    qr_x, qr_y = map(float, transform_match.groups())
+    qr_width = float(qr_box.get("width"))
+    qr_height = float(qr_box.get("height"))
+    qr_group.remove(qr_box)
+
+    view_box = root.get("viewBox", "").split()
+    if len(view_box) != 4:
+        raise ValueError("SVG template has no valid viewBox")
+    _, _, view_width, view_height = map(float, view_box)
+    width = round(ORDER_LABEL_WIDTH_MM * dpi_x / 25.4)
+    height = round(ORDER_LABEL_HEIGHT_MM * dpi_y / 25.4)
+    ET.register_namespace("", ORDER_LABEL_SVG_NS)
+    ET.register_namespace("xlink", "http://www.w3.org/1999/xlink")
+    root.set("width", str(width))
+    root.set("height", str(height))
+
+    browser = find_order_label_browser()
+    with tempfile.TemporaryDirectory(prefix="AutoChecker-order-label-") as temporary:
+        folder = Path(temporary)
+        html_path = folder / "label.html"
+        image_path = folder / "label.png"
+        html_path.write_text(
+            '<!doctype html><meta charset="utf-8"><style>'
+            "html,body{margin:0;background:white;overflow:hidden}"
+            "svg{display:block}</style>"
+            + ET.tostring(root, encoding="unicode"),
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                str(browser),
+                "--headless",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-background-networking",
+                "--hide-scrollbars",
+                "--force-device-scale-factor=1",
+                "--no-proxy-server",
+                f"--user-data-dir={folder / 'profile'}",
+                f"--window-size={max(width, 800)},{max(height, 600)}",
+                f"--screenshot={image_path}",
+                html_path.as_uri(),
+            ],
+            check=True,
+            timeout=45,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        with Image.open(image_path) as rendered:
+            image = rendered.convert("RGB").crop((0, 0, width, height))
+
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        border=4,
+    )
+    qr.add_data(data["OrderNumber"])
+    qr.make(fit=True)
+    modules = len(qr.get_matrix())
+    scale = int(
+        min(
+            qr_width / view_width * width,
+            qr_height / view_height * height,
+        ) // modules
+    )
+    if scale < 3:
+        raise ValueError("QR area is too small for reliable printing")
+    qr.box_size = scale
+    qr_image = qr.make_image(
+        fill_color="black",
+        back_color="white",
+    ).convert("RGB")
+    left = round(
+        qr_x / view_width * width
+        + (qr_width / view_width * width - qr_image.width) / 2
+    )
+    top = round(
+        qr_y / view_height * height
+        + (qr_height / view_height * height - qr_image.height) / 2
+    )
+    image.paste(qr_image, (left, top))
+    return image
+
+
+def print_RETAIL_order_label(worker: dict, order_id: str) -> int:
+    """Render and submit one normal or STEALTH RETAIL order label."""
+    printer_name = str(worker.get("PRINTER", "")).strip()
+    if not printer_name:
+        raise ValueError("Printer is not selected")
+    metadata = worker.get("RETAIL_ORDER_META", {}).get(order_id)
+    if not isinstance(metadata, dict):
+        raise LookupError(f"Order metadata not found: {order_id}")
+    is_stealth = str(metadata.get("stealth", "NO")).upper() == "YES"
+    template_path = (
+        STEALTH_ORDER_LABEL_TEMPLATE if is_stealth else ORDER_LABEL_TEMPLATE
+    )
+    data = {
+        "NAME": str(worker.get("NAME", "")),
+        "OrderNumber": order_id,
+        "Delivery": normalize_RETAIL_delivery(metadata.get("delivery", "")),
+        "Date": f"{datetime.date.today():%d.%m.%Y}",
+    }
+
+    dc, dpi_x, dpi_y = open_order_label_printer(printer_name)
+    document_started = False
+    try:
+        image = render_order_label(template_path, data, dpi_x, dpi_y)
+        job_id = dc.StartDoc(f"AutoChecker order {order_id}")
+        document_started = True
+        dc.StartPage()
+        offset_x = dc.GetDeviceCaps(112)
+        offset_y = dc.GetDeviceCaps(113)
+        ImageWin.Dib(image).draw(
+            dc.GetHandleOutput(),
+            (
+                -offset_x,
+                -offset_y,
+                image.width - offset_x,
+                image.height - offset_y,
+            ),
+        )
+        dc.EndPage()
+        dc.EndDoc()
+        document_started = False
+        return job_id
+    except BaseException:
+        if document_started:
+            dc.AbortDoc()
+        raise
+    finally:
+        dc.DeleteDC()
 
 
 def print_pdf_page(
@@ -2648,6 +3015,61 @@ def retail_stat_metadata_values(metadata: dict) -> tuple[str, str]:
     return tracking_number, customer_name
 
 
+def normalize_RETAIL_delivery(value: object) -> str:
+    """Return the canonical supported delivery name, or an empty string."""
+    normalized = str(value).strip().casefold()
+    return next(
+        (
+            delivery
+            for delivery in RETAIL_DELIVERY_ORDER
+            if delivery.casefold() == normalized
+        ),
+        "",
+    )
+
+
+def sorted_RETAIL_order_ids(
+    parsed_orders: dict,
+    metadata_by_order: dict[str, dict],
+) -> list[str]:
+    """Group orders as UPS, Zasilkovna, Postal while preserving PDF order."""
+    delivery_rank = {
+        delivery.casefold(): rank
+        for rank, delivery in enumerate(RETAIL_DELIVERY_ORDER)
+    }
+    return sorted(
+        parsed_orders,
+        key=lambda order_id: delivery_rank.get(
+            normalize_RETAIL_delivery(
+                metadata_by_order.get(order_id, {}).get("delivery", "")
+            ).casefold(),
+            len(RETAIL_DELIVERY_ORDER),
+        ),
+    )
+
+
+def RETAIL_part_totals(
+    parsed_orders: dict,
+    config: dict,
+) -> tuple[int, int]:
+    """Return (PRODUCTS/Bonus packs, all non-removed position volume)."""
+    product_names = set(config.get("PRODUCTS", {}).values())
+    remove_items = config.get("REMOVE_ITEMS", [])
+    pack = 0
+    volume = 0
+    for items in parsed_orders.values():
+        for item_name, quantity in items:
+            if any(remove in item_name for remove in remove_items):
+                continue
+            volume += quantity
+            if (
+                product_base_name(item_name, config) in product_names
+                or "bonus" in item_name.casefold()
+            ):
+                pack += quantity
+    return pack, volume
+
+
 def retail_stat_order_prefix(order_id: str, metadata: dict, *,
                              tracking_width: int | None = None,
                              customer_width: int | None = None) -> str:
@@ -2664,9 +3086,15 @@ def retail_stat_order_prefix(order_id: str, metadata: dict, *,
     )
 
 
-def save_part_to_statistics(worker: dict, pdf_path: Path, parsed_orders: dict) -> None:
+def save_part_to_statistics(
+    worker: dict,
+    pdf_path: Path,
+    parsed_orders: dict,
+    config: dict,
+) -> None:
     stat_file = statistics_file(worker)
-    header = f"----------{pdf_path.name}----------"
+    header_prefix = f"----------{pdf_path.name}----------"
+    pack, volume = RETAIL_part_totals(parsed_orders, config)
     metadata_by_order = worker.get("RETAIL_ORDER_META", {})
     metadata_values = {
         order_id: retail_stat_metadata_values(
@@ -2674,6 +3102,10 @@ def save_part_to_statistics(worker: dict, pdf_path: Path, parsed_orders: dict) -
         )
         for order_id in parsed_orders
     }
+    ordered_order_ids = sorted_RETAIL_order_ids(
+        parsed_orders,
+        metadata_by_order,
+    )
     tracking_width = max(
         (len(values[0]) for values in metadata_values.values()),
         default=0,
@@ -2682,12 +3114,23 @@ def save_part_to_statistics(worker: dict, pdf_path: Path, parsed_orders: dict) -
         (len(values[1]) for values in metadata_values.values()),
         default=0,
     )
+    natural_order_column = tracking_width + 3 + customer_width + 3
+    order_column = max(natural_order_column, len(header_prefix) + 3)
+    customer_width += order_column - natural_order_column
+    header = (
+        f"{header_prefix:<{order_column}}"
+        f"Pack: {pack}, Volume: {volume}"
+    )
     # Keep the lock across the complete read-modify-write operation.
     with _locked_statistics_file(stat_file) as file:
         file.seek(0)
         lines = file.readlines()
         header_index = next(
-            (index for index, line in enumerate(lines) if line.strip() == header),
+            (
+                index
+                for index, line in enumerate(lines)
+                if line.strip().startswith(header_prefix)
+            ),
             None,
         )
         if header_index is None:
@@ -2701,10 +3144,11 @@ def save_part_to_statistics(worker: dict, pdf_path: Path, parsed_orders: dict) -
                     tracking_width=tracking_width,
                     customer_width=customer_width,
                 ) + "\n"
-                for order_id in parsed_orders
+                for order_id in ordered_order_ids
             )
             lines.append("\n")
         else:
+            lines[header_index] = header + "\n"
             end_index = next(
                 (
                     index
@@ -2727,7 +3171,7 @@ def save_part_to_statistics(worker: dict, pdf_path: Path, parsed_orders: dict) -
                 insertion_index -= 1
 
             missing_lines = []
-            for order_id in parsed_orders:
+            for order_id in ordered_order_ids:
                 prefix = retail_stat_order_prefix(
                     order_id,
                     metadata_by_order.get(order_id, {}),
@@ -2746,6 +3190,33 @@ def save_part_to_statistics(worker: dict, pdf_path: Path, parsed_orders: dict) -
                 lines[existing_index] = prefix + suffix + "\n"
             if missing_lines:
                 lines[insertion_index:insertion_index] = missing_lines
+
+            # Reorder the complete existing section too, while retaining every
+            # assembler/status suffix which was already stored on its line.
+            end_index = next(
+                (
+                    index
+                    for index in range(header_index + 1, len(lines))
+                    if lines[index].strip().startswith("----------")
+                ),
+                len(lines),
+            )
+            order_lines = {}
+            unrecognized_lines = []
+            for line in lines[header_index + 1:end_index]:
+                order_id = retail_order_id_from_stat_line(line.strip())
+                if order_id in parsed_orders:
+                    order_lines[order_id] = line
+                elif line.strip():
+                    unrecognized_lines.append(line)
+            sorted_section = [
+                order_lines[order_id]
+                for order_id in ordered_order_ids
+                if order_id in order_lines
+            ]
+            sorted_section.extend(unrecognized_lines)
+            sorted_section.append("\n")
+            lines[header_index + 1:end_index] = sorted_section
 
         file.seek(0)
         file.truncate()
@@ -2827,6 +3298,7 @@ def parse_RETAIL_pdf_document(
             "tracking_number": tracking_match.group(0) if tracking_match else "",
             "customer_name": re.sub(r"\s+", " ", match.group(3)).strip(),
             "stealth": "YES" if match.group(2) else "NO",
+            "delivery": normalize_RETAIL_delivery(match.group(4)),
         }
 
     text = restore_RETAIL_wrapped_lines(text, tracking_pattern)
@@ -2856,6 +3328,7 @@ def parse_RETAIL_pdf_document(
                 "tracking_number": "",
                 "customer_name": "",
                 "stealth": "NO",
+                "delivery": "",
             },
         )
     return parsed, metadata_by_order
@@ -2874,6 +3347,9 @@ def RETAIL_order_cache_document(
             "TrackNumber": str(metadata.get("tracking_number", "")),
             "CustomerName": str(metadata.get("customer_name", "")),
             "Stealth": "YES" if stealth == "YES" else "NO",
+            "Delivery": normalize_RETAIL_delivery(
+                metadata.get("delivery", "")
+            ),
             "Order": [
                 {"Name": name, "Quantity": quantity}
                 for name, quantity in items
@@ -2894,7 +3370,13 @@ def decode_RETAIL_order_cache(
     for order_id, entry in document.items():
         if not re.fullmatch(r"#\d+", str(order_id)) or not isinstance(entry, dict):
             raise ValueError("Invalid order entry in Order JSON")
-        if not {"TrackNumber", "CustomerName", "Stealth", "Order"} <= entry.keys():
+        if not {
+            "TrackNumber",
+            "CustomerName",
+            "Stealth",
+            "Delivery",
+            "Order",
+        } <= entry.keys():
             raise ValueError(f"Incomplete Order JSON entry: {order_id}")
         stealth = str(entry["Stealth"]).strip().upper()
         if stealth not in {"YES", "NO"} or not isinstance(entry["Order"], list):
@@ -2919,6 +3401,7 @@ def decode_RETAIL_order_cache(
             "tracking_number": str(entry["TrackNumber"]).strip(),
             "customer_name": str(entry["CustomerName"]).strip(),
             "stealth": stealth,
+            "delivery": normalize_RETAIL_delivery(entry["Delivery"]),
         }
     return parsed, metadata_by_order
 
@@ -2975,7 +3458,7 @@ def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> d
         send(worker["DISPLAY"], message)
         return {}
     worker["RETAIL_ORDER_META"] = metadata_by_order
-    save_part_to_statistics(worker, pdf_path, parsed)
+    save_part_to_statistics(worker, pdf_path, parsed, config)
     return parsed
 
 
@@ -3165,6 +3648,63 @@ def update_order_in_statistics(worker: dict, order_id: str, *, add_name: bool = 
         return updated
 
 
+def reserve_next_RETAIL_order(worker: dict, orders: dict) -> str | None:
+    """Atomically assign the first unclaimed order in statistics-file order."""
+    available_order_ids = set(orders)
+    stat_file = statistics_file(worker)
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        reserved_order = None
+        for index, line in enumerate(lines):
+            raw_text = line.rstrip("\r\n")
+            order_id = retail_order_id_from_stat_line(raw_text)
+            if order_id not in available_order_ids:
+                continue
+            # Any suffix means an assembler, +/(+) or Cancelled is present.
+            if retail_stat_order_suffix(raw_text).strip():
+                continue
+            lines[index] = f"{raw_text} {worker['NAME']}\n"
+            reserved_order = order_id
+            break
+        if reserved_order is not None:
+            file.seek(0)
+            file.truncate()
+            file.writelines(lines)
+            file.flush()
+        return reserved_order
+
+
+def release_RETAIL_order_reservation(worker: dict, order_id: str) -> bool:
+    """Remove this worker's untouched reservation after a printing failure."""
+    stat_file = statistics_file(worker)
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        changed = False
+        for index, line in enumerate(lines):
+            raw_text = line.rstrip("\r\n")
+            stored_order = retail_order_id_from_stat_line(raw_text)
+            if stored_order != order_id:
+                continue
+            if retail_stat_order_suffix(raw_text).strip() != worker["NAME"]:
+                break
+            order_match = re.search(
+                rf"(?<!\S){re.escape(order_id)}(?=\s|$)",
+                raw_text,
+            )
+            if order_match is not None:
+                lines[index] = raw_text[:order_match.end()] + "\n"
+                changed = True
+            break
+        if changed:
+            file.seek(0)
+            file.truncate()
+            file.writelines(lines)
+            file.flush()
+        return changed
+
+
 def cancel_order(worker: dict, order_id: str) -> bool:
     """Mark a RETAIL daily order or B2B index entry as Cancelled."""
     department = worker.get("DEPARTMENT", "").upper()
@@ -3287,22 +3827,29 @@ def order_ready(items: list[tuple[str, int]], counts: defaultdict, extras: defau
     return all(counts.get(name, 0) == quantity for name, quantity in items)
 
 
-def save_photo(worker: dict, order_id: str | None, frame, *, manually: bool = False) -> bool:
+def save_photo(
+    worker: dict,
+    order_id: str | None,
+    frame,
+    *,
+    manually: bool = False,
+) -> tuple[bool, bool]:
+    """Save a photo and return (saved, first photo for this order)."""
     if not worker.get("HAS_CAMERA", True):
         message = "XXX Process without camera"
         Printer(message)
         send(worker["DISPLAY"], message)
-        return False
+        return False, False
     if frame is None:
         message = "XXX Camera frame unavailable"
         Printer(message)
         send(worker["DISPLAY"], message)
-        return False
+        return False, False
     if not order_id:
         message = "XXX Order not selected"
         Printer(message)
         send(worker["DISPLAY"], message)
-        return False
+        return False, False
     number = 1
     while True:
         suffix = "" if number == 1 else f"_{number}"
@@ -3320,13 +3867,14 @@ def save_photo(worker: dict, order_id: str | None, frame, *, manually: bool = Fa
         saved = True
     Printer(message)
     send(worker["DISPLAY"], message)
-    return saved
+    return saved, saved and number == 1
 
 
 def process_scan(worker: dict, config: dict, code: str, orders: dict, current_order: str | None,
                  counts: defaultdict, extras: defaultdict, errors: set,
                  no_barcode_items: list[tuple[str, int]], photo_pending: bool,
-                 photo_start: float) -> tuple[str | None, bool, float]:
+                 photo_start: float, automatic_assignment: bool = False,
+                 ) -> tuple[str | None, bool, float]:
     """Apply one scanner barcode/order code using the previous AutoChecker rules."""
     send_fn = lambda message: send(worker["DISPLAY"], message)
     is_B2B = worker.get("DEPARTMENT", "").upper() == "B2B"
@@ -3366,6 +3914,13 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                 return current_order, photo_pending, photo_start
         if performance_stats is not None:
             performance_stats.record_scan(matched)
+        if worker.get("DEPARTMENT", "").upper() == "RETAIL":
+            if automatic_assignment:
+                worker["RETAIL_AUTOMATIC_ORDER"] = matched
+            else:
+                # A valid Scan:#order explicitly selected this order, so its
+                # first photo must not start the automatic assignment chain.
+                worker.pop("RETAIL_AUTOMATIC_ORDER", None)
         current_order = matched
         counts.clear(); extras.clear(); errors.clear(); no_barcode_items.clear()
         for item, quantity in orders[current_order]:
@@ -3459,6 +4014,58 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
         else:
             photo_pending = False
     return current_order, photo_pending, photo_start
+
+
+def automatically_assign_next_RETAIL_order(
+    worker: dict,
+    config: dict,
+    orders: dict,
+    counts: defaultdict,
+    extras: defaultdict,
+    errors: set,
+    no_barcode_items: list[tuple[str, int]],
+) -> tuple[str | None, bool, float]:
+    """Print, reserve and activate the next free RETAIL order."""
+    performance_stats: WorkerPerformanceStats | None = worker.get(
+        "PERFORMANCE_STATS"
+    )
+    order_id = reserve_next_RETAIL_order(worker, orders)
+    if order_id is None:
+        if performance_stats is not None:
+            performance_stats.stop_tracking()
+        message = "? No available RETAIL orders"
+        Printer(message)
+        send(worker["DISPLAY"], message)
+        return None, False, 0.0
+
+    try:
+        job_id = print_RETAIL_order_label(worker, order_id)
+    except Exception as error:
+        release_RETAIL_order_reservation(worker, order_id)
+        if performance_stats is not None:
+            performance_stats.stop_tracking()
+        message = f"XXX Cannot print order label {order_id}: {error}"
+        Printer(message)
+        send(worker["DISPLAY"], message)
+        return None, False, 0.0
+
+    message = f"* Order label printed {order_id.lstrip('#')} | Job {job_id}"
+    Printer(message)
+    send(worker["DISPLAY"], message)
+    return process_scan(
+        worker,
+        config,
+        order_id,
+        orders,
+        None,
+        counts,
+        extras,
+        errors,
+        no_barcode_items,
+        False,
+        0.0,
+        automatic_assignment=True,
+    )
 
 
 def draw_RETAIL_order_counters(frame, completed: int, total: int) -> None:
@@ -3612,15 +4219,33 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "PRINTER": identity.printer_name or "",
             "PERFORMANCE_STATS": performance_stats,
         }
-        if (
-            identity.department.upper() == RETAIL_UP_DEPARTMENT
-            and identity.printer_name
-        ):
-            message = "* Label OCR started"
-            Printer(message)
-            send(display, message)
+        if identity.department.upper() == RETAIL_UP_DEPARTMENT:
+            label_date = datetime.date.today()
+            downloads_dirs = B2B_download_directories()
+            label_files = current_RETAIL_UP_label_files(label_date)
+            pending_label_pdfs = pending_RETAIL_UP_label_pdfs(label_date)
+            if pending_label_pdfs:
+                label_ocr_ready_event = multiprocessing.Event()
+                label_ocr_process = start_label_ocr_process(
+                    identity.department,
+                    label_ocr_ready_event,
+                    downloads_dirs,
+                    label_date,
+                )
+                message = "* Label OCR started"
+                Printer(message)
+                send(display, message)
             try:
-                label_files = prepare_RETAIL_UP_label_data()
+                if not label_files and label_ocr_process is not None:
+                    label_files = wait_for_RETAIL_UP_label_data(
+                        label_ocr_process,
+                        label_ocr_ready_event,
+                        label_date,
+                    )
+                if not label_files:
+                    raise FileNotFoundError(
+                        "Today's Label PDF/JSON was not found in Downloads"
+                    )
                 message = f"* Label data ready: {len(label_files)} file(s)"
             except Exception as error:
                 message = f"XXX {error}"
@@ -3641,6 +4266,22 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
         no_barcode_items: list[tuple[str, int]] = []
         photo_pending = False
         photo_start = 0.0
+
+        if (
+            identity.department.upper() == "RETAIL"
+            and identity.printer_name
+        ):
+            current_order, photo_pending, photo_start = (
+                automatically_assign_next_RETAIL_order(
+                    worker,
+                    config,
+                    orders,
+                    counts,
+                    extras,
+                    errors,
+                    no_barcode_items,
+                )
+            )
 
         if cap is not None:
             print(
@@ -3857,6 +4498,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     if loaded_orders:
                         orders = loaded_orders
                         current_order = None
+                        worker.pop("RETAIL_AUTOMATIC_ORDER", None)
                         counts.clear()
                         extras.clear()
                         errors.clear()
@@ -3897,6 +4539,28 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                                 first_order,
                                 last_order,
                             )
+
+            if line == "NextOrder":
+                if identity.department.upper() != "RETAIL":
+                    message = "XXX NextOrder is available only for RETAIL"
+                    Printer(message)
+                    send(worker["DISPLAY"], message)
+                elif not identity.printer_name:
+                    message = "XXX Printer is not selected"
+                    Printer(message)
+                    send(worker["DISPLAY"], message)
+                else:
+                    next_state = automatically_assign_next_RETAIL_order(
+                        worker,
+                        config,
+                        orders,
+                        counts,
+                        extras,
+                        errors,
+                        no_barcode_items,
+                    )
+                    if next_state[0] is not None:
+                        current_order, photo_pending, photo_start = next_state
 
             is_direct_B2B_order = (
                 identity.department.upper() == "B2B"
@@ -3973,19 +4637,75 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         )
 
             if line == "Photo":
-                if save_photo(
+                photographed_order = current_order
+                continue_automatic_assignment = (
+                    photographed_order is not None
+                    and worker.get("RETAIL_AUTOMATIC_ORDER")
+                    == photographed_order
+                )
+                saved, first_photo = save_photo(
                     worker,
                     current_order,
                     frame if ok else None,
                     manually=True,
-                ):
-                    performance_stats.record_photo(current_order)
+                )
+                if saved:
+                    performance_stats.record_photo(photographed_order)
                 photo_pending = False
+                if (
+                    saved
+                    and first_photo
+                    and identity.department.upper() == "RETAIL"
+                    and identity.printer_name
+                    and continue_automatic_assignment
+                ):
+                    worker.pop("RETAIL_AUTOMATIC_ORDER", None)
+                    next_state = automatically_assign_next_RETAIL_order(
+                        worker,
+                        config,
+                        orders,
+                        counts,
+                        extras,
+                        errors,
+                        no_barcode_items,
+                    )
+                    if next_state[0] is not None:
+                        current_order, photo_pending, photo_start = next_state
 
             if photo_pending and time.time() - photo_start >= PHOTO_DELAY:
-                if save_photo(worker, current_order, frame if ok else None):
-                    performance_stats.record_photo(current_order)
+                photographed_order = current_order
+                continue_automatic_assignment = (
+                    photographed_order is not None
+                    and worker.get("RETAIL_AUTOMATIC_ORDER")
+                    == photographed_order
+                )
+                saved, first_photo = save_photo(
+                    worker,
+                    current_order,
+                    frame if ok else None,
+                )
+                if saved:
+                    performance_stats.record_photo(photographed_order)
                 photo_pending = False
+                if (
+                    saved
+                    and first_photo
+                    and identity.department.upper() == "RETAIL"
+                    and identity.printer_name
+                    and continue_automatic_assignment
+                ):
+                    worker.pop("RETAIL_AUTOMATIC_ORDER", None)
+                    next_state = automatically_assign_next_RETAIL_order(
+                        worker,
+                        config,
+                        orders,
+                        counts,
+                        extras,
+                        errors,
+                        no_barcode_items,
+                    )
+                    if next_state[0] is not None:
+                        current_order, photo_pending, photo_start = next_state
 
             if cap is not None:
                 key = cv2.waitKey(1) & 0xFF
