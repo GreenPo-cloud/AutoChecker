@@ -128,7 +128,7 @@ OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
 
-CURRENT_VERSION = "2.9"
+CURRENT_VERSION = "3.0"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -275,6 +275,62 @@ def update_program() -> None:
         raise
     except Exception as error:
         print(f"XXX Update failed: {error}")
+
+
+def sync_order_label_templates() -> None:
+    """Keep both SVG templates in sync independently of the code version."""
+    templates = (
+        (ORDER_LABEL_TEMPLATE, ORDER_LABEL_SVG_URL),
+        (STEALTH_ORDER_LABEL_TEMPLATE, STEALTH_ORDER_LABEL_SVG_URL),
+    )
+    temporary_files: list[Path] = []
+    try:
+        downloaded_templates: list[tuple[Path, bytes]] = []
+        for target_file, url in templates:
+            response = requests.get(url, timeout=10)
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"cannot download {target_file.name}: HTTP "
+                    f"{response.status_code}"
+                )
+            downloaded_data = response.content
+            ET.fromstring(downloaded_data)
+            downloaded_templates.append((target_file, downloaded_data))
+
+        changed_templates = [
+            (target_file, downloaded_data)
+            for target_file, downloaded_data in downloaded_templates
+            if (
+                not target_file.is_file()
+                or target_file.read_bytes() != downloaded_data
+            )
+        ]
+        for target_file, downloaded_data in changed_templates:
+            temporary_file = target_file.with_name(
+                target_file.name + ".sync"
+            )
+            temporary_file.write_bytes(downloaded_data)
+            temporary_files.append(temporary_file)
+
+        for temporary_file, (target_file, _downloaded_data) in zip(
+            temporary_files,
+            changed_templates,
+        ):
+            os.replace(temporary_file, target_file)
+
+        if changed_templates:
+            names = ", ".join(
+                target_file.name for target_file, _data in changed_templates
+            )
+            print(f"* Order label templates synchronized: {names}")
+    except Exception as error:
+        print(f"XXX Order label template synchronization failed: {error}")
+    finally:
+        for temporary_file in temporary_files:
+            try:
+                temporary_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def load_label_ocr_processor():
@@ -5425,4 +5481,5 @@ def dispatcher() -> None:
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     check_for_updates()
+    sync_order_label_templates()
     dispatcher()
