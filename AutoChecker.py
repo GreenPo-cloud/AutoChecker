@@ -1,9 +1,9 @@
-"""AutoChecker v2: dynamic discovery of displays, cameras and printers.
+"""AutoChecker v2: dynamic discovery of displays, cameras, printers and scanners.
 
 Protocol received from a display (one command per line):
-    Start:<name>;<department>;<camera>;<printer>\n
-    Stop:<name>;<department>;<camera>;<printer>\n
-The printer field is optional for compatibility with existing displays.
+    Start:<name>;<department>;<camera>;<printer>;<scanner>\n
+    Stop:<name>;<department>;<camera>;<printer>;<scanner>\n
+The printer and scanner fields are optional for compatibility with old displays.
 """
 
 from __future__ import annotations
@@ -109,6 +109,7 @@ SETTINGS_FILE = BASE_DIR / "Settings.json"
 DESKTOP_DIR = Path.home() / "Desktop"
 
 DISPLAY_BAUDRATE = 115200
+SCANNER_BAUDRATE = 115200
 DISPLAY_TIMEOUT = 0.1
 DISPLAY_WRITE_TIMEOUT = 5.0
 HANDSHAKE_TIMEOUT = 1.0
@@ -126,9 +127,7 @@ RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
 RETAIL_DELIVERY_ORDER = ("UPS", "Zasilkovna", "Postal")
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
-LABEL_OCR_LOCK_FILE = BASE_DIR / ".pdf_label_ocr.lock"
-
-CURRENT_VERSION = "3.1"
+CURRENT_VERSION = "3.5"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -473,29 +472,21 @@ def run_pending_label_ocr(
             if ready_event is not None:
                 ready_event.set()
 
-        # Launcher startup and NextPDF can request OCR at nearly the same time.
-        # Serialize them so a label PDF is never recognized twice concurrently.
-        with portalocker.Lock(
-            str(LABEL_OCR_LOCK_FILE),
-            mode="a+",
-            encoding="utf-8",
-            timeout=3600,
-        ):
-            created_json_files = []
-            if downloads_dirs is None:
+        created_json_files = []
+        if downloads_dirs is None:
+            created_json_files.extend(process_pending_label_pdfs(
+                department,
+                label_date=label_date,
+                page_saved_callback=page_saved,
+            ))
+        else:
+            for downloads_dir in downloads_dirs:
                 created_json_files.extend(process_pending_label_pdfs(
                     department,
+                    downloads_dir=downloads_dir,
                     label_date=label_date,
                     page_saved_callback=page_saved,
                 ))
-            else:
-                for downloads_dir in downloads_dirs:
-                    created_json_files.extend(process_pending_label_pdfs(
-                        department,
-                        downloads_dir=downloads_dir,
-                        label_date=label_date,
-                        page_saved_callback=page_saved,
-                    ))
         if created_json_files:
             print(
                 "* Label OCR created: "
@@ -513,26 +504,57 @@ def start_label_ocr_process(
     ready_event=None,
     downloads_dirs=None,
     label_date: datetime.date | None = None,
-) -> multiprocessing.Process:
-    """Start non-blocking label OCR and return its short-lived process."""
-    process = multiprocessing.Process(
-        target=run_pending_label_ocr,
-        args=(department, ready_event, downloads_dirs, label_date),
-        name=f"AutoChecker-label-OCR-{department.upper()}",
-        daemon=True,
-    )
-    process.start()
+) -> subprocess.Popen:
+    """Start OCR independently so its checker process may safely exit."""
+    command = [
+        sys.executable,
+        str(BASE_DIR / "pdf_label_ocr.py"),
+        "--department",
+        department,
+    ]
+    for downloads_dir in downloads_dirs or []:
+        command.extend(("--downloads-dir", str(downloads_dir)))
+    if label_date is not None:
+        command.extend(("--label-date", label_date.isoformat()))
+
+    creationflags = 0
+    start_new_session = False
+    if os.name == "nt":
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW
+        )
+    else:
+        start_new_session = True
+    log_path = Path(tempfile.gettempdir()) / "AutoChecker_pdf_label_ocr.log"
+    log_file = log_path.open("a", encoding="utf-8")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            creationflags=creationflags,
+            start_new_session=start_new_session,
+        )
+    finally:
+        log_file.close()
+    print(f"* Label OCR process {process.pid} started; log: {log_path}")
     return process
 
 
-def stop_label_ocr_process(process: multiprocessing.Process | None) -> None:
-    """Reap a completed OCR process, or stop it when its owner is exiting."""
+def label_ocr_process_is_alive(process) -> bool:
+    """Return whether a detached OCR subprocess is still running."""
+    return process is not None and process.poll() is None
+
+
+def join_finished_label_ocr_process(process) -> None:
+    """Release OS handles only after OCR has finished; never terminate it."""
     if process is None:
         return
-    process.join(timeout=0.2)
-    if process.is_alive():
-        process.terminate()
-        process.join()
+    if process.poll() is not None:
+        process.wait()
 
 
 @dataclass(frozen=True)
@@ -541,6 +563,7 @@ class CheckerIdentity:
     department: str
     camera_number: int | None
     printer_name: str | None = None
+    scanner_name: str | None = None
 
 
 def load_settings() -> dict:
@@ -569,7 +592,7 @@ def close_serial_safely(display) -> None:
 
 
 def update_display_last_identity(display_mac: str, identity: CheckerIdentity) -> None:
-    """Persist the last name, department, camera and printer selection."""
+    """Persist the last name, department, camera, printer and scanner."""
     with portalocker.Lock(str(SETTINGS_FILE), mode="r+", encoding="utf-8", timeout=30) as file:
         file.seek(0)
         settings = json.load(file)
@@ -578,6 +601,7 @@ def update_display_last_identity(display_mac: str, identity: CheckerIdentity) ->
             identity.department,
             identity.camera_number if identity.camera_number is not None else "",
             identity.printer_name or "",
+            identity.scanner_name or "",
         ]
         file.seek(0)
         file.truncate()
@@ -754,6 +778,9 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
     focus = settings.setdefault("FOCUS", {})
     display_settings = settings.setdefault("DISPLAY", {})
     _, changed = ensure_other_slots(settings)
+    if not isinstance(settings.get("SCANNER"), dict):
+        settings["SCANNER"] = {}
+        changed = True
 
     # Migrate the former global PRINTER.RETAIL_UP value to the per-display
     # last selection, then remove the obsolete dictionary.
@@ -793,9 +820,9 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
 
     for display_mac, values in list(display_settings.items()):
         if not isinstance(values, list):
-            values = ["", "", "", ""]
+            values = ["", "", "", "", ""]
         else:
-            values = (values + ["", "", "", ""])[:4]
+            values = (values + ["", "", "", "", ""])[:5]
         if (
             not values[3]
             and str(values[1]).upper() == RETAIL_UP_DEPARTMENT
@@ -808,7 +835,7 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
 
     for display_mac in displays:
         if display_mac not in display_settings:
-            display_settings[display_mac] = ["", "", "", ""]
+            display_settings[display_mac] = ["", "", "", "", ""]
             changed = True
 
     if changed:
@@ -938,6 +965,183 @@ def find_autochecker_displays(latest_version: str | None) -> dict[str, str]:
     return displays
 
 
+def read_windows_port_identity(port_info) -> tuple[str, str]:
+    """Return (bus-reported description, serial number) for one COM device."""
+    description = str(
+        getattr(port_info, "product", "")
+        or getattr(port_info, "description", "")
+        or ""
+    ).strip()
+    serial_number = str(getattr(port_info, "serial_number", "") or "").strip()
+    if os.name != "nt":
+        return description, serial_number
+
+    script = r"""
+$portName = $env:AUTOCHECKER_SCANNER_PORT
+$device = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+    Where-Object { $_.FriendlyName -like "*($portName)*" } |
+    Select-Object -First 1
+if ($null -eq $device) { exit 2 }
+$leafInstanceId = ($device.InstanceId -split '\\')[-1]
+$current = $device.InstanceId
+$busDescription = ""
+$serialNumber = ""
+for ($index = 0; $index -lt 6 -and $current; $index++) {
+    if (-not $busDescription) {
+        $value = Get-PnpDeviceProperty -InstanceId $current `
+            -KeyName 'DEVPKEY_Device_BusReportedDeviceDesc' `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $value.Data) { $busDescription = [string]$value.Data }
+    }
+    if (-not $serialNumber) {
+        $value = Get-PnpDeviceProperty -InstanceId $current `
+            -KeyName 'DEVPKEY_Device_SerialNumber' `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $value.Data) { $serialNumber = [string]$value.Data }
+    }
+    if ($busDescription -and $serialNumber) { break }
+    $parent = Get-PnpDeviceProperty -InstanceId $current `
+        -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue
+    $current = if ($null -ne $parent.Data) { [string]$parent.Data } else { "" }
+}
+if (-not $serialNumber -and $leafInstanceId) {
+    $candidate = [string]$leafInstanceId
+    if ($candidate -match '^S/N:(.+)$') {
+        $candidate = [string]$Matches[1]
+        $candidate = $candidate -replace ':[A-Za-z]$', ''
+    }
+    # Values such as 5&315b279c&0&0 are USB topology paths, not stable
+    # device serial numbers, and must not be persisted as scanner IDs.
+    if ($candidate -and $candidate -notmatch '^\d+&') {
+        $serialNumber = $candidate
+    }
+}
+[PSCustomObject]@{
+    description = $busDescription
+    serial_number = $serialNumber
+} | ConvertTo-Json -Compress
+"""
+    environment = os.environ.copy()
+    environment["AUTOCHECKER_SCANNER_PORT"] = str(port_info.device)
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            env=environment,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            properties = json.loads(result.stdout.strip().lstrip("\ufeff"))
+            description = str(
+                properties.get("description") or description
+            ).strip()
+            serial_number = str(
+                properties.get("serial_number") or serial_number
+            ).strip()
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        print(f"? Cannot read PnP properties for {port_info.device}: {error}")
+    return description, serial_number
+
+
+def identify_external_scanner(port_info, *, announce: bool = True) -> str | None:
+    """Return/register Scanner N when a COM device is a configured scanner."""
+    description, serial_number = read_windows_port_identity(port_info)
+    if not serial_number:
+        return None
+
+    with portalocker.Lock(
+        str(SETTINGS_FILE), mode="r+", encoding="utf-8", timeout=30
+    ) as file:
+        file.seek(0)
+        settings = json.load(file)
+        scanner_settings = settings.setdefault("SCANNER", {})
+        if not isinstance(scanner_settings, dict):
+            scanner_settings = {}
+            settings["SCANNER"] = scanner_settings
+
+        stored_serial = next(
+            (
+                key for key in scanner_settings
+                if str(key).casefold() == serial_number.casefold()
+            ),
+            None,
+        )
+        changed = False
+        if stored_serial is not None and str(scanner_settings[stored_serial]).strip():
+            scanner_name = str(scanner_settings[stored_serial]).strip()
+        else:
+            description_key = description.casefold()
+            if not all(
+                token in description_key for token in ("scanner", "bar", "code")
+            ):
+                return None
+            used_numbers = [
+                int(match.group(1))
+                for value in scanner_settings.values()
+                if (
+                    match := re.fullmatch(
+                        r"Scanner\s+(\d+)", str(value).strip(), re.IGNORECASE
+                    )
+                )
+            ]
+            scanner_name = f"Scanner {max(used_numbers, default=0) + 1}"
+            scanner_settings[serial_number] = scanner_name
+            changed = True
+
+        if changed:
+            file.seek(0)
+            file.truncate()
+            json.dump(settings, file, ensure_ascii=False, indent=4)
+            file.write("\n")
+            file.flush()
+
+    if announce:
+        print(
+            f"* Scanner found: {scanner_name} ({port_info.device}), "
+            f"serial {serial_number}, {description or 'no description'}"
+        )
+    return scanner_name
+
+
+def find_external_scanners(
+    excluded_ports: set[str] | None = None,
+    *,
+    announce: bool = True,
+) -> dict[str, str]:
+    """Return {Scanner N: COM port}, excluding identified displays."""
+    excluded = excluded_ports or set()
+    scanners: dict[str, str] = {}
+    for port_info in list_ports.comports():
+        if port_info.device in excluded:
+            continue
+        scanner_name = identify_external_scanner(port_info, announce=announce)
+        if scanner_name is None:
+            continue
+        duplicate = next(
+            (name for name in scanners if name.casefold() == scanner_name.casefold()),
+            None,
+        )
+        if duplicate is not None:
+            print(
+                f"XXX Duplicate {scanner_name} on {port_info.device}; "
+                f"already using {scanners[duplicate]}"
+            )
+            continue
+        scanners[scanner_name] = port_info.device
+    return scanners
+
+
 def find_autochecker_cameras(*, announce: bool = True) -> dict[int, int]:
     """Return {AutoChecker number: OpenCV DirectShow index}."""
     graph = FilterGraph()
@@ -1020,27 +1224,32 @@ def upload_display_data(
     settings: dict,
     cameras: dict[int, int],
     printers: list[str],
+    scanners: list[str],
 ) -> None:
     """Upload menu options, placing the display's last selection first."""
     last_values = settings.get("DISPLAY", {}).get(
         display_mac,
-        ["", "", "", ""],
+        ["", "", "", "", ""],
     )
-    last_values = (list(last_values) + ["", "", "", ""])[:4]
+    last_values = (list(last_values) + ["", "", "", "", ""])[:5]
     names = _prioritise(list(settings.get("NAME", [])), last_values[0])
     departments = _prioritise(list(settings.get("DEPARTMENT", [])), last_values[1])
     camera_numbers = _prioritise(sorted(cameras), last_values[2])
     printer_names = _prioritise(list(printers), last_values[3])
+    scanner_names = _prioritise(list(scanners), last_values[4])
 
     fields = [
         ",".join(map(str, names)),
         ",".join(map(str, departments)),
         ",".join(map(str, camera_numbers)),
         ",".join(printer_names),
+        ",".join(scanner_names),
         "*ORDER*",
     ]
     for setting_name, setting_value in settings.items():
-        if setting_name in {"DEPARTMENT", "DISPLAY", "OTHER", "PRINTER"}:
+        if setting_name in {
+            "DEPARTMENT", "DISPLAY", "OTHER", "PRINTER", "SCANNER"
+        }:
             continue
         if setting_name == "FOCUS":
             if isinstance(setting_value, dict):
@@ -1097,10 +1306,28 @@ def printers_available_for_selection(
     ]
 
 
+def scanners_available_for_selection(
+    scanners: dict[str, str],
+    worker_identities: dict[str, CheckerIdentity],
+) -> list[str]:
+    """Exclude external scanners currently owned by running workers."""
+    reserved = {
+        identity.scanner_name.casefold()
+        for identity in worker_identities.values()
+        if identity.scanner_name
+    }
+    return [
+        scanner_name
+        for scanner_name in scanners
+        if scanner_name.casefold() not in reserved
+    ]
+
+
 def refresh_idle_display_data(
     settings: dict,
     cameras: dict[int, int],
     printers: list[str],
+    scanners: list[str],
     idle_displays: dict[str, serial.Serial],
 ) -> None:
     """Send current menu data to every display still owned by the launcher."""
@@ -1112,6 +1339,7 @@ def refresh_idle_display_data(
                 settings,
                 cameras,
                 printers,
+                scanners,
             )
         except (serial.SerialException, OSError) as error:
             print(f"XXX Cannot upload data to AutoChecker {display_number}: {error}")
@@ -1121,6 +1349,7 @@ def broadcast_display_data(
         settings: dict,
         cameras: dict[int, int],
         printers: list[str],
+        scanners: dict[str, str],
         idle_displays: dict[str, serial.Serial],
         worker_update_queues: dict[str, multiprocessing.Queue],
         worker_identities: dict[str, CheckerIdentity],
@@ -1134,10 +1363,15 @@ def broadcast_display_data(
         printers,
         worker_identities,
     )
+    available_scanners = scanners_available_for_selection(
+        scanners,
+        worker_identities,
+    )
     refresh_idle_display_data(
         settings,
         available_cameras,
         available_printers,
+        available_scanners,
         idle_displays,
     )
 
@@ -1147,6 +1381,7 @@ def broadcast_display_data(
                 "uploadData",
                 dict(available_cameras),
                 list(available_printers),
+                list(available_scanners),
             ))
         except (OSError, ValueError, queue.Full) as error:
             print(f"XXX Cannot notify AutoChecker {display_number}: {error}")
@@ -1156,18 +1391,27 @@ def parse_command(line: str) -> tuple[str, CheckerIdentity] | None:
     """Parse one Start or Stop line; reject malformed data."""
     match = re.fullmatch(
         r"(Start|Stop):([^;\r\n]+);([^;\r\n]+);(\d*)"
+        r"(?:;([^;\r\n]*))?"
         r"(?:;([^;\r\n]*))?",
         line.strip(),
     )
     if not match:
         return None
 
-    action, name, department, camera_number, printer_name = match.groups()
+    (
+        action,
+        name,
+        department,
+        camera_number,
+        printer_name,
+        scanner_name,
+    ) = match.groups()
     identity = CheckerIdentity(
         name.strip(),
         department.strip(),
         int(camera_number) if camera_number else None,
         printer_name.strip() if printer_name and printer_name.strip() else None,
+        scanner_name.strip() if scanner_name and scanner_name.strip() else None,
     )
 
     if not identity.name or not identity.department:
@@ -1180,7 +1424,7 @@ def stop_matches_identity(
     stop_identity: CheckerIdentity,
     running_identity: CheckerIdentity,
 ) -> bool:
-    """Match legacy three-field Stop commands and new four-field commands."""
+    """Match legacy Stop commands and optional printer/scanner fields."""
     return (
         stop_identity.name == running_identity.name
         and stop_identity.department == running_identity.department
@@ -1191,6 +1435,14 @@ def stop_matches_identity(
                 running_identity.printer_name is not None
                 and stop_identity.printer_name.casefold()
                 == running_identity.printer_name.casefold()
+            )
+        )
+        and (
+            stop_identity.scanner_name is None
+            or (
+                running_identity.scanner_name is not None
+                and stop_identity.scanner_name.casefold()
+                == running_identity.scanner_name.casefold()
             )
         )
     )
@@ -1825,7 +2077,7 @@ def current_RETAIL_UP_label_files(
 def pending_RETAIL_UP_label_pdfs(
     day: datetime.date | None = None,
 ) -> list[Path]:
-    """Return today's Label PDFs which do not yet have a JSON document."""
+    """Return today's Label PDFs with an absent or incomplete JSON document."""
     from pdf_label_ocr import find_pending_label_pdfs
 
     today = datetime.date.today()
@@ -1838,8 +2090,8 @@ def pending_RETAIL_UP_label_pdfs(
 
 
 def wait_for_RETAIL_UP_label_data(
-    process: multiprocessing.Process,
-    ready_event,
+    process,
+    ready_event=None,
     day: datetime.date | None = None,
 ) -> list[tuple[Path, Path, int]]:
     """Wait only for the first usable page, not for the complete OCR run."""
@@ -1848,12 +2100,14 @@ def wait_for_RETAIL_UP_label_data(
         label_files = current_RETAIL_UP_label_files(day)
         if label_files:
             return label_files
-        if ready_event.wait(timeout=0.1):
+        if ready_event is not None and ready_event.wait(timeout=0.1):
             label_files = current_RETAIL_UP_label_files(day)
             if label_files:
                 return label_files
-        if not process.is_alive():
-            process.join()
+        else:
+            time.sleep(0.1)
+        if not label_ocr_process_is_alive(process):
+            join_finished_label_ocr_process(process)
             raise FileNotFoundError(
                 f"Label PDF/JSON for {day:%d.%m.%Y} was not found in Downloads"
             )
@@ -3285,6 +3539,111 @@ def save_part_to_statistics(
         file.flush()
 
 
+def find_RETAIL_pdf_statistics_section(
+    statistics_dir: Path,
+    pdf_path: Path,
+) -> tuple[Path, list[str]] | None:
+    """Return the newest daily statistics section belonging to one PDF."""
+    header_prefix = f"----------{pdf_path.name}----------"
+    dated_files: list[tuple[datetime.date, Path]] = []
+    if statistics_dir.is_dir():
+        for stat_path in statistics_dir.iterdir():
+            match = re.fullmatch(
+                r"(\d{2}\.\d{2}\.\d{4})\.txt",
+                stat_path.name,
+                re.IGNORECASE,
+            )
+            if match is None or not stat_path.is_file():
+                continue
+            try:
+                stat_date = datetime.datetime.strptime(
+                    match.group(1),
+                    "%d.%m.%Y",
+                ).date()
+            except ValueError:
+                continue
+            dated_files.append((stat_date, stat_path))
+
+    for _, stat_path in sorted(
+        dated_files,
+        key=lambda item: item[0],
+        reverse=True,
+    ):
+        lines = read_stat_lines(stat_path)
+        header_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if line.strip().startswith(header_prefix)
+            ),
+            None,
+        )
+        if header_index is None:
+            continue
+        end_index = next(
+            (
+                index
+                for index in range(header_index + 1, len(lines))
+                if lines[index].strip().startswith("----------")
+            ),
+            len(lines),
+        )
+        return stat_path, lines[header_index + 1:end_index]
+    return None
+
+
+def RETAIL_orders_for_current_day(
+    worker: dict,
+    pdf_path: Path,
+    parsed_orders: dict,
+) -> OrderedDict[str, list[tuple[str, int]]]:
+    """Select all new orders or carry only free orders from an older day."""
+    source = find_RETAIL_pdf_statistics_section(
+        worker["STATISTICS"],
+        pdf_path,
+    )
+    if source is None:
+        Printer(f"* New RETAIL PDF | {pdf_path.name}")
+        return OrderedDict(parsed_orders)
+
+    source_path, section_lines = source
+    today_path = statistics_file(worker)
+    source_is_today = source_path == today_path
+    selected_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for line in section_lines:
+        raw_text = line.rstrip("\r\n")
+        order_id = retail_order_id_from_stat_line(raw_text)
+        if (
+            order_id is None
+            or order_id not in parsed_orders
+            or order_id in seen_ids
+        ):
+            continue
+        if (
+            not source_is_today
+            and retail_stat_order_suffix(raw_text).strip()
+        ):
+            continue
+        selected_ids.append(order_id)
+        seen_ids.add(order_id)
+
+    if source_is_today:
+        Printer(
+            f"* RETAIL PDF already prepared today | {pdf_path.name} | "
+            f"{len(selected_ids)} order(s)"
+        )
+    else:
+        Printer(
+            f"* RETAIL PDF continued from {source_path.name} | "
+            f"{len(selected_ids)}/{len(parsed_orders)} free order(s)"
+        )
+    return OrderedDict(
+        (order_id, parsed_orders[order_id])
+        for order_id in selected_ids
+    )
+
+
 def restore_RETAIL_wrapped_lines(text: str, tracking_pattern: re.Pattern) -> str:
     """Remove delivery prefixes and reattach their product-name continuations."""
     restored_lines: list[str] = []
@@ -3519,6 +3878,7 @@ def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> d
         send(worker["DISPLAY"], message)
         return {}
     worker["RETAIL_ORDER_META"] = metadata_by_order
+    parsed = RETAIL_orders_for_current_day(worker, pdf_path, parsed)
     save_part_to_statistics(worker, pdf_path, parsed, config)
     return parsed
 
@@ -4094,7 +4454,7 @@ def automatically_assign_next_RETAIL_order(
     if order_id is None:
         if performance_stats is not None:
             performance_stats.stop_tracking()
-        message = "? No available RETAIL orders"
+        message = "* All orders compeleted"
         Printer(message)
         send(worker["DISPLAY"], message)
         return None, False, 0.0
@@ -4228,8 +4588,8 @@ def RETAIL_daily_order_counts(worker: dict) -> tuple[int, int]:
 
 
 def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | None,
-         display_port: str, display_number: str, cameras: dict[int, int],
-         printers: list[str],
+         display_port: str, scanner_port: str | None, display_number: str,
+         cameras: dict[int, int], printers: list[str], scanners: list[str],
          settings_update_requests: multiprocessing.Queue,
          display_update_queue: multiprocessing.Queue,
          display_reset_event: multiprocessing.Event,
@@ -4237,6 +4597,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
     """Run one checker and own its COM port until its matching Stop command."""
     cap = None
     display = None
+    external_scanner = None
     performance_stats = None
     label_ocr_process = None
     label_ocr_rerun_requested = False
@@ -4252,6 +4613,25 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             timeout=DISPLAY_TIMEOUT,
             write_timeout=DISPLAY_WRITE_TIMEOUT,
         )
+
+        if scanner_port is not None:
+            try:
+                external_scanner = serial.Serial(
+                    scanner_port,
+                    baudrate=SCANNER_BAUDRATE,
+                    timeout=DISPLAY_TIMEOUT,
+                    write_timeout=DISPLAY_WRITE_TIMEOUT,
+                )
+                external_scanner.reset_input_buffer()
+                print(
+                    f"* {identity.scanner_name} opened on {scanner_port} "
+                    f"at {SCANNER_BAUDRATE} baud"
+                )
+            except (serial.SerialException, OSError) as error:
+                message = f"XXX Cannot open {identity.scanner_name}: {error}"
+                Printer(message)
+                send(display, message)
+                external_scanner = None
 
         if camera_id is not None:
             cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
@@ -4286,7 +4666,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             label_files = current_RETAIL_UP_label_files(label_date)
             pending_label_pdfs = pending_RETAIL_UP_label_pdfs(label_date)
             if pending_label_pdfs:
-                label_ocr_ready_event = multiprocessing.Event()
+                label_ocr_ready_event = None
                 label_ocr_process = start_label_ocr_process(
                     identity.department,
                     label_ocr_ready_event,
@@ -4357,8 +4737,11 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
 
         window_name = f"AutoChecker - {identity.name} - {identity.department} - {identity.camera_number}"
         while True:
-            if label_ocr_process is not None and not label_ocr_process.is_alive():
-                label_ocr_process.join()
+            if (
+                label_ocr_process is not None
+                and not label_ocr_process_is_alive(label_ocr_process)
+            ):
+                join_finished_label_ocr_process(label_ocr_process)
                 label_ocr_process = None
                 if label_ocr_rerun_requested:
                     label_ocr_rerun_requested = False
@@ -4369,13 +4752,14 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             display_update_requested = False
             updated_cameras = None
             updated_printers = None
+            updated_scanners = None
             camera_stop_reason = None
             while True:
                 try:
                     update_message = display_update_queue.get_nowait()
                     if (
                         isinstance(update_message, tuple)
-                        and len(update_message) in {2, 3}
+                        and len(update_message) in {2, 3, 4}
                     ):
                         if (
                             update_message[0] == "uploadData"
@@ -4384,10 +4768,15 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                             display_update_requested = True
                             updated_cameras = update_message[1]
                             if (
-                                len(update_message) == 3
+                                len(update_message) >= 3
                                 and isinstance(update_message[2], list)
                             ):
                                 updated_printers = update_message[2]
+                            if (
+                                len(update_message) == 4
+                                and isinstance(update_message[3], list)
+                            ):
+                                updated_scanners = update_message[3]
                         elif update_message[0] == "stop":
                             camera_stop_reason = str(update_message[1])
                 except queue.Empty:
@@ -4408,6 +4797,8 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     cameras = updated_cameras
                 if updated_printers is not None:
                     printers = updated_printers
+                if updated_scanners is not None:
+                    scanners = updated_scanners
                 config = load_settings()
                 try:
                     upload_display_data(
@@ -4416,6 +4807,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         config,
                         cameras,
                         printers,
+                        scanners,
                     )
                 except serial.SerialTimeoutException as error:
                     # A settings refresh must not stop order processing merely
@@ -4440,6 +4832,28 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                 cv2.imshow(window_name, preview)
 
             line = display.readline().decode("utf-8", errors="ignore").strip()
+            if not line and external_scanner is not None:
+                try:
+                    scanner_line = external_scanner.readline().decode(
+                        "utf-8",
+                        errors="ignore",
+                    ).strip()
+                except (serial.SerialException, OSError) as error:
+                    message = (
+                        f"XXX {identity.scanner_name} disconnected: {error}"
+                    )
+                    Printer(message)
+                    send(display, message)
+                    close_serial_safely(external_scanner)
+                    external_scanner = None
+                else:
+                    if scanner_line:
+                        print(f"* {identity.scanner_name}: {scanner_line}")
+                        line = (
+                            scanner_line
+                            if scanner_line.startswith("Scan:")
+                            else f"Scan:{scanner_line}"
+                        )
             if line.startswith(ESP_ROM_PREFIX):
                 print(f"? AutoChecker {display_number} reset detected")
                 display_reset_event.set()
@@ -4467,6 +4881,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         identity.department,
                         identity.camera_number,
                         identity.printer_name,
+                        identity.scanner_name,
                     )
                     worker["NAME"] = new_name
                     update_display_last_identity(display_number, identity)
@@ -4542,13 +4957,15 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     if line == "NextPDF":
                         if (
                             label_ocr_process is not None
-                            and label_ocr_process.is_alive()
+                            and label_ocr_process_is_alive(label_ocr_process)
                         ):
                             # Coalesce repeated requests into one follow-up run.
                             label_ocr_rerun_requested = True
                         else:
                             if label_ocr_process is not None:
-                                label_ocr_process.join()
+                                join_finished_label_ocr_process(
+                                    label_ocr_process
+                                )
                             label_ocr_process = start_label_ocr_process(
                                 identity.department
                             )
@@ -4699,12 +5116,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
 
             if line == "Photo":
                 photographed_order = current_order
-                continue_automatic_assignment = (
-                    photographed_order is not None
-                    and worker.get("RETAIL_AUTOMATIC_ORDER")
-                    == photographed_order
-                )
-                saved, first_photo = save_photo(
+                saved, _first_photo = save_photo(
                     worker,
                     current_order,
                     frame if ok else None,
@@ -4712,26 +5124,11 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                 )
                 if saved:
                     performance_stats.record_photo(photographed_order)
+                    if identity.department.upper() == "RETAIL":
+                        # A photo requested by the display ends the automatic
+                        # assignment chain. Only NextOrder can start it again.
+                        worker.pop("RETAIL_AUTOMATIC_ORDER", None)
                 photo_pending = False
-                if (
-                    saved
-                    and first_photo
-                    and identity.department.upper() == "RETAIL"
-                    and identity.printer_name
-                    and continue_automatic_assignment
-                ):
-                    worker.pop("RETAIL_AUTOMATIC_ORDER", None)
-                    next_state = automatically_assign_next_RETAIL_order(
-                        worker,
-                        config,
-                        orders,
-                        counts,
-                        extras,
-                        errors,
-                        no_barcode_items,
-                    )
-                    if next_state[0] is not None:
-                        current_order, photo_pending, photo_start = next_state
 
             if photo_pending and time.time() - photo_start >= PHOTO_DELAY:
                 photographed_order = current_order
@@ -4787,7 +5184,8 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
         if cap is not None:
             cv2.destroyAllWindows()
         close_serial_safely(display)
-        stop_label_ocr_process(label_ocr_process)
+        close_serial_safely(external_scanner)
+        join_finished_label_ocr_process(label_ocr_process)
 
 
 
@@ -4854,6 +5252,13 @@ def dispatcher() -> None:
     if not display_ports:
         print("? No AutoChecker displays found; monitoring new COM ports")
 
+    scanners = find_external_scanners(
+        set(display_ports.values()),
+        announce=True,
+    )
+    if not scanners:
+        print("? No external scanners found; launcher will continue without them")
+
     # Add the per-display saved-selection slots after their IDs are known.
     settings = ensure_detected_settings(cameras, display_ports)
     ensure_worker_statistics_files(settings)
@@ -4886,6 +5291,7 @@ def dispatcher() -> None:
                     settings,
                     cameras,
                     printers,
+                    list(scanners),
                 )
                 notify_launcher_ready(idle_displays[display_number])
             except (serial.SerialException, OSError) as error:
@@ -4929,6 +5335,10 @@ def dispatcher() -> None:
                                 printers,
                                 worker_identities,
                             ),
+                            scanners_available_for_selection(
+                                scanners,
+                                worker_identities,
+                            ),
                             idle_displays,
                         )
                         print(
@@ -4953,6 +5363,10 @@ def dispatcher() -> None:
                                 printers,
                                 worker_identities,
                             ),
+                            scanners_available_for_selection(
+                                scanners,
+                                worker_identities,
+                            ),
                             idle_displays,
                         )
                         notify_launcher_ready(idle_displays[display_number])
@@ -4970,16 +5384,39 @@ def dispatcher() -> None:
 
             if time.monotonic() >= next_port_scan:
                 try:
-                    current_ports = {
-                        port_info.device for port_info in list_ports.comports()
+                    current_port_infos = {
+                        port_info.device: port_info
+                        for port_info in list_ports.comports()
                     }
+                    current_ports = set(current_port_infos)
                 except OSError as error:
                     print(f"XXX Cannot enumerate COM ports: {error}")
+                    current_port_infos = {}
                     current_ports = observed_ports
 
                 observed_ports.intersection_update(current_ports)
                 disconnected_ports_waiting_removal.intersection_update(current_ports)
-                known_ports = set(display_ports.values())
+                disconnected_scanners = [
+                    scanner_name
+                    for scanner_name, scanner_port in scanners.items()
+                    if scanner_port not in current_ports
+                ]
+                if disconnected_scanners:
+                    for scanner_name in disconnected_scanners:
+                        scanner_port = scanners.pop(scanner_name)
+                        print(f"? {scanner_name} disconnected from {scanner_port}")
+                    settings = load_settings()
+                    broadcast_display_data(
+                        settings,
+                        cameras,
+                        printers,
+                        scanners,
+                        idle_displays,
+                        worker_update_queues,
+                        worker_identities,
+                    )
+
+                known_ports = set(display_ports.values()) | set(scanners.values())
                 new_ports = (
                     current_ports
                     - observed_ports
@@ -4993,6 +5430,38 @@ def dispatcher() -> None:
                         latest_display_version,
                     )
                     if display_number is None:
+                        port_info = current_port_infos.get(port)
+                        if port_info is None:
+                            continue
+                        scanner_name = identify_external_scanner(port_info)
+                        if scanner_name is None:
+                            continue
+                        duplicate = next(
+                            (
+                                existing_name
+                                for existing_name in scanners
+                                if existing_name.casefold()
+                                == scanner_name.casefold()
+                            ),
+                            None,
+                        )
+                        if duplicate is not None:
+                            print(
+                                f"XXX Duplicate {scanner_name} on {port}; "
+                                f"already using {scanners[duplicate]}"
+                            )
+                            continue
+                        scanners[scanner_name] = port
+                        settings = load_settings()
+                        broadcast_display_data(
+                            settings,
+                            cameras,
+                            printers,
+                            scanners,
+                            idle_displays,
+                            worker_update_queues,
+                            worker_identities,
+                        )
                         continue
                     if display_number in display_ports:
                         print(
@@ -5018,6 +5487,10 @@ def dispatcher() -> None:
                             ),
                             printers_available_for_selection(
                                 printers,
+                                worker_identities,
+                            ),
+                            scanners_available_for_selection(
+                                scanners,
                                 worker_identities,
                             ),
                         )
@@ -5108,6 +5581,7 @@ def dispatcher() -> None:
                         settings,
                         cameras,
                         printers,
+                        scanners,
                         idle_displays,
                         worker_update_queues,
                         worker_identities,
@@ -5158,6 +5632,7 @@ def dispatcher() -> None:
                         settings,
                         cameras,
                         printers,
+                        scanners,
                         idle_displays,
                         worker_update_queues,
                         worker_identities,
@@ -5181,6 +5656,7 @@ def dispatcher() -> None:
                     settings,
                     cameras,
                     printers,
+                    scanners,
                     idle_displays,
                     worker_update_queues,
                     worker_identities,
@@ -5203,6 +5679,10 @@ def dispatcher() -> None:
                             ),
                             printers_available_for_selection(
                                 printers,
+                                worker_identities,
+                            ),
+                            scanners_available_for_selection(
+                                scanners,
                                 worker_identities,
                             ),
                         )
@@ -5265,6 +5745,7 @@ def dispatcher() -> None:
                                     settings,
                                     cameras,
                                     printers,
+                                    scanners,
                                     idle_displays,
                                     worker_update_queues,
                                     worker_identities,
@@ -5288,6 +5769,7 @@ def dispatcher() -> None:
                                 settings,
                                 cameras,
                                 printers,
+                                scanners,
                                 idle_displays,
                                 worker_update_queues,
                                 worker_identities,
@@ -5407,6 +5889,53 @@ def dispatcher() -> None:
                         identity.department,
                         identity.camera_number,
                         actual_printer,
+                        identity.scanner_name,
+                    )
+
+                scanner_port = None
+                if identity.scanner_name:
+                    requested_scanner = identity.scanner_name.casefold()
+                    scanner_owner = next(
+                        (
+                            worker_display
+                            for worker_display, worker_identity
+                            in worker_identities.items()
+                            if worker_identity.scanner_name
+                            and worker_identity.scanner_name.casefold()
+                            == requested_scanner
+                        ),
+                        None,
+                    )
+                    if scanner_owner is not None:
+                        message = (
+                            f"XXX {identity.scanner_name} is already in use"
+                        )
+                        Printer(message)
+                        send(display, message)
+                        notify_launcher_ready(display)
+                        continue
+
+                    actual_scanner = next(
+                        (
+                            scanner_name
+                            for scanner_name in scanners
+                            if scanner_name.casefold() == requested_scanner
+                        ),
+                        None,
+                    )
+                    if actual_scanner is None:
+                        message = f"XXX {identity.scanner_name} is unavailable"
+                        Printer(message)
+                        send(display, message)
+                        notify_launcher_ready(display)
+                        continue
+                    scanner_port = scanners[actual_scanner]
+                    identity = CheckerIdentity(
+                        identity.name,
+                        identity.department,
+                        identity.camera_number,
+                        identity.printer_name,
+                        actual_scanner,
                     )
 
                 # Windows locks COM ports exclusively. Close it before the child opens it.
@@ -5424,9 +5953,11 @@ def dispatcher() -> None:
                         camera_id,
                         focus,
                         port,
+                        scanner_port,
                         display_number,
                         cameras,
                         printers,
+                        list(scanners),
                         settings_update_requests,
                         display_update_queue,
                         display_reset_event,
@@ -5454,6 +5985,10 @@ def dispatcher() -> None:
                     ),
                     printers_available_for_selection(
                         printers,
+                        worker_identities,
+                    ),
+                    scanners_available_for_selection(
+                        scanners,
                         worker_identities,
                     ),
                     idle_displays,
