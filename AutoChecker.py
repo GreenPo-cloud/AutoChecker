@@ -9,6 +9,7 @@ The printer and scanner fields are optional for compatibility with old displays.
 from __future__ import annotations
 
 import importlib
+import copy
 import os
 import shutil
 import subprocess
@@ -121,13 +122,42 @@ CAMERA_STABLE_POLLS = 2
 PRINTER_SCAN_INTERVAL = 1.5
 PRINTER_STABLE_POLLS = 2
 SCAN_INTERVAL = 0.2
+CHANGE_PDF_SCAN_INTERVAL = 2.0
+CHANGE_PDF_RETRY_INTERVAL = 10.0
 PHOTO_DELAY = 2.5
 B2B_INDEX_FILENAME = "B2B_Order_Index.txt"
 RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
 RETAIL_DELIVERY_ORDER = ("UPS", "Zasilkovna", "Postal")
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
-CURRENT_VERSION = "3.5"
+CURRENT_VERSION = "3.10"
+
+DEFAULT_SUPPORT_PATHS = {
+    "downloads": r"\\GREENPO\Downloads",
+    "photos": r"\\GREENPO\Foto",
+    "statistics": r"\\GREENPO\Statistik2",
+}
+SETTINGS_SCHEMA_DEFAULTS = {
+    "NAME": [],
+    "DEPARTMENT": [],
+    "FOCUS": {},
+    "DISPLAY": {},
+    "SCANNER": {},
+    "OTHER": {},
+    "B2B_ALIASES": {},
+    "AUTO_COMPLETE_ITEMS": [],
+    "FEM_BONUS": {},
+    "AUTO_BONUS": {},
+    "OTHER_BONUS": {},
+    "REMOVE_ITEMS": [],
+    "REMOVE_PHRASES": [],
+    "PRODUCT_NAME_EXCEPTIONS": [],
+    "PRODUCTS": {},
+    "Merch": {},
+    "CHECK": {},
+    "support": False,
+    "support_paths": DEFAULT_SUPPORT_PATHS,
+}
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -640,6 +670,52 @@ def ensure_other_slots(settings: dict) -> tuple[dict, bool]:
     return slots, changed
 
 
+def ensure_settings_schema() -> dict:
+    """Add settings introduced by newer releases without replacing user data."""
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with portalocker.Lock(
+        str(SETTINGS_FILE), mode="a+", encoding="utf-8", timeout=30
+    ) as file:
+        file.seek(0)
+        raw = file.read().strip()
+        settings = json.loads(raw) if raw else {}
+        if not isinstance(settings, dict):
+            raise ValueError("Settings.json must contain a JSON object")
+
+        changed = False
+        for key, default_value in SETTINGS_SCHEMA_DEFAULTS.items():
+            if key not in settings:
+                settings[key] = copy.deepcopy(default_value)
+                changed = True
+
+        support_paths = settings.get("support_paths")
+        if not isinstance(support_paths, dict):
+            support_paths = copy.deepcopy(DEFAULT_SUPPORT_PATHS)
+            settings["support_paths"] = support_paths
+            changed = True
+        else:
+            for key, default_path in DEFAULT_SUPPORT_PATHS.items():
+                if key not in support_paths:
+                    support_paths[key] = default_path
+                    changed = True
+
+        _slots, other_changed = ensure_other_slots(settings)
+        changed = changed or other_changed
+
+        departments = settings.get("DEPARTMENT")
+        if isinstance(departments, list) and RETAIL_UP_DEPARTMENT not in departments:
+            departments.append(RETAIL_UP_DEPARTMENT)
+            changed = True
+
+        if changed:
+            file.seek(0)
+            file.truncate()
+            json.dump(settings, file, ensure_ascii=False, indent=4)
+            file.write("\n")
+            file.flush()
+        return settings
+
+
 def get_other_colour_rules() -> list[tuple[str, str]]:
     """Read OTHER rules only when Settings.json has changed."""
     global OTHER_CACHE_SIGNATURE, OTHER_CACHE_RULES
@@ -774,7 +850,7 @@ def apply_other_colours(colours: list[str]) -> tuple[bool, str]:
 
 def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) -> dict:
     """Create default settings for every newly discovered camera/display."""
-    settings = load_settings()
+    settings = ensure_settings_schema()
     focus = settings.setdefault("FOCUS", {})
     display_settings = settings.setdefault("DISPLAY", {})
     _, changed = ensure_other_slots(settings)
@@ -1248,7 +1324,8 @@ def upload_display_data(
     ]
     for setting_name, setting_value in settings.items():
         if setting_name in {
-            "DEPARTMENT", "DISPLAY", "OTHER", "PRINTER", "SCANNER"
+            "DEPARTMENT", "DISPLAY", "OTHER", "PRINTER", "SCANNER",
+            "support", "support_paths",
         }:
             continue
         if setting_name == "FOCUS":
@@ -1460,6 +1537,73 @@ def department_paths(department: str) -> tuple[Path, Path]:
     photo_dir.mkdir(parents=True, exist_ok=True)
     statistics_dir.mkdir(parents=True, exist_ok=True)
     return photo_dir, statistics_dir
+
+
+def support_mode_enabled(settings: dict) -> bool:
+    """Return True only for an explicit JSON boolean true."""
+    return settings.get("support") is True
+
+
+def configured_support_paths(settings: dict) -> dict[str, Path]:
+    """Validate and return the three shared folders used in support mode."""
+    configured = settings.get("support_paths", {})
+    if not isinstance(configured, dict):
+        raise ValueError("support_paths must be a dictionary")
+
+    result = {}
+    for key, default_path in DEFAULT_SUPPORT_PATHS.items():
+        raw_path = str(configured.get(key, default_path)).strip()
+        if not raw_path:
+            raise ValueError(f"support_paths.{key} is empty")
+        result[key] = Path(raw_path)
+
+    if not result["downloads"].is_dir():
+        raise FileNotFoundError(
+            f"Support downloads folder is unavailable: {result['downloads']}"
+        )
+    for key in ("photos", "statistics"):
+        result[key].mkdir(parents=True, exist_ok=True)
+        if not result[key].is_dir():
+            raise FileNotFoundError(
+                f"Support {key} folder is unavailable: {result[key]}"
+            )
+    return result
+
+
+def configure_worker_storage(worker: dict, settings: dict) -> None:
+    """Select local or shared RETAIL storage and retain local mirror paths."""
+    department = str(worker.get("DEPARTMENT", "")).upper()
+    local_retail_statistics = DESKTOP_DIR / "RETAIL" / "Statistik"
+    local_retail_statistics.mkdir(parents=True, exist_ok=True)
+
+    worker["DOWNLOAD_DIRECTORIES"] = (
+        [Path.home() / "Downloads"]
+        if department == "RETAIL"
+        else B2B_download_directories()
+    )
+    worker["RETAIL_STATISTICS"] = local_retail_statistics
+    worker["RETAIL_LOCAL_STATISTICS"] = local_retail_statistics
+    if department not in {"RETAIL", RETAIL_UP_DEPARTMENT}:
+        return
+    if not support_mode_enabled(settings):
+        return
+
+    shared = configured_support_paths(settings)
+    worker["SUPPORT"] = True
+    worker["DOWNLOAD_DIRECTORIES"] = [shared["downloads"]]
+    worker["SUPPORT_FOTO"] = shared["photos"]
+    worker["RETAIL_STATISTICS"] = shared["statistics"]
+    worker["STATISTICS_MIRROR_DIR"] = local_retail_statistics
+    if department == "RETAIL":
+        worker["STATISTICS"] = shared["statistics"]
+
+
+def retail_statistics_file(worker: dict) -> Path:
+    """Return today's RETAIL file for both assembly and packing workers."""
+    statistics_dir = worker.get("RETAIL_STATISTICS")
+    if statistics_dir is None:
+        statistics_dir = DESKTOP_DIR / "RETAIL" / "Statistik"
+    return Path(statistics_dir) / f"{datetime.date.today():%d.%m.%Y}.txt"
 
 
 def safe_worker_filename(name: str) -> str:
@@ -1904,28 +2048,44 @@ def sort_key(item: tuple[str, int], config: dict) -> tuple[int, str, int]:
     return category, base_name, fem_count
 
 
-def _available_order_pdfs() -> list[tuple[datetime.date, int, Path]]:
+def _available_order_pdfs(
+    download_directories: list[Path] | None = None,
+) -> list[tuple[datetime.date, int, Path]]:
     pattern = re.compile(r"^(\d{2}\.\d{2}\.\d{4}) Part (\d+)\.pdf$", re.IGNORECASE)
     found = []
-    downloads = Path.home() / "Downloads"
-    if not downloads.is_dir():
-        return found
-    for path in downloads.iterdir():
-        match = pattern.fullmatch(path.name)
-        if not match:
+    seen_paths = set()
+    directories = download_directories or [Path.home() / "Downloads"]
+    for downloads in directories:
+        if not downloads.is_dir():
             continue
-        try:
-            date = datetime.datetime.strptime(match.group(1), "%d.%m.%Y").date()
-            found.append((date, int(match.group(2)), path))
-        except ValueError:
-            continue
-    return sorted(found)
+        for path in downloads.iterdir():
+            match = pattern.fullmatch(path.name)
+            if not match:
+                continue
+            path_key = str(path).casefold()
+            if path_key in seen_paths:
+                continue
+            try:
+                date = datetime.datetime.strptime(
+                    match.group(1), "%d.%m.%Y"
+                ).date()
+                found.append((date, int(match.group(2)), path))
+                seen_paths.add(path_key)
+            except ValueError:
+                continue
+    return sorted(
+        found,
+        key=lambda item: (item[0], item[1], str(item[2]).casefold()),
+    )
 
 
-def find_latest_pdf(previous: bool = False) -> tuple[Path | None, int | None]:
+def find_latest_pdf(
+    previous: bool = False,
+    download_directories: list[Path] | None = None,
+) -> tuple[Path | None, int | None]:
     """Find latest PDF, or step back one part/date when previous is requested."""
     global PDF_HISTORY_CURSOR
-    files = _available_order_pdfs()
+    files = _available_order_pdfs(download_directories)
     if not files:
         return None, None
     today_files = [item for item in files if item[0] == datetime.date.today()]
@@ -1952,10 +2112,45 @@ def statistics_file(worker: dict) -> Path:
 
 
 def _locked_statistics_file(stat_file: Path):
-    """Return an exclusive, cross-process lock for a statistics file."""
+    """Return an exclusive OS/SMB lock for a statistics file."""
     stat_file.parent.mkdir(parents=True, exist_ok=True)
     stat_file.touch(exist_ok=True)
     return portalocker.Lock(str(stat_file), mode="r+", encoding="utf-8", timeout=30)
+
+
+def mirror_statistics_lines(
+    worker: dict,
+    source_file: Path,
+    lines: list[str],
+) -> None:
+    """Write a locked local mirror while the authoritative shared lock is held."""
+    mirror_dir = worker.get("STATISTICS_MIRROR_DIR")
+    if mirror_dir is None:
+        return
+    mirror_file = Path(mirror_dir) / source_file.name
+    try:
+        if mirror_file.resolve() == source_file.resolve():
+            return
+    except OSError:
+        if str(mirror_file).casefold() == str(source_file).casefold():
+            return
+    with _locked_statistics_file(mirror_file) as mirror:
+        mirror.seek(0)
+        mirror.truncate()
+        mirror.writelines(lines)
+        mirror.flush()
+
+
+def synchronize_support_statistics(worker: dict) -> None:
+    """Refresh today's local mirror from the authoritative network file."""
+    if not worker.get("SUPPORT"):
+        return
+    shared_file = retail_statistics_file(worker)
+    if not shared_file.is_file():
+        return
+    with _locked_statistics_file(shared_file) as file:
+        file.seek(0)
+        mirror_statistics_lines(worker, shared_file, file.readlines())
 
 
 def read_stat_lines(stat_file: Path) -> list[str]:
@@ -2047,6 +2242,7 @@ def B2B_download_directories() -> list[Path]:
 
 def current_RETAIL_UP_label_files(
     day: datetime.date | None = None,
+    download_directories: list[Path] | None = None,
 ) -> list[tuple[Path, Path, int]]:
     """Return today's existing (JSON, PDF, part number) label file pairs."""
     day = day or datetime.date.today()
@@ -2056,7 +2252,7 @@ def current_RETAIL_UP_label_files(
         re.IGNORECASE,
     )
     result: list[tuple[Path, Path, int]] = []
-    for directory in B2B_download_directories():
+    for directory in download_directories or B2B_download_directories():
         if not directory.is_dir():
             continue
         for json_path in directory.iterdir():
@@ -2076,6 +2272,7 @@ def current_RETAIL_UP_label_files(
 
 def pending_RETAIL_UP_label_pdfs(
     day: datetime.date | None = None,
+    download_directories: list[Path] | None = None,
 ) -> list[Path]:
     """Return today's Label PDFs with an absent or incomplete JSON document."""
     from pdf_label_ocr import find_pending_label_pdfs
@@ -2084,7 +2281,7 @@ def pending_RETAIL_UP_label_pdfs(
     if day is not None:
         today = day
     pending = []
-    for directory in B2B_download_directories():
+    for directory in download_directories or B2B_download_directories():
         pending.extend(find_pending_label_pdfs(directory, label_date=today))
     return pending
 
@@ -2093,15 +2290,20 @@ def wait_for_RETAIL_UP_label_data(
     process,
     ready_event=None,
     day: datetime.date | None = None,
+    download_directories: list[Path] | None = None,
 ) -> list[tuple[Path, Path, int]]:
     """Wait only for the first usable page, not for the complete OCR run."""
     day = day or datetime.date.today()
     while True:
-        label_files = current_RETAIL_UP_label_files(day)
+        label_files = current_RETAIL_UP_label_files(
+            day, download_directories
+        )
         if label_files:
             return label_files
         if ready_event is not None and ready_event.wait(timeout=0.1):
-            label_files = current_RETAIL_UP_label_files(day)
+            label_files = current_RETAIL_UP_label_files(
+                day, download_directories
+            )
             if label_files:
                 return label_files
         else:
@@ -2133,18 +2335,13 @@ def read_RETAIL_UP_label_document(json_path: Path) -> dict:
     return document
 
 
-def RETAIL_UP_statistics_line(order_id: str) -> str:
+def RETAIL_UP_statistics_line(worker: dict, order_id: str) -> str:
     """Return one RETAIL statistics line without checking its order status."""
     normalized_order = order_id.strip()
     if not re.fullmatch(r"#\d+", normalized_order):
         raise ValueError(f"Invalid order number {order_id}")
 
-    stat_file = (
-        DESKTOP_DIR
-        / "RETAIL"
-        / "Statistik"
-        / f"{datetime.date.today():%d.%m.%Y}.txt"
-    )
+    stat_file = retail_statistics_file(worker)
     if not stat_file.is_file():
         raise FileNotFoundError("Today's RETAIL statistics file was not found")
 
@@ -2160,13 +2357,13 @@ def RETAIL_UP_statistics_line(order_id: str) -> str:
     return matching_line
 
 
-def RETAIL_UP_ready_statistics_line(order_id: str) -> str:
+def RETAIL_UP_ready_statistics_line(worker: dict, order_id: str) -> str:
     """Return one completed, non-cancelled RETAIL statistics line."""
     normalized_order = order_id.strip()
-    matching_line = RETAIL_UP_statistics_line(normalized_order)
+    matching_line = RETAIL_UP_statistics_line(worker, normalized_order)
 
-    status = retail_stat_order_suffix(matching_line)
-    if "cancelled" in status.casefold():
+    status = retail_stat_effective_suffix(matching_line)
+    if retail_stat_is_cancelled(matching_line):
         raise ValueError(f"Cancelled order {normalized_order}")
     if "+" not in status:
         raise ValueError(f"Order is not completed {normalized_order}")
@@ -2185,12 +2382,15 @@ def RETAIL_UP_tracking_from_order_line(order_id: str, line: str) -> str:
     prefix = line[:order_position].strip()
     tracking_number = prefix.split(maxsplit=1)[0] if prefix else ""
     tracking_number = re.sub(r"[^A-Za-z0-9]", "", tracking_number).upper()
-    if not tracking_number:
-        raise LookupError(f"Tracking number is missing for {normalized_order}")
+    is_ups = bool(re.fullmatch(r"1ZR[A-Z0-9]+", tracking_number))
+    is_zasilkovna = bool(re.fullmatch(r"Z\d{5,}", tracking_number))
+    if not (is_ups or is_zasilkovna):
+        raise LookupError(f"Order {normalized_order} is Postal")
     return tracking_number
 
 
 def RETAIL_UP_tracking_from_statistics(
+    worker: dict,
     order_id: str,
     *,
     require_ready: bool = True,
@@ -2198,21 +2398,16 @@ def RETAIL_UP_tracking_from_statistics(
     """Return an order's tracking number, optionally requiring ready status."""
     normalized_order = order_id.strip()
     matching_line = (
-        RETAIL_UP_ready_statistics_line(normalized_order)
+        RETAIL_UP_ready_statistics_line(worker, normalized_order)
         if require_ready
-        else RETAIL_UP_statistics_line(normalized_order)
+        else RETAIL_UP_statistics_line(worker, normalized_order)
     )
     return RETAIL_UP_tracking_from_order_line(normalized_order, matching_line)
 
 
-def RETAIL_UP_today_orders() -> dict[str, str]:
+def RETAIL_UP_today_orders(worker: dict) -> dict[str, str]:
     """Return today's RETAIL statistics lines indexed by order number."""
-    stat_file = (
-        DESKTOP_DIR
-        / "RETAIL"
-        / "Statistik"
-        / f"{datetime.date.today():%d.%m.%Y}.txt"
-    )
+    stat_file = retail_statistics_file(worker)
     if not stat_file.is_file():
         raise FileNotFoundError("Today's RETAIL statistics file was not found")
 
@@ -2246,27 +2441,29 @@ def parse_RETAIL_UP_print_label_command(
     return first_order, last_order or None
 
 
-def append_RETAIL_UP_print_name(order_id: str, name: str) -> None:
-    """Append the printing worker name to today's RETAIL order line."""
+def append_RETAIL_UP_print_name(worker: dict, order_id: str, name: str) -> bool:
+    """Append a packing name and return whether one was already recorded."""
     normalized_order = order_id.strip()
-    stat_file = (
-        DESKTOP_DIR
-        / "RETAIL"
-        / "Statistik"
-        / f"{datetime.date.today():%d.%m.%Y}.txt"
-    )
+    stat_file = retail_statistics_file(worker)
     with _locked_statistics_file(stat_file) as file:
         file.seek(0)
         lines = file.readlines()
         for index, line in enumerate(lines):
             if retail_order_id_from_stat_line(line) != normalized_order:
                 continue
+            if retail_stat_is_cancelled(line):
+                raise ValueError(f"Cancelled order {normalized_order}")
+            duplicate = (
+                RETAIL_UP_printed_name(retail_stat_effective_suffix(line))
+                is not None
+            )
             lines[index] = line.rstrip("\r\n") + f" {name}\n"
             file.seek(0)
             file.truncate()
             file.writelines(lines)
             file.flush()
-            return
+            mirror_statistics_lines(worker, stat_file, lines)
+            return duplicate
     raise LookupError(f"Unknown order {normalized_order}")
 
 
@@ -2280,28 +2477,96 @@ def RETAIL_UP_shipping_progress_from_lines(
         if retail_order_id_from_stat_line(line) is None:
             continue
         total += 1
-        status = retail_stat_order_suffix(line)
-        printed_name = re.search(r"(?:\(\+\)|\+)\s+(.+?)\s*$", status)
+        status = retail_stat_effective_suffix(line)
         if (
-            "cancelled" not in status.casefold()
-            and printed_name is not None
-            and printed_name.group(1).strip()
+            not retail_stat_is_cancelled(line)
+            and RETAIL_UP_printed_name(status) is not None
         ):
             completed += 1
     return completed, total - completed, total
 
 
-def RETAIL_UP_shipping_progress() -> tuple[int, int, int]:
-    """Return completed-for-shipping, left and all RETAIL orders for today."""
-    stat_file = (
-        DESKTOP_DIR
-        / "RETAIL"
-        / "Statistik"
-        / f"{datetime.date.today():%d.%m.%Y}.txt"
+def RETAIL_UP_printed_name(status: str) -> str | None:
+    """Return text recorded after +/(+), or None before the first packing."""
+    match = re.search(r"(?:\(\+\)|\+)\s+(.+?)\s*$", status)
+    if match is None or not match.group(1).strip():
+        return None
+    return match.group(1).strip()
+
+
+def RETAIL_UP_shipping_progress_by_delivery_from_lines(
+    lines: list[str],
+) -> tuple[int, int, int, int, int]:
+    """Return completed UPS/Zasilkovna/Postal counts, left and total."""
+    completed_ups = 0
+    completed_zasilkovna = 0
+    completed_postal = 0
+    total = 0
+
+    for line in lines:
+        order_id = retail_order_id_from_stat_line(line)
+        if order_id is None:
+            continue
+        total += 1
+        status = retail_stat_effective_suffix(line)
+        if (
+            retail_stat_is_cancelled(line)
+            or RETAIL_UP_printed_name(status) is None
+        ):
+            continue
+
+        order_position = line.find(order_id)
+        prefix = line[:order_position].strip() if order_position >= 0 else ""
+        first_value = prefix.split(maxsplit=1)[0] if prefix else ""
+        tracking_number = re.sub(
+            r"[^A-Za-z0-9]", "", first_value
+        ).upper()
+        if tracking_number.startswith("1ZR"):
+            completed_ups += 1
+        elif re.match(r"^Z\d", tracking_number):
+            completed_zasilkovna += 1
+        else:
+            completed_postal += 1
+
+    completed = completed_ups + completed_zasilkovna + completed_postal
+    return (
+        completed_ups,
+        completed_zasilkovna,
+        completed_postal,
+        total - completed,
+        total,
     )
+
+
+def RETAIL_UP_shipping_progress(worker: dict) -> tuple[int, int, int]:
+    """Return completed-for-shipping, left and all RETAIL orders for today."""
+    stat_file = retail_statistics_file(worker)
     if not stat_file.is_file():
         return 0, 0, 0
     return RETAIL_UP_shipping_progress_from_lines(read_stat_lines(stat_file))
+
+
+def RETAIL_UP_shipping_progress_by_delivery(
+    worker: dict,
+) -> tuple[int, int, int, int, int]:
+    """Read today's detailed packing progress from RETAIL statistics."""
+    stat_file = retail_statistics_file(worker)
+    if not stat_file.is_file():
+        return 0, 0, 0, 0, 0
+    return RETAIL_UP_shipping_progress_by_delivery_from_lines(
+        read_stat_lines(stat_file)
+    )
+
+
+def RETAIL_UP_shipping_header(worker: dict) -> str:
+    """Build the first display line with completed delivery-type counts."""
+    ups, zasilkovna, postal, left, total = (
+        RETAIL_UP_shipping_progress_by_delivery(worker)
+    )
+    return (
+        f"* Completed UPS: {ups}, Zasilkovna: {zasilkovna}, "
+        f"Postal: {postal}, Left: {left}, All: {total}"
+    )
 
 
 def RETAIL_check_fragments(settings: dict) -> list[str]:
@@ -2331,20 +2596,31 @@ def RETAIL_check_fragments(settings: dict) -> list[str]:
     return unique
 
 
-def RETAIL_UP_check_lines(order_id: str, settings: dict) -> list[str]:
-    """Return CHECK positions and yellow merchandise positions for packing."""
+def RETAIL_UP_is_product_item(name: str, settings: dict) -> bool:
+    """Return whether an order name resolves to a PRODUCTS catalogue value."""
+    products = settings.get("PRODUCTS", {})
+    if not isinstance(products, dict):
+        return False
+    product_names = {
+        normalize(value).casefold()
+        for value in products.values()
+        if isinstance(value, str) and value.strip()
+    }
+    return product_base_name(name, settings).casefold() in product_names
+
+
+def RETAIL_UP_check_lines(
+    worker: dict,
+    order_id: str,
+    settings: dict,
+) -> list[str]:
+    """Return CHECK positions and every non-PRODUCTS position for packing."""
     fragments = RETAIL_check_fragments(settings)
     fragment_keys = [fragment.casefold() for fragment in fragments]
-    merchandise = settings.get("Merch", {})
-    merchandise_names = {
-        re.sub(r"\s+", " ", value).strip().casefold()
-        for value in merchandise.values()
-        if isinstance(value, str) and value.strip()
-    } if isinstance(merchandise, dict) else set()
-    if not fragment_keys and not merchandise_names:
-        return []
     today = datetime.date.today()
-    for pdf_date, _part, pdf_path in reversed(_available_order_pdfs()):
+    for pdf_date, _part, pdf_path in reversed(
+        _available_order_pdfs(worker.get("DOWNLOAD_DIRECTORIES"))
+    ):
         if pdf_date != today:
             continue
         try:
@@ -2366,20 +2642,19 @@ def RETAIL_UP_check_lines(order_id: str, settings: dict) -> list[str]:
             continue
         result = []
         for name, quantity in matched_order:
-            name_key = re.sub(r"\s+", " ", name).strip().casefold()
-            is_merchandise = name_key in merchandise_names
+            is_product = RETAIL_UP_is_product_item(name, settings)
             matches_check = any(
                 fragment in name.casefold() for fragment in fragment_keys
             )
-            if not is_merchandise and not matches_check:
+            if is_product and not matches_check:
                 continue
             line = f"{quantity} {name}"
-            # An explicit tag keeps merchandise yellow even if OTHER colour
-            # rules contain a matching fragment. If CHECK also matches the
-            # same item, it is still emitted only once as merchandise.
-            result.append(f"#ffff00 {line}" if is_merchandise else line)
+            # Every position outside PRODUCTS is a packing warning, including
+            # Merch and completely unknown items. An explicit tag keeps it
+            # yellow even if OTHER colour rules contain a matching fragment.
+            result.append(f"#ffff00 {line}" if not is_product else line)
         return result
-    Printer(f"? Order data for CHECK/Merch not found: {order_id}")
+    Printer(f"? Order data for packing checks not found: {order_id}")
     return []
 
 
@@ -2388,11 +2663,13 @@ def normalize_RETAIL_UP_tracking_number(tracking_number: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", str(tracking_number)).upper()
 
 
-def RETAIL_UP_label_tracking_sequence() -> list[str]:
+def RETAIL_UP_label_tracking_sequence(worker: dict) -> list[str]:
     """Return today's Label tracking numbers in PDF part/page order."""
     sequence = []
     label_files = sorted(
-        current_RETAIL_UP_label_files(),
+        current_RETAIL_UP_label_files(
+            download_directories=worker.get("DOWNLOAD_DIRECTORIES")
+        ),
         key=lambda item: item[2],
     )
     if not label_files:
@@ -2436,11 +2713,14 @@ def RETAIL_UP_label_tracking_sequence() -> list[str]:
 
 
 def find_RETAIL_UP_label_page(
+    worker: dict,
     tracking_number: str,
 ) -> tuple[Path, int, str]:
     """Find a tracking number and its label type in today's Label JSON."""
     expected = normalize_RETAIL_UP_tracking_number(tracking_number)
-    for json_path, pdf_path, _part_number in current_RETAIL_UP_label_files():
+    for json_path, pdf_path, _part_number in current_RETAIL_UP_label_files(
+        download_directories=worker.get("DOWNLOAD_DIRECTORIES")
+    ):
         document = read_RETAIL_UP_label_document(json_path)
         actual_key = next(
             (
@@ -2877,26 +3157,35 @@ def submit_RETAIL_UP_label(
 ) -> tuple[str, bool]:
     """Validate one order, optionally print it, and record the worker name."""
     printer_name = str(worker.get("PRINTER", "")).strip()
+    ready_line = RETAIL_UP_ready_statistics_line(worker, order_id)
     if printer_name:
-        tracking_number = RETAIL_UP_tracking_from_statistics(order_id)
+        tracking_number = RETAIL_UP_tracking_from_order_line(
+            order_id, ready_line
+        )
         pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
-            tracking_number
+            worker, tracking_number
         )
         print_pdf_page(pdf_path, page_number, printer_name, label_type)
-        status_message = (
-            f"+ Label printed {order_id.lstrip('#')} page {page_number}"
-        )
         physically_printed = True
     else:
-        RETAIL_UP_ready_statistics_line(order_id)
-        status_message = (
-            f"+ Order {order_id.lstrip('#')} recorded without printing"
-        )
         physically_printed = False
     recorded_name = worker["NAME"]
     if physically_printed and parenthesize_print_name:
         recorded_name = f"({recorded_name})"
-    append_RETAIL_UP_print_name(order_id, recorded_name)
+    duplicate_print = append_RETAIL_UP_print_name(
+        worker, order_id, recorded_name
+    )
+    if physically_printed:
+        status_message = (
+            f"? Dublicate print label {order_id.lstrip('#')} "
+            f"page {page_number}"
+            if duplicate_print
+            else f"+ Label printed {order_id.lstrip('#')} page {page_number}"
+        )
+    else:
+        status_message = (
+            f"+ Order {order_id.lstrip('#')} recorded without printing"
+        )
     return status_message, physically_printed
 
 
@@ -2916,14 +3205,13 @@ def process_RETAIL_UP_scan(
             order_id,
             parenthesize_print_name=parenthesize_print_name,
         )
-        check_lines = RETAIL_UP_check_lines(order_id, settings)
+        check_lines = RETAIL_UP_check_lines(worker, order_id, settings)
         success = True
     except Exception as error:
         status_message = f"XXX {error}"
         success = False
-    completed, left, total = RETAIL_UP_shipping_progress()
     message = "\n".join((
-        f"* Completed: {completed}, Left: {left}, All: {total}",
+        RETAIL_UP_shipping_header(worker),
         status_message,
         *check_lines,
     ))
@@ -2940,21 +3228,21 @@ def process_RETAIL_UP_label_range(
 ) -> int:
     """Print an inclusive range in Label JSON part/page order."""
     try:
-        orders = RETAIL_UP_today_orders()
+        orders = RETAIL_UP_today_orders(worker)
         first_tracking = normalize_RETAIL_UP_tracking_number(
             RETAIL_UP_tracking_from_statistics(
-                first_order,
+                worker, first_order,
                 require_ready=False,
             )
         )
         last_tracking = normalize_RETAIL_UP_tracking_number(
             RETAIL_UP_tracking_from_statistics(
-                last_order,
+                worker, last_order,
                 require_ready=False,
             )
         )
 
-        label_sequence = RETAIL_UP_label_tracking_sequence()
+        label_sequence = RETAIL_UP_label_tracking_sequence(worker)
         try:
             first_position = label_sequence.index(first_tracking)
         except ValueError as error:
@@ -2994,8 +3282,8 @@ def process_RETAIL_UP_label_range(
                     f"XXX Tracking {tracking_number} not found in statistics"
                 )
                 continue
-            status = retail_stat_order_suffix(orders[order_id])
-            if "cancelled" in status.casefold():
+            status = retail_stat_effective_suffix(orders[order_id])
+            if retail_stat_is_cancelled(orders[order_id]):
                 status_lines.append(f"XXX {order_id} is Cancelled")
                 continue
             if "+" not in status:
@@ -3018,14 +3306,13 @@ def process_RETAIL_UP_label_range(
         printed_count = 0
         status_lines = [f"XXX {error}"]
 
-    completed, left, total = RETAIL_UP_shipping_progress()
     result_line = (
         f"+ Labels printed: {printed_count}"
         if worker.get("PRINTER")
         else f"+ Orders recorded: {processed_count}"
     )
     message = "\n".join((
-        f"* Completed: {completed}, Left: {left}, All: {total}",
+        RETAIL_UP_shipping_header(worker),
         result_line,
         *status_lines,
     ))
@@ -3320,6 +3607,45 @@ def retail_stat_order_suffix(text: str) -> str:
     return text[match.end():] if match else ""
 
 
+def retail_stat_change_match(text: str) -> re.Match | None:
+    """Return the last whole-word Change marker in an order status suffix."""
+    matches = list(
+        re.finditer(
+            r"(?<!\S)Change(?=\s|$)",
+            retail_stat_order_suffix(text),
+            re.IGNORECASE,
+        )
+    )
+    return matches[-1] if matches else None
+
+
+def retail_stat_has_change(text: str) -> bool:
+    """Return whether a RETAIL line contains a Change history boundary."""
+    return retail_stat_change_match(text) is not None
+
+
+def retail_stat_is_cancelled(text: str) -> bool:
+    """Treat Cancelled anywhere in the order history as authoritative."""
+    return bool(
+        re.search(
+            r"(?<!\S)Cancelled(?=\s|$)",
+            retail_stat_order_suffix(text),
+            re.IGNORECASE,
+        )
+    )
+
+
+def retail_stat_effective_suffix(text: str) -> str:
+    """Return only the live status after the latest Change marker.
+
+    Text before Change remains in the file as history, but no assembler,
+    completion or cancellation flag from that history affects current work.
+    """
+    suffix = retail_stat_order_suffix(text)
+    change_match = retail_stat_change_match(text)
+    return suffix[change_match.end():] if change_match is not None else suffix
+
+
 def retail_stat_metadata_values(metadata: dict) -> tuple[str, str]:
     tracking_number = re.sub(
         r"\s+", " ", str(metadata.get("tracking_number", ""))
@@ -3537,6 +3863,7 @@ def save_part_to_statistics(
         file.truncate()
         file.writelines(lines)
         file.flush()
+        mirror_statistics_lines(worker, stat_file, lines)
 
 
 def find_RETAIL_pdf_statistics_section(
@@ -3622,7 +3949,10 @@ def RETAIL_orders_for_current_day(
             continue
         if (
             not source_is_today
-            and retail_stat_order_suffix(raw_text).strip()
+            and (
+                retail_stat_is_cancelled(raw_text)
+                or retail_stat_effective_suffix(raw_text).strip()
+            )
         ):
             continue
         selected_ids.append(order_id)
@@ -3858,8 +4188,322 @@ def load_or_create_RETAIL_order_cache(
         return parsed, metadata_by_order
 
 
+def RETAIL_change_pdf_order_ids(pdf_path: Path) -> list[str]:
+    """Return order IDs encoded by a valid Change PDF filename."""
+    match = re.fullmatch(
+        r"Change\s+.+\s+\(\d{2}\.\d{2}\.\d{4}\)\.pdf",
+        pdf_path.name,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return []
+    result = []
+    seen = set()
+    for order_id in re.findall(r"#\d+", pdf_path.stem):
+        if order_id not in seen:
+            seen.add(order_id)
+            result.append(order_id)
+    return result
+
+
+def available_RETAIL_change_pdfs(
+    download_directories: list[Path] | None,
+) -> list[Path]:
+    """List manager Change PDFs in chronological and filesystem order."""
+    result: list[tuple[datetime.date, int, str, Path]] = []
+    seen = set()
+    for directory in download_directories or [Path.home() / "Downloads"]:
+        if not directory.is_dir():
+            continue
+        try:
+            paths = list(directory.iterdir())
+        except OSError:
+            continue
+        for path in paths:
+            if not path.is_file() or not RETAIL_change_pdf_order_ids(path):
+                continue
+            path_key = str(path).casefold()
+            if path_key in seen:
+                continue
+            seen.add(path_key)
+            date_match = re.search(
+                r"\((\d{2}\.\d{2}\.\d{4})\)\.pdf$",
+                path.name,
+                re.IGNORECASE,
+            )
+            try:
+                change_date = datetime.datetime.strptime(
+                    date_match.group(1), "%d.%m.%Y"
+                ).date()
+            except (AttributeError, ValueError):
+                change_date = datetime.date.min
+            try:
+                modified_ns = path.stat().st_mtime_ns
+            except OSError:
+                modified_ns = 0
+            result.append((change_date, modified_ns, path.name.casefold(), path))
+    return [entry[-1] for entry in sorted(result)]
+
+
+def merge_RETAIL_change_cache(
+    cache_path: Path,
+    source_pdf: Path | None,
+    replacements: dict[str, list[tuple[str, int]]],
+    replacement_metadata: dict[str, dict],
+    config: dict,
+) -> set[str]:
+    """Replace matching order entries in one locked normal Order cache."""
+    with portalocker.Lock(
+        str(cache_path), mode="a+", encoding="utf-8", timeout=120
+    ) as file:
+        file.seek(0)
+        raw = file.read().strip()
+        parsed = None
+        metadata_by_order = None
+        if raw:
+            try:
+                parsed, metadata_by_order = decode_RETAIL_order_cache(
+                    json.loads(raw)
+                )
+            except (ValueError, TypeError, json.JSONDecodeError):
+                parsed = None
+                metadata_by_order = None
+        if parsed is None:
+            if source_pdf is None or not source_pdf.is_file():
+                return set()
+            parsed, metadata_by_order = parse_RETAIL_pdf_document(
+                source_pdf, config
+            )
+
+        matched = set(parsed).intersection(replacements)
+        if not matched:
+            return set()
+        for order_id in matched:
+            parsed[order_id] = replacements[order_id]
+            metadata_by_order[order_id] = replacement_metadata[order_id]
+
+        document = RETAIL_order_cache_document(parsed, metadata_by_order)
+        file.seek(0)
+        file.truncate()
+        json.dump(document, file, ensure_ascii=False, indent=4)
+        file.write("\n")
+        file.flush()
+        return matched
+
+
+def update_RETAIL_change_caches(
+    worker: dict,
+    replacements: dict[str, list[tuple[str, int]]],
+    replacement_metadata: dict[str, dict],
+    config: dict,
+) -> set[str]:
+    """Update every normal cache containing one of the changed orders."""
+    cache_sources: OrderedDict[str, tuple[Path, Path | None]] = OrderedDict()
+    for _pdf_date, _part, pdf_path in _available_order_pdfs(
+        worker.get("DOWNLOAD_DIRECTORIES")
+    ):
+        cache_path = RETAIL_order_cache_path(pdf_path)
+        cache_sources[str(cache_path).casefold()] = (cache_path, pdf_path)
+
+    for directory in worker.get("DOWNLOAD_DIRECTORIES") or []:
+        if not Path(directory).is_dir():
+            continue
+        try:
+            paths = list(Path(directory).iterdir())
+        except OSError:
+            continue
+        for cache_path in paths:
+            if (
+                cache_path.is_file()
+                and not cache_path.name.casefold().startswith("change ")
+                and cache_path.name.casefold().endswith(
+                    RETAIL_ORDER_CACHE_SUFFIX.casefold()
+                )
+            ):
+                cache_sources.setdefault(
+                    str(cache_path).casefold(), (cache_path, None)
+                )
+
+    matched: set[str] = set()
+    for cache_path, source_pdf in cache_sources.values():
+        matched.update(
+            merge_RETAIL_change_cache(
+                cache_path,
+                source_pdf,
+                replacements,
+                replacement_metadata,
+                config,
+            )
+        )
+    return matched
+
+
+def append_RETAIL_change_markers(
+    worker: dict,
+    order_ids: list[str],
+) -> tuple[set[str], set[str]]:
+    """Append one Change boundary to every found statistics order line."""
+    target_ids = set(order_ids)
+    stat_file = retail_statistics_file(worker)
+    found: set[str] = set()
+    added: set[str] = set()
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        for index, line in enumerate(lines):
+            raw_text = line.rstrip("\r\n")
+            order_id = retail_order_id_from_stat_line(raw_text)
+            if order_id not in target_ids:
+                continue
+            found.add(order_id)
+            if retail_stat_has_change(raw_text):
+                continue
+            lines[index] = raw_text + " Change\n"
+            added.add(order_id)
+        if added:
+            file.seek(0)
+            file.truncate()
+            file.writelines(lines)
+            file.flush()
+            mirror_statistics_lines(worker, stat_file, lines)
+    return found, added
+
+
+def process_RETAIL_change_pdf(
+    worker: dict,
+    config: dict,
+    change_pdf: Path,
+) -> tuple[
+    OrderedDict[str, list[tuple[str, int]]],
+    dict[str, dict],
+    set[str],
+]:
+    """Apply one Change PDF to normal caches and current statistics."""
+    expected_ids = RETAIL_change_pdf_order_ids(change_pdf)
+    if not expected_ids:
+        raise ValueError(f"Invalid Change PDF filename: {change_pdf.name}")
+
+    lock_path = change_pdf.parent / ".AutoChecker_change_orders.lock"
+    with portalocker.Lock(
+        str(lock_path), mode="a+", encoding="utf-8", timeout=120
+    ):
+        parsed, metadata_by_order = parse_RETAIL_pdf_document(
+            change_pdf, config
+        )
+        missing_in_pdf = [
+            order_id for order_id in expected_ids if order_id not in parsed
+        ]
+        if missing_in_pdf:
+            raise ValueError(
+                "Change PDF does not contain: " + ", ".join(missing_in_pdf)
+            )
+
+        replacements = OrderedDict(
+            (order_id, parsed[order_id]) for order_id in expected_ids
+        )
+        replacement_metadata = {
+            order_id: metadata_by_order[order_id]
+            for order_id in expected_ids
+        }
+        cached_ids = update_RETAIL_change_caches(
+            worker,
+            replacements,
+            replacement_metadata,
+            config,
+        )
+        missing_caches = set(expected_ids) - cached_ids
+        if missing_caches:
+            raise LookupError(
+                "Normal Order JSON not found for: "
+                + ", ".join(sorted(missing_caches))
+            )
+
+        found_ids, added_ids = append_RETAIL_change_markers(
+            worker, expected_ids
+        )
+        missing_statistics = set(expected_ids) - found_ids
+        if missing_statistics:
+            raise LookupError(
+                "Orders not found in today's statistics: "
+                + ", ".join(sorted(missing_statistics))
+            )
+    return replacements, replacement_metadata, added_ids
+
+
+def process_pending_RETAIL_change_pdfs(
+    worker: dict,
+    config: dict,
+) -> tuple[
+    OrderedDict[str, list[tuple[str, int]]],
+    dict[str, dict],
+    set[str],
+]:
+    """Process stable new Change PDFs once per signature in this worker."""
+    observed = worker.setdefault("RETAIL_CHANGE_OBSERVED", {})
+    processed = worker.setdefault("RETAIL_CHANGE_PROCESSED", {})
+    failures = worker.setdefault("RETAIL_CHANGE_FAILURES", {})
+    merged_orders: OrderedDict[str, list[tuple[str, int]]] = OrderedDict()
+    merged_metadata: dict[str, dict] = {}
+    newly_changed: set[str] = set()
+    now = time.time()
+
+    for change_pdf in available_RETAIL_change_pdfs(
+        worker.get("DOWNLOAD_DIRECTORIES")
+    ):
+        path_key = str(change_pdf).casefold()
+        try:
+            stat = change_pdf.stat()
+        except OSError:
+            continue
+        signature = (stat.st_mtime_ns, stat.st_size)
+        previous_signature = observed.get(path_key)
+        observed[path_key] = signature
+        if processed.get(path_key) == signature:
+            continue
+        # Do not open a PDF while another program may still be copying it.
+        if (
+            previous_signature != signature
+            and now - stat.st_mtime < CHANGE_PDF_SCAN_INTERVAL
+        ):
+            continue
+        failed = failures.get(path_key)
+        if (
+            failed is not None
+            and failed[0] == signature
+            and time.monotonic() - failed[1] < CHANGE_PDF_RETRY_INTERVAL
+        ):
+            continue
+        try:
+            changed_orders, changed_metadata, added_ids = (
+                process_RETAIL_change_pdf(worker, config, change_pdf)
+            )
+        except Exception as error:
+            failures[path_key] = (signature, time.monotonic())
+            message = f"XXX Cannot apply {change_pdf.name}: {error}"
+            Printer(message)
+            send(worker["DISPLAY"], message)
+            continue
+
+        processed[path_key] = signature
+        failures.pop(path_key, None)
+        merged_orders.update(changed_orders)
+        merged_metadata.update(changed_metadata)
+        newly_changed.update(added_ids)
+        if added_ids:
+            message = (
+                f"* Orders changed: {', '.join(sorted(added_ids))}"
+            )
+            Printer(message)
+            send(worker["DISPLAY"], message)
+
+    return merged_orders, merged_metadata, newly_changed
+
+
 def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> dict:
-    pdf_path, _ = find_latest_pdf(previous)
+    pdf_path, _ = find_latest_pdf(
+        previous,
+        worker.get("DOWNLOAD_DIRECTORIES"),
+    )
     if pdf_path is None:
         message = "XXX Orders PDF not found in Downloads"
         Printer(message)
@@ -4009,8 +4653,8 @@ def get_order_status(worker: dict, order_id: str) -> str:
             or stored_order_id.lstrip("#") != order_id.lstrip("#")
         ):
             continue
-        status_suffix = retail_stat_order_suffix(text)
-        cancelled = "Cancelled" in status_suffix
+        status_suffix = retail_stat_effective_suffix(text)
+        cancelled = retail_stat_is_cancelled(text)
         completed = "+" in status_suffix
         if cancelled and completed:
             return "completed_cancelled"
@@ -4019,6 +4663,40 @@ def get_order_status(worker: dict, order_id: str) -> str:
         if completed:
             return "completed"
         return "active"
+    return "not_found"
+
+
+def claim_RETAIL_order(worker: dict, order_id: str) -> str:
+    """Atomically claim one free RETAIL order across local/SMB workers."""
+    stat_file = statistics_file(worker)
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        for index, line in enumerate(lines):
+            raw_text = line.rstrip("\r\n")
+            stored_order = retail_order_id_from_stat_line(raw_text)
+            if (
+                stored_order is None
+                or stored_order.lstrip("#") != order_id.lstrip("#")
+            ):
+                continue
+
+            status_suffix = retail_stat_effective_suffix(raw_text).strip()
+            if retail_stat_is_cancelled(raw_text):
+                return "cancelled"
+            if "+" in status_suffix:
+                return "completed"
+            if not status_suffix:
+                lines[index] = f"{raw_text} {worker['NAME']}\n"
+                file.seek(0)
+                file.truncate()
+                file.writelines(lines)
+                file.flush()
+                mirror_statistics_lines(worker, stat_file, lines)
+                return "claimed"
+            if status_suffix == worker["NAME"]:
+                return "active"
+            return "assigned"
     return "not_found"
 
 
@@ -4043,10 +4721,14 @@ def update_order_in_statistics(worker: dict, order_id: str, *, add_name: bool = 
             else:
                 matches_order = text.startswith(order_id)
             status_suffix = (
-                retail_stat_order_suffix(raw_text)
+                retail_stat_effective_suffix(raw_text)
                 if department == "RETAIL" else text
             )
-            if matches_order and "Cancelled" not in status_suffix:
+            order_cancelled = (
+                retail_stat_is_cancelled(raw_text)
+                if department == "RETAIL" else "Cancelled" in status_suffix
+            )
+            if matches_order and not order_cancelled:
                 if add_name and worker["NAME"] not in status_suffix:
                     raw_text += f" {worker['NAME']}"
                     status_suffix += f" {worker['NAME']}"
@@ -4066,33 +4748,43 @@ def update_order_in_statistics(worker: dict, order_id: str, *, add_name: bool = 
             file.truncate()
             file.writelines(result)
             file.flush()
+            mirror_statistics_lines(worker, stat_file, result)
         return updated
 
 
 def reserve_next_RETAIL_order(worker: dict, orders: dict) -> str | None:
-    """Atomically assign the first unclaimed order in statistics-file order."""
+    """Assign a changed order first, then the first ordinary free order."""
     available_order_ids = set(orders)
     stat_file = statistics_file(worker)
     with _locked_statistics_file(stat_file) as file:
         file.seek(0)
         lines = file.readlines()
         reserved_order = None
-        for index, line in enumerate(lines):
-            raw_text = line.rstrip("\r\n")
-            order_id = retail_order_id_from_stat_line(raw_text)
-            if order_id not in available_order_ids:
-                continue
-            # Any suffix means an assembler, +/(+) or Cancelled is present.
-            if retail_stat_order_suffix(raw_text).strip():
-                continue
-            lines[index] = f"{raw_text} {worker['NAME']}\n"
-            reserved_order = order_id
-            break
+        # A manager's Change reopens an order. Reissue all such orders before
+        # continuing through untouched orders in their normal file order.
+        for changed_order_only in (True, False):
+            for index, line in enumerate(lines):
+                raw_text = line.rstrip("\r\n")
+                order_id = retail_order_id_from_stat_line(raw_text)
+                if order_id not in available_order_ids:
+                    continue
+                if retail_stat_is_cancelled(raw_text):
+                    continue
+                if retail_stat_has_change(raw_text) != changed_order_only:
+                    continue
+                if retail_stat_effective_suffix(raw_text).strip():
+                    continue
+                lines[index] = f"{raw_text} {worker['NAME']}\n"
+                reserved_order = order_id
+                break
+            if reserved_order is not None:
+                break
         if reserved_order is not None:
             file.seek(0)
             file.truncate()
             file.writelines(lines)
             file.flush()
+            mirror_statistics_lines(worker, stat_file, lines)
         return reserved_order
 
 
@@ -4108,14 +4800,22 @@ def release_RETAIL_order_reservation(worker: dict, order_id: str) -> bool:
             stored_order = retail_order_id_from_stat_line(raw_text)
             if stored_order != order_id:
                 continue
-            if retail_stat_order_suffix(raw_text).strip() != worker["NAME"]:
+            if retail_stat_is_cancelled(raw_text):
+                break
+            if retail_stat_effective_suffix(raw_text).strip() != worker["NAME"]:
                 break
             order_match = re.search(
                 rf"(?<!\S){re.escape(order_id)}(?=\s|$)",
                 raw_text,
             )
             if order_match is not None:
-                lines[index] = raw_text[:order_match.end()] + "\n"
+                change_match = retail_stat_change_match(raw_text)
+                keep_until = (
+                    order_match.end() + change_match.end()
+                    if change_match is not None
+                    else order_match.end()
+                )
+                lines[index] = raw_text[:keep_until] + "\n"
                 changed = True
             break
         if changed:
@@ -4123,14 +4823,18 @@ def release_RETAIL_order_reservation(worker: dict, order_id: str) -> bool:
             file.truncate()
             file.writelines(lines)
             file.flush()
+            mirror_statistics_lines(worker, stat_file, lines)
         return changed
 
 
 def cancel_order(worker: dict, order_id: str) -> bool:
     """Mark a RETAIL daily order or B2B index entry as Cancelled."""
     department = worker.get("DEPARTMENT", "").upper()
+    is_retail = department in {"RETAIL", RETAIL_UP_DEPARTMENT}
     if department == "B2B":
         target = B2B_index_file(worker)
+    elif is_retail:
+        target = retail_statistics_file(worker)
     else:
         target = worker["STATISTICS"] / f"{datetime.date.today():%d.%m.%Y}.txt"
 
@@ -4152,7 +4856,12 @@ def cancel_order(worker: dict, order_id: str) -> bool:
                 if department == "B2B"
                 else retail_stat_order_suffix(raw_text)
             )
-            if "Cancelled" not in status_text:
+            already_cancelled = (
+                "cancelled" in status_text.casefold()
+                if department == "B2B"
+                else retail_stat_is_cancelled(raw_text)
+            )
+            if not already_cancelled:
                 lines[index] = (
                     text + " | Cancelled\n"
                     if department == "B2B"
@@ -4166,6 +4875,7 @@ def cancel_order(worker: dict, order_id: str) -> bool:
             file.truncate()
             file.writelines(lines)
             file.flush()
+            mirror_statistics_lines(worker, target, lines)
         return changed
 
 
@@ -4177,6 +4887,8 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
         if isinstance(last_values, (list, tuple)) and len(last_values) > 1
         else ""
     )
+    if preferred_department == RETAIL_UP_DEPARTMENT:
+        preferred_department = "RETAIL"
     candidates = [
         preferred_department,
         *(str(value).upper() for value in settings.get("DEPARTMENT", [])),
@@ -4191,6 +4903,10 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
         checked.add(department)
 
         statistics_dir = DESKTOP_DIR / department / "Statistik"
+        mirror_dir = None
+        if department == "RETAIL" and support_mode_enabled(settings):
+            statistics_dir = configured_support_paths(settings)["statistics"]
+            mirror_dir = DESKTOP_DIR / "RETAIL" / "Statistik"
         target = (
             statistics_dir / B2B_INDEX_FILENAME
             if department == "B2B"
@@ -4203,6 +4919,9 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
             "DEPARTMENT": department,
             "STATISTICS": statistics_dir,
         }
+        if mirror_dir is not None:
+            worker["STATISTICS_MIRROR_DIR"] = mirror_dir
+            worker["RETAIL_STATISTICS"] = statistics_dir
         if cancel_order(worker, order_id):
             return True
     return False
@@ -4271,21 +4990,50 @@ def save_photo(
         Printer(message)
         send(worker["DISPLAY"], message)
         return False, False
+    photo_directories = [Path(worker["FOTO"])]
+    support_photo_dir = worker.get("SUPPORT_FOTO")
+    if support_photo_dir is not None:
+        support_photo_dir = Path(support_photo_dir)
+        if str(support_photo_dir).casefold() != str(photo_directories[0]).casefold():
+            photo_directories.append(support_photo_dir)
+
     number = 1
     while True:
         suffix = "" if number == 1 else f"_{number}"
-        path = worker["FOTO"] / f"{order_id}{suffix}.jpg"
-        if not path.exists():
+        filename = f"{order_id}{suffix}.jpg"
+        if not any((directory / filename).exists() for directory in photo_directories):
             break
         number += 1
+    path = photo_directories[0] / filename
     if not cv2.imwrite(str(path), frame):
         message = f"XXX Cannot save photo {path.name}"
         saved = False
     else:
-        display_filename = path.name.lstrip("#")
-        message = f"* {display_filename} Photo taken manually" if manually else f"* {display_filename} Photo saved"
-        update_order_in_statistics(worker, order_id, add_plus=not manually, manual_plus=manually)
-        saved = True
+        try:
+            for directory in photo_directories[1:]:
+                directory.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, directory / filename)
+        except OSError as error:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            message = f"XXX Cannot save support photo {filename}: {error}"
+            saved = False
+        else:
+            display_filename = path.name.lstrip("#")
+            message = (
+                f"* {display_filename} Photo taken manually"
+                if manually
+                else f"* {display_filename} Photo saved"
+            )
+            update_order_in_statistics(
+                worker,
+                order_id,
+                add_plus=not manually,
+                manual_plus=manually,
+            )
+            saved = True
     Printer(message)
     send(worker["DISPLAY"], message)
     return saved, saved and number == 1
@@ -4295,6 +5043,7 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                  counts: defaultdict, extras: defaultdict, errors: set,
                  no_barcode_items: list[tuple[str, int]], photo_pending: bool,
                  photo_start: float, automatic_assignment: bool = False,
+                 record_performance: bool = True,
                  ) -> tuple[str | None, bool, float]:
     """Apply one scanner barcode/order code using the previous AutoChecker rules."""
     send_fn = lambda message: send(worker["DISPLAY"], message)
@@ -4324,8 +5073,17 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
             send_fn(message)
             return current_order, photo_pending, photo_start
         if worker.get("DEPARTMENT", "").upper() != "B2B":
-            status = get_order_status(worker, matched)
-            if status != "active" and status != "not_found":
+            status = (
+                claim_RETAIL_order(worker, matched)
+                if worker.get("SUPPORT")
+                else get_order_status(worker, matched)
+            )
+            available_statuses = (
+                {"claimed", "active"}
+                if worker.get("SUPPORT")
+                else {"active", "not_found"}
+            )
+            if status not in available_statuses:
                 if performance_stats is not None:
                     performance_stats.record_scan()
                     performance_stats.record_mistake()
@@ -4333,7 +5091,7 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                 Printer(message)
                 send_fn(message)
                 return current_order, photo_pending, photo_start
-        if performance_stats is not None:
+        if performance_stats is not None and record_performance:
             performance_stats.record_scan(matched)
         if worker.get("DEPARTMENT", "").upper() == "RETAIL":
             if automatic_assignment:
@@ -4446,7 +5204,7 @@ def automatically_assign_next_RETAIL_order(
     errors: set,
     no_barcode_items: list[tuple[str, int]],
 ) -> tuple[str | None, bool, float]:
-    """Print, reserve and activate the next free RETAIL order."""
+    """Reserve and activate the next RETAIL order, printing when possible."""
     performance_stats: WorkerPerformanceStats | None = worker.get(
         "PERFORMANCE_STATS"
     )
@@ -4459,18 +5217,23 @@ def automatically_assign_next_RETAIL_order(
         send(worker["DISPLAY"], message)
         return None, False, 0.0
 
-    try:
-        job_id = print_RETAIL_order_label(worker, order_id)
-    except Exception as error:
-        release_RETAIL_order_reservation(worker, order_id)
-        if performance_stats is not None:
-            performance_stats.stop_tracking()
-        message = f"XXX Cannot print order label {order_id}: {error}"
-        Printer(message)
-        send(worker["DISPLAY"], message)
-        return None, False, 0.0
-
-    message = f"* Order label printed {order_id.lstrip('#')} | Job {job_id}"
+    printer_name = str(worker.get("PRINTER", "")).strip()
+    if printer_name:
+        try:
+            job_id = print_RETAIL_order_label(worker, order_id)
+        except Exception as error:
+            release_RETAIL_order_reservation(worker, order_id)
+            if performance_stats is not None:
+                performance_stats.stop_tracking()
+            message = f"XXX Cannot print order label {order_id}: {error}"
+            Printer(message)
+            send(worker["DISPLAY"], message)
+            return None, False, 0.0
+        message = (
+            f"* Order label printed {order_id.lstrip('#')} | Job {job_id}"
+        )
+    else:
+        message = f"* Order {order_id.lstrip('#')} assigned without printing"
     Printer(message)
     send(worker["DISPLAY"], message)
     return process_scan(
@@ -4546,7 +5309,10 @@ def RETAIL_daily_order_counts(worker: dict) -> tuple[int, int]:
         if retail_order_id_from_stat_line(line) is None:
             continue
         total += 1
-        if "+" in line:
+        if (
+            not retail_stat_is_cancelled(line)
+            and "+" in retail_stat_effective_suffix(line)
+        ):
             completed += 1
 
     worker["RETAIL_ORDER_COUNTER_CACHE"] = (
@@ -4603,9 +5369,8 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
     label_ocr_rerun_requested = False
 
     try:
+        config = load_settings()
         photo_dir, statistics_dir = department_paths(identity.department)
-        print(f"* Photo folder: {photo_dir}")
-        print(f"* Statistics folder: {statistics_dir}")
 
         display = serial.Serial(
             display_port,
@@ -4644,7 +5409,6 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             if focus is not None:
                 cap.set(cv2.CAP_PROP_FOCUS, focus)
 
-        config = load_settings()
         performance_stats = WorkerPerformanceStats(
             identity.name,
             identity.department,
@@ -4660,11 +5424,32 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "PRINTER": identity.printer_name or "",
             "PERFORMANCE_STATS": performance_stats,
         }
+        try:
+            configure_worker_storage(worker, config)
+            synchronize_support_statistics(worker)
+        except (OSError, ValueError) as error:
+            message = f"XXX Support storage unavailable: {error}"
+            Printer(message)
+            send(display, message)
+            raise RuntimeError(message) from error
+
+        print(f"* Photo folder: {photo_dir}")
+        print(f"* Statistics folder: {worker['STATISTICS']}")
+        if worker.get("SUPPORT"):
+            print(f"* Support photo folder: {worker['SUPPORT_FOTO']}")
+            print(
+                "* Support downloads folder: "
+                f"{worker['DOWNLOAD_DIRECTORIES'][0]}"
+            )
         if identity.department.upper() == RETAIL_UP_DEPARTMENT:
             label_date = datetime.date.today()
-            downloads_dirs = B2B_download_directories()
-            label_files = current_RETAIL_UP_label_files(label_date)
-            pending_label_pdfs = pending_RETAIL_UP_label_pdfs(label_date)
+            downloads_dirs = worker["DOWNLOAD_DIRECTORIES"]
+            label_files = current_RETAIL_UP_label_files(
+                label_date, downloads_dirs
+            )
+            pending_label_pdfs = pending_RETAIL_UP_label_pdfs(
+                label_date, downloads_dirs
+            )
             if pending_label_pdfs:
                 label_ocr_ready_event = None
                 label_ocr_process = start_label_ocr_process(
@@ -4682,6 +5467,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         label_ocr_process,
                         label_ocr_ready_event,
                         label_date,
+                        downloads_dirs,
                     )
                 if not label_files:
                     raise FileNotFoundError(
@@ -4699,7 +5485,20 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             worker["B2B_HISTORY"] = B2B_history
         # RETAIL uses the PDF order list. B2B will load its order PDF when it
         # receives Scan:<pdf filename>; it never parses a retail PDF here.
-        orders = parse_orders_RETAIL(worker, config) if identity.department.upper() == "RETAIL" else {}
+        department = identity.department.upper()
+        orders = parse_orders_RETAIL(worker, config) if department == "RETAIL" else {}
+        if department in {"RETAIL", RETAIL_UP_DEPARTMENT}:
+            changed_orders, changed_metadata, _newly_changed = (
+                process_pending_RETAIL_change_pdfs(worker, config)
+            )
+            if department == "RETAIL":
+                orders.update(changed_orders)
+                worker.setdefault("RETAIL_ORDER_META", {}).update(
+                    changed_metadata
+                )
+        next_change_pdf_scan = (
+            time.monotonic() + CHANGE_PDF_SCAN_INTERVAL
+        )
         current_order = None
         counts = defaultdict(int)
         extras = defaultdict(int)
@@ -4738,6 +5537,66 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
         window_name = f"AutoChecker - {identity.name} - {identity.department} - {identity.camera_number}"
         while True:
             if (
+                department in {"RETAIL", RETAIL_UP_DEPARTMENT}
+                and time.monotonic() >= next_change_pdf_scan
+            ):
+                next_change_pdf_scan = (
+                    time.monotonic() + CHANGE_PDF_SCAN_INTERVAL
+                )
+                changed_orders, changed_metadata, _newly_changed = (
+                    process_pending_RETAIL_change_pdfs(worker, config)
+                )
+                if department == "RETAIL" and changed_orders:
+                    orders.update(changed_orders)
+                    worker.setdefault("RETAIL_ORDER_META", {}).update(
+                        changed_metadata
+                    )
+                    if current_order in changed_orders:
+                        if get_order_status(worker, current_order) in {
+                            "cancelled",
+                            "completed_cancelled",
+                        }:
+                            message = f"XXX Cancelled order {current_order}"
+                            Printer(message)
+                            send(worker["DISPLAY"], message)
+                            current_order = None
+                            worker.pop("RETAIL_AUTOMATIC_ORDER", None)
+                            counts.clear()
+                            extras.clear()
+                            errors.clear()
+                            no_barcode_items.clear()
+                            photo_pending = False
+                            performance_stats.stop_tracking()
+                            continue
+                        # Reclaim the just-reopened order before another
+                        # automatic worker can reserve the same Change entry.
+                        update_order_in_statistics(
+                            worker, current_order, add_name=True
+                        )
+                        was_automatic = (
+                            worker.get("RETAIL_AUTOMATIC_ORDER")
+                            == current_order
+                        )
+                        message = f"? Order {current_order} was changed"
+                        Printer(message)
+                        send(worker["DISPLAY"], message)
+                        current_order, photo_pending, photo_start = process_scan(
+                            worker,
+                            config,
+                            current_order,
+                            orders,
+                            current_order,
+                            counts,
+                            extras,
+                            errors,
+                            no_barcode_items,
+                            False,
+                            0.0,
+                            automatic_assignment=was_automatic,
+                            record_performance=False,
+                        )
+
+            if (
                 label_ocr_process is not None
                 and not label_ocr_process_is_alive(label_ocr_process)
             ):
@@ -4746,7 +5605,9 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                 if label_ocr_rerun_requested:
                     label_ocr_rerun_requested = False
                     label_ocr_process = start_label_ocr_process(
-                        identity.department
+                        identity.department,
+                        downloads_dirs=worker.get("DOWNLOAD_DIRECTORIES"),
+                        label_date=datetime.date.today(),
                     )
 
             display_update_requested = False
@@ -4967,7 +5828,10 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                                     label_ocr_process
                                 )
                             label_ocr_process = start_label_ocr_process(
-                                identity.department
+                                identity.department,
+                                downloads_dirs=worker.get(
+                                    "DOWNLOAD_DIRECTORIES"
+                                ),
                             )
                     loaded_orders = parse_orders_RETAIL(
                         worker, config, previous=(line == "LastPDF")
@@ -5021,10 +5885,6 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             if line == "NextOrder":
                 if identity.department.upper() != "RETAIL":
                     message = "XXX NextOrder is available only for RETAIL"
-                    Printer(message)
-                    send(worker["DISPLAY"], message)
-                elif not identity.printer_name:
-                    message = "XXX Printer is not selected"
                     Printer(message)
                     send(worker["DISPLAY"], message)
                 else:
@@ -5149,7 +6009,6 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     saved
                     and first_photo
                     and identity.department.upper() == "RETAIL"
-                    and identity.printer_name
                     and continue_automatic_assignment
                 ):
                     worker.pop("RETAIL_AUTOMATIC_ORDER", None)
@@ -6021,5 +6880,6 @@ def dispatcher() -> None:
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     check_for_updates()
+    ensure_settings_schema()
     sync_order_label_templates()
     dispatcher()
