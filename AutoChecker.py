@@ -134,7 +134,7 @@ RETAIL_DELIVERY_ORDER = ("UPS", "Zasilkovna", "Postal")
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.13"
+CURRENT_VERSION = "3.14"
 
 DEFAULT_SUPPORT_PATHS = {
     "downloads": r"\\GREENPO\Downloads",
@@ -2734,14 +2734,36 @@ def RETAIL_UP_shipping_progress_by_delivery(
     )
 
 
+def RETAIL_UP_left_by_delivery_from_lines(
+    lines: list[str],
+) -> tuple[int, int, int]:
+    """Return unpacked, non-cancelled UPS, Packeta and Postal counts."""
+    left = {delivery: 0 for delivery in RETAIL_DELIVERY_ORDER}
+    for line in lines:
+        if retail_order_id_from_stat_line(line) is None:
+            continue
+        if retail_stat_is_cancelled(line):
+            continue
+        status = retail_stat_effective_suffix(line)
+        if RETAIL_UP_printed_name(status) is not None:
+            continue
+        left[RETAIL_delivery_from_stat_line(line)] += 1
+    return left["UPS"], left["Zasilkovna"], left["Postal"]
+
+
+def RETAIL_UP_left_by_delivery(worker: dict) -> tuple[int, int, int]:
+    """Read today's remaining packing work grouped by delivery type."""
+    stat_file = retail_statistics_file(worker)
+    if not stat_file.is_file():
+        return 0, 0, 0
+    return RETAIL_UP_left_by_delivery_from_lines(read_stat_lines(stat_file))
+
+
 def RETAIL_UP_shipping_header(worker: dict) -> str:
-    """Build the first display line with completed delivery-type counts."""
-    ups, zasilkovna, postal, left, total = (
-        RETAIL_UP_shipping_progress_by_delivery(worker)
-    )
+    """Build the compact first display line with remaining work counts."""
+    ups, packeta, postal = RETAIL_UP_left_by_delivery(worker)
     return (
-        f"* Completed UPS: {ups}, Zasilkovna: {zasilkovna}, "
-        f"Postal: {postal}, Left: {left}, All: {total}"
+        f"* LEFT UPS: {ups}, Packeta: {packeta}, Postal: {postal}"
     )
 
 
@@ -2809,7 +2831,7 @@ def RETAIL_UP_check_lines(
     order_id: str,
     settings: dict,
 ) -> list[str]:
-    """Return CHECK positions and every non-PRODUCTS position for packing."""
+    """Return packing warnings, excluding every Bonus position."""
     fragments = RETAIL_check_fragments(settings)
     fragment_keys = [fragment.casefold() for fragment in fragments]
     today = datetime.date.today()
@@ -2837,6 +2859,8 @@ def RETAIL_UP_check_lines(
             continue
         result = []
         for name, quantity in matched_order:
+            if is_bonus_item(name):
+                continue
             is_product = RETAIL_UP_is_product_item(name, settings)
             matches_check = any(
                 fragment in name.casefold() for fragment in fragment_keys
@@ -3413,13 +3437,21 @@ def submit_RETAIL_UP_label(
     *,
     parenthesize_print_name: bool = False,
 ) -> tuple[str, bool]:
-    """Validate one order, optionally print it, and record the worker name."""
+    """Validate one order, print non-Postal labels, and record the worker."""
     printer_name = str(worker.get("PRINTER", "")).strip()
     ready_line = RETAIL_UP_ready_statistics_line(worker, order_id)
-    if printer_name:
+    postal_order = False
+    try:
         tracking_number = RETAIL_UP_tracking_from_order_line(
             order_id, ready_line
         )
+    except LookupError as error:
+        if str(error) != f"Order {order_id.strip()} is Postal":
+            raise
+        tracking_number = ""
+        postal_order = True
+
+    if printer_name and not postal_order:
         pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
             worker, tracking_number
         )
@@ -3439,6 +3471,10 @@ def submit_RETAIL_UP_label(
             f"page {page_number}"
             if duplicate_print
             else f"+ Label printed {order_id.lstrip('#')} page {page_number}"
+        )
+    elif postal_order:
+        status_message = (
+            f"+ Postal order {order_id.lstrip('#')} recorded without printing"
         )
     else:
         status_message = (
