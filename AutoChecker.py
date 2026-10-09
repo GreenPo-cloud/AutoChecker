@@ -9,7 +9,10 @@ The printer and scanner fields are optional for compatibility with old displays.
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import base64
 import copy
+import ctypes
 import os
 import shutil
 import subprocess
@@ -29,7 +32,13 @@ def ensure_package(module_name: str, pip_name: str | None = None) -> None:
         pip_name = module_name
 
     try:
-        importlib.import_module(module_name)
+        # dymo-sdk starts its .NET runtime during import. Detect the package
+        # without starting that runtime on computers that do not use DYMO.
+        if module_name == "dymo_sdk":
+            if importlib.util.find_spec(module_name) is None:
+                raise ImportError(module_name)
+        else:
+            importlib.import_module(module_name)
     except ImportError:
         print(f"Installing missing package: {pip_name}")
         subprocess.check_call([
@@ -58,6 +67,7 @@ REQUIRED_PACKAGES = [
     ("esptool", "esptool>=4.8,<6"),
     ("PIL", "Pillow>=10"),
     ("qrcode", "qrcode[pil]>=7.4,<9"),
+    ("dymo_sdk", "dymo-sdk"),
     ("win32print", "pywin32>=306"),
 ]
 
@@ -97,9 +107,13 @@ import qrcode
 import requests
 import serial
 import win32con
+import win32api
+import win32event
 import win32gui
 import win32print
+import win32process
 import win32ui
+from win32com.shell import shell, shellcon
 from PIL import Image, ImageWin
 from pygrabber.dshow_graph import FilterGraph
 from send2trash import send2trash
@@ -134,13 +148,38 @@ RETAIL_DELIVERY_ORDER = ("UPS", "Zasilkovna", "Postal")
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.14"
+CURRENT_VERSION = "3.16"
 
-DEFAULT_SUPPORT_PATHS = {
-    "downloads": r"\\GREENPO\Downloads",
-    "photos": r"\\GREENPO\Foto",
-    "statistics": r"\\GREENPO\Statistik2",
+DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
+SUPPORT_SHARE_NAMES = {
+    "downloads": "Downloads",
+    "photos": "AutoChecker_Photo",
+    "statistics": "AutoChecker_Statistik",
+    "settings": "AutoChecker_Settings",
 }
+DEFAULT_SUPPORT_PATHS = {
+    "downloads": rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['downloads']}",
+    "photos": rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['photos']}",
+    "statistics": rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['statistics']}",
+    "settings": (
+        rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['settings']}"
+        r"\Settings.json"
+    ),
+}
+SUPPORT_CATALOG_KEYS = (
+    "PRODUCTS",
+    "Merch",
+    "OTHER",
+    "B2B_ALIASES",
+    "AUTO_COMPLETE_ITEMS",
+    "FEM_BONUS",
+    "AUTO_BONUS",
+    "OTHER_BONUS",
+    "REMOVE_ITEMS",
+    "REMOVE_PHRASES",
+    "PRODUCT_NAME_EXCEPTIONS",
+    "CHECK",
+)
 DEFAULT_ORDER_LABEL_SETTINGS = {
     "width_mm": 70.0,
     "height_mm": 35.0,
@@ -156,6 +195,8 @@ SETTINGS_SCHEMA_DEFAULTS = {
     "OTHER": {},
     "B2B_ALIASES": {},
     "AUTO_COMPLETE_ITEMS": [],
+    "FEM_BONUS": {},
+    "AUTO_BONUS": {},
     "OTHER_BONUS": {},
     "REMOVE_ITEMS": [],
     "REMOVE_PHRASES": [],
@@ -165,6 +206,7 @@ SETTINGS_SCHEMA_DEFAULTS = {
     "CHECK": {},
     "ORDER_LABEL": DEFAULT_ORDER_LABEL_SETTINGS,
     "support": False,
+    "main_computer_name": DEFAULT_MAIN_COMPUTER_NAME,
     "support_paths": DEFAULT_SUPPORT_PATHS,
 }
 
@@ -180,6 +222,14 @@ ORDER_LABEL_SVG_URL = (
 STEALTH_ORDER_LABEL_SVG_URL = (
     "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
     "main/STEALTH%20Etiketka.svg"
+)
+DYMO_ORDER_LABEL_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+    "main/DYMO%20Etiketka.dymo"
+)
+DYMO_STEALTH_ORDER_LABEL_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+    "main/DYMO%20STEALTH%20Etiketka.dymo"
 )
 
 DISPLAY_VERSION_URL = (
@@ -203,6 +253,10 @@ RETAIL_UP_PRINT_SCALE = 1.0
 ORDER_LABEL_SVG_NS = "http://www.w3.org/2000/svg"
 ORDER_LABEL_TEMPLATE = BASE_DIR / "Etiketka.svg"
 STEALTH_ORDER_LABEL_TEMPLATE = BASE_DIR / "STEALTH Etiketka.svg"
+DYMO_ORDER_LABEL_TEMPLATE = BASE_DIR / "DYMO Etiketka.dymo"
+DYMO_STEALTH_ORDER_LABEL_TEMPLATE = BASE_DIR / "DYMO STEALTH Etiketka.dymo"
+DYMO_ROLL_SELECTED = 2
+DYMO_PRINT_DELAY = 1.0
 EXPECTED_DISPLAY_APP_SLOTS = (
     (0x10000, 0x140000, "app0"),
     (0x150000, 0x140000, "app1"),
@@ -314,17 +368,30 @@ def update_program() -> None:
 
 
 def sync_order_label_templates() -> None:
-    """Keep both SVG templates in sync independently of the code version."""
+    """Keep SVG and published DYMO templates in sync after every update."""
     templates = (
-        (ORDER_LABEL_TEMPLATE, ORDER_LABEL_SVG_URL),
-        (STEALTH_ORDER_LABEL_TEMPLATE, STEALTH_ORDER_LABEL_SVG_URL),
+        (ORDER_LABEL_TEMPLATE, ORDER_LABEL_SVG_URL, False),
+        (STEALTH_ORDER_LABEL_TEMPLATE, STEALTH_ORDER_LABEL_SVG_URL, False),
+        (DYMO_ORDER_LABEL_TEMPLATE, DYMO_ORDER_LABEL_URL, True),
+        (
+            DYMO_STEALTH_ORDER_LABEL_TEMPLATE,
+            DYMO_STEALTH_ORDER_LABEL_URL,
+            True,
+        ),
     )
     temporary_files: list[Path] = []
     try:
         downloaded_templates: list[tuple[Path, bytes]] = []
-        for target_file, url in templates:
+        for target_file, url, optional in templates:
             response = requests.get(url, timeout=10)
             if response.status_code != 200:
+                if optional:
+                    if not target_file.is_file():
+                        print(
+                            f"? Optional DYMO template is not published: "
+                            f"{target_file.name}"
+                        )
+                    continue
                 raise RuntimeError(
                     f"cannot download {target_file.name}: HTTP "
                     f"{response.status_code}"
@@ -677,6 +744,37 @@ def ensure_other_slots(settings: dict) -> tuple[dict, bool]:
     return slots, changed
 
 
+def migrate_trial_packs_to_standard_products(settings: dict) -> bool:
+    """Remove the legacy Trial Pack rule and package size from catalog names."""
+    changed = False
+    exceptions = settings.get("PRODUCT_NAME_EXCEPTIONS")
+    if isinstance(exceptions, list):
+        filtered = [
+            fragment
+            for fragment in exceptions
+            if str(fragment).strip().casefold() != "trial pack"
+        ]
+        if filtered != exceptions:
+            settings["PRODUCT_NAME_EXCEPTIONS"] = filtered
+            changed = True
+
+    products = settings.get("PRODUCTS")
+    if isinstance(products, dict):
+        for product_code, product_name in list(products.items()):
+            if "trial pack" not in str(product_name).casefold():
+                continue
+            normalized_name = re.sub(
+                r"\s*-\s*\d+(?:\+\d+)?\s*fem\s*$",
+                "",
+                str(product_name),
+                flags=re.IGNORECASE,
+            ).strip()
+            if normalized_name != product_name:
+                products[product_code] = normalized_name
+                changed = True
+    return changed
+
+
 def ensure_settings_schema() -> dict:
     """Add settings introduced by newer releases without replacing user data."""
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -695,15 +793,22 @@ def ensure_settings_schema() -> dict:
                 settings[key] = copy.deepcopy(default_value)
                 changed = True
 
+        main_computer_name = normalized_main_computer_name(
+            settings.get("main_computer_name", DEFAULT_MAIN_COMPUTER_NAME)
+        )
+        if settings.get("main_computer_name") != main_computer_name:
+            settings["main_computer_name"] = main_computer_name
+            changed = True
+
+        expected_support_paths = support_paths_for_computer(main_computer_name)
         support_paths = settings.get("support_paths")
         if not isinstance(support_paths, dict):
-            support_paths = copy.deepcopy(DEFAULT_SUPPORT_PATHS)
-            settings["support_paths"] = support_paths
+            settings["support_paths"] = expected_support_paths
             changed = True
         else:
-            for key, default_path in DEFAULT_SUPPORT_PATHS.items():
-                if key not in support_paths:
-                    support_paths[key] = default_path
+            for key, expected_path in expected_support_paths.items():
+                if support_paths.get(key) != expected_path:
+                    support_paths[key] = expected_path
                     changed = True
 
         order_label = settings.get("ORDER_LABEL")
@@ -719,6 +824,9 @@ def ensure_settings_schema() -> dict:
 
         _slots, other_changed = ensure_other_slots(settings)
         changed = changed or other_changed
+
+        trial_pack_changed = migrate_trial_packs_to_standard_products(settings)
+        changed = changed or trial_pack_changed
 
         departments = settings.get("DEPARTMENT")
         if isinstance(departments, list) and RETAIL_UP_DEPARTMENT not in departments:
@@ -1344,6 +1452,7 @@ def upload_display_data(
         if setting_name in {
             "DEPARTMENT", "DISPLAY", "OTHER", "PRINTER", "SCANNER",
             "FEM_BONUS", "AUTO_BONUS", "support", "support_paths",
+            "main_computer_name",
         }:
             continue
         if setting_name == "FOCUS":
@@ -1605,14 +1714,17 @@ def support_mode_enabled(settings: dict) -> bool:
 
 
 def configured_support_paths(settings: dict) -> dict[str, Path]:
-    """Validate and return the three shared folders used in support mode."""
+    """Validate and return the fixed shared resources used in support mode."""
     configured = settings.get("support_paths", {})
     if not isinstance(configured, dict):
         raise ValueError("support_paths must be a dictionary")
 
+    expected = support_paths_for_computer(
+        settings.get("main_computer_name", DEFAULT_MAIN_COMPUTER_NAME)
+    )
     result = {}
-    for key, default_path in DEFAULT_SUPPORT_PATHS.items():
-        raw_path = str(configured.get(key, default_path)).strip()
+    for key, expected_path in expected.items():
+        raw_path = str(configured.get(key, expected_path)).strip()
         if not raw_path:
             raise ValueError(f"support_paths.{key} is empty")
         result[key] = Path(raw_path)
@@ -1627,6 +1739,10 @@ def configured_support_paths(settings: dict) -> dict[str, Path]:
             raise FileNotFoundError(
                 f"Support {key} folder is unavailable: {result[key]}"
             )
+    if not result["settings"].is_file():
+        raise FileNotFoundError(
+            f"Main Settings.json is unavailable: {result['settings']}"
+        )
     return result
 
 
@@ -2751,6 +2867,32 @@ def RETAIL_UP_left_by_delivery_from_lines(
     return left["UPS"], left["Zasilkovna"], left["Postal"]
 
 
+def RETAIL_UP_left_and_total_by_delivery_from_lines(
+    lines: list[str],
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Return remaining/total active orders for each delivery type."""
+    left = {delivery: 0 for delivery in RETAIL_DELIVERY_ORDER}
+    total = {delivery: 0 for delivery in RETAIL_DELIVERY_ORDER}
+    for line in lines:
+        if retail_order_id_from_stat_line(line) is None:
+            continue
+        # Cancelled orders are not work and therefore are not part of either
+        # side of LEFT n/x. If Cancelled is removed, the next refresh includes
+        # that order again.
+        if retail_stat_is_cancelled(line):
+            continue
+        delivery = RETAIL_delivery_from_stat_line(line)
+        total[delivery] += 1
+        status = retail_stat_effective_suffix(line)
+        if RETAIL_UP_printed_name(status) is None:
+            left[delivery] += 1
+    return (
+        (left["UPS"], total["UPS"]),
+        (left["Zasilkovna"], total["Zasilkovna"]),
+        (left["Postal"], total["Postal"]),
+    )
+
+
 def RETAIL_UP_left_by_delivery(worker: dict) -> tuple[int, int, int]:
     """Read today's remaining packing work grouped by delivery type."""
     stat_file = retail_statistics_file(worker)
@@ -2761,9 +2903,21 @@ def RETAIL_UP_left_by_delivery(worker: dict) -> tuple[int, int, int]:
 
 def RETAIL_UP_shipping_header(worker: dict) -> str:
     """Build the compact first display line with remaining work counts."""
-    ups, packeta, postal = RETAIL_UP_left_by_delivery(worker)
+    stat_file = retail_statistics_file(worker)
+    if stat_file.is_file():
+        grouped = RETAIL_UP_left_and_total_by_delivery_from_lines(
+            read_stat_lines(stat_file)
+        )
+    else:
+        grouped = ((0, 0), (0, 0), (0, 0))
+    (ups_left, ups_total), (packeta_left, packeta_total), (
+        postal_left,
+        postal_total,
+    ) = grouped
     return (
-        f"* LEFT UPS: {ups}, Packeta: {packeta}, Postal: {postal}"
+        f"* LEFT UPS: {ups_left}/{ups_total}, "
+        f"Packeta: {packeta_left}/{packeta_total}, "
+        f"Postal: {postal_left}/{postal_total}"
     )
 
 
@@ -3228,7 +3382,71 @@ def render_order_label(
     return image
 
 
-def print_RETAIL_order_label(worker: dict, order_id: str) -> int:
+def load_DYMO_sdk():
+    """Start the DYMO .NET bridge only when a DYMO printer is selected."""
+    try:
+        return importlib.import_module("dymo_sdk")
+    except Exception as error:
+        raise RuntimeError(f"Cannot start DYMO SDK: {error}") from error
+
+
+def connected_DYMO_printer(printer_name: str):
+    """Return the connected DYMO SDK printer matching a Windows name."""
+    dsdk = load_DYMO_sdk()
+    selected = printer_name.casefold()
+    for printer in dsdk.get_printers():
+        candidate = str(getattr(printer, "name", "")).strip()
+        candidate_folded = candidate.casefold()
+        if not getattr(printer, "is_connected", False):
+            continue
+        if (
+            selected == candidate_folded
+            or selected in candidate_folded
+            or candidate_folded in selected
+        ):
+            return printer
+    raise RuntimeError(f"Connected DYMO printer not found: {printer_name}")
+
+
+def print_DYMO_order_label(
+    printer_name: str,
+    template_path: Path,
+    data: dict[str, str],
+) -> str:
+    """Fill and print one native DYMO order-label template."""
+    if not template_path.is_file():
+        raise FileNotFoundError(
+            f"DYMO order label template not found: {template_path.name}"
+        )
+    dsdk = load_DYMO_sdk()
+    printer = connected_DYMO_printer(printer_name)
+    label = dsdk.DymoLabel(filepath=str(template_path))
+    values = {
+        **data,
+        "QR-code": data["OrderNumber"],
+    }
+    missing = []
+    for object_name, value in values.items():
+        label_object = label.get_label_object(object_name)
+        if label_object is None:
+            missing.append(object_name)
+            continue
+        label_object.update_data(str(value))
+    if missing:
+        raise ValueError(
+            f"Missing DYMO fields in {template_path.name}: "
+            + ", ".join(missing)
+        )
+    printer.print_label(
+        label,
+        roll_selected=DYMO_ROLL_SELECTED,
+        barcode_graphics_quality=True,
+    )
+    time.sleep(DYMO_PRINT_DELAY)
+    return "DYMO"
+
+
+def print_RETAIL_order_label(worker: dict, order_id: str) -> int | str:
     """Render and submit one normal or STEALTH RETAIL order label."""
     printer_name = str(worker.get("PRINTER", "")).strip()
     if not printer_name:
@@ -3237,9 +3455,6 @@ def print_RETAIL_order_label(worker: dict, order_id: str) -> int:
     if not isinstance(metadata, dict):
         raise LookupError(f"Order metadata not found: {order_id}")
     is_stealth = str(metadata.get("stealth", "NO")).upper() == "YES"
-    template_path = (
-        STEALTH_ORDER_LABEL_TEMPLATE if is_stealth else ORDER_LABEL_TEMPLATE
-    )
     customer_name = re.sub(
         r"\s+", " ", str(metadata.get("customer_name", ""))
     ).strip()
@@ -3251,6 +3466,18 @@ def print_RETAIL_order_label(worker: dict, order_id: str) -> int:
         "Delivery": normalize_RETAIL_delivery(metadata.get("delivery", "")),
         "Date": f"{datetime.date.today():%d.%m.%Y}",
     }
+
+    if "dymo" in printer_name.casefold():
+        template_path = (
+            DYMO_STEALTH_ORDER_LABEL_TEMPLATE
+            if is_stealth
+            else DYMO_ORDER_LABEL_TEMPLATE
+        )
+        return print_DYMO_order_label(printer_name, template_path, data)
+
+    template_path = (
+        STEALTH_ORDER_LABEL_TEMPLATE if is_stealth else ORDER_LABEL_TEMPLATE
+    )
 
     label_settings = order_label_settings()
     width_mm = label_settings["width_mm"]
@@ -4767,6 +4994,271 @@ def merge_RETAIL_change_cache(
         file.write("\n")
         file.flush()
         return matched
+
+
+def normalized_main_computer_name(value: object) -> str:
+    """Validate the DNS/Windows name used to build support UNC paths."""
+    name = str(value).strip().lstrip("\\")
+    if (
+        not name
+        or len(name) > 63
+        or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", name)
+    ):
+        raise ValueError(f"Invalid main_computer_name: {value!r}")
+    return name
+
+
+def support_paths_for_computer(computer_name: object) -> dict[str, str]:
+    """Build the fixed support paths from one main-computer name."""
+    name = normalized_main_computer_name(computer_name)
+    root = rf"\\{name}"
+    return {
+        "downloads": root + "\\" + SUPPORT_SHARE_NAMES["downloads"],
+        "photos": root + "\\" + SUPPORT_SHARE_NAMES["photos"],
+        "statistics": root + "\\" + SUPPORT_SHARE_NAMES["statistics"],
+        "settings": (
+            root
+            + "\\"
+            + SUPPORT_SHARE_NAMES["settings"]
+            + "\\Settings.json"
+        ),
+    }
+
+
+def synchronize_support_catalog_settings(settings: dict) -> dict:
+    """Replace only product-related local settings from the main computer."""
+    if not support_mode_enabled(settings):
+        return settings
+    remote_path = Path(
+        support_paths_for_computer(settings["main_computer_name"])["settings"]
+    )
+    try:
+        with portalocker.Lock(
+            str(remote_path),
+            mode="r",
+            encoding="utf-8",
+            timeout=30,
+            flags=portalocker.LOCK_SH | portalocker.LOCK_NB,
+        ) as remote_file:
+            remote_settings = json.load(remote_file)
+        if not isinstance(remote_settings, dict):
+            raise ValueError("remote Settings.json root is not an object")
+    except Exception as error:
+        print(f"XXX Cannot update product settings from {remote_path}: {error}")
+        return settings
+
+    changed_keys = []
+    missing_keys = []
+    with portalocker.Lock(
+        str(SETTINGS_FILE), mode="r+", encoding="utf-8", timeout=30
+    ) as local_file:
+        local_file.seek(0)
+        local_settings = json.load(local_file)
+        for key in SUPPORT_CATALOG_KEYS:
+            if key not in remote_settings:
+                missing_keys.append(key)
+                continue
+            remote_value = copy.deepcopy(remote_settings[key])
+            if local_settings.get(key) != remote_value:
+                local_settings[key] = remote_value
+                changed_keys.append(key)
+        if changed_keys:
+            local_file.seek(0)
+            local_file.truncate()
+            json.dump(local_settings, local_file, ensure_ascii=False, indent=4)
+            local_file.write("\n")
+            local_file.flush()
+
+    if changed_keys:
+        print("* Product settings updated: " + ", ".join(changed_keys))
+    else:
+        print("* Product settings are current")
+    if missing_keys:
+        print(
+            "? Main Settings.json has no product settings: "
+            + ", ".join(missing_keys)
+        )
+    return ensure_settings_schema()
+
+
+def main_share_directories() -> dict[str, Path]:
+    """Return local folders exposed by the main AutoChecker computer."""
+    return {
+        "downloads": Path.home() / "Downloads",
+        "photos": DESKTOP_DIR / "RETAIL" / "Photo",
+        "statistics": DESKTOP_DIR / "RETAIL" / "Statistik",
+        # Windows shares directories, not individual files. The project
+        # folder is therefore exposed read-only and Settings.json stays at
+        # its root.
+        "settings": BASE_DIR,
+    }
+
+
+def main_network_share_is_usable(
+    share_name: str,
+    directory: Path,
+    read_only: bool,
+) -> bool:
+    """Verify the share mapping and its required access through SMB itself."""
+    unc_root = Path(rf"\\localhost\{share_name}")
+    if read_only:
+        try:
+            return (
+                (unc_root / SETTINGS_FILE.name).read_bytes()
+                == SETTINGS_FILE.read_bytes()
+            )
+        except OSError:
+            return False
+
+    probe_name = (
+        f".autochecker-share-probe-{os.getpid()}-{time.time_ns()}.tmp"
+    )
+    local_probe = directory / probe_name
+    unc_probe = unc_root / probe_name
+    probe_text = f"AutoChecker {time.time_ns()}"
+    try:
+        unc_probe.write_text(probe_text, encoding="utf-8")
+        return local_probe.read_text(encoding="utf-8") == probe_text
+    except OSError:
+        return False
+    finally:
+        for probe in (unc_probe, local_probe):
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def missing_main_network_shares() -> list[tuple[str, Path, bool]]:
+    """Return shares that do not expose the expected folder and access."""
+    missing: list[tuple[str, Path, bool]] = []
+    for key, directory in main_share_directories().items():
+        directory.mkdir(parents=True, exist_ok=True)
+        share_name = SUPPORT_SHARE_NAMES[key]
+        read_only = key == "settings"
+        if main_network_share_is_usable(share_name, directory, read_only):
+            print(f"* Network share ready: {share_name} -> {directory}")
+        else:
+            missing.append((share_name, directory, read_only))
+    return missing
+
+
+def _powershell_single_quoted(value: object) -> str:
+    """Quote one value for a PowerShell single-quoted string literal."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def network_share_setup_script(
+    shares: list[tuple[str, Path, bool]],
+) -> str:
+    """Build an idempotent elevated script for SMB and NTFS permissions."""
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        (
+            "$everyone = ([System.Security.Principal.SecurityIdentifier]"
+            "'S-1-1-0').Translate("
+            "[System.Security.Principal.NTAccount]).Value"
+        ),
+    ]
+    for share_name, directory, read_only in shares:
+        share_literal = _powershell_single_quoted(share_name)
+        path_literal = _powershell_single_quoted(directory)
+        access_parameter = "ReadAccess" if read_only else "ChangeAccess"
+        access_right = "Read" if read_only else "Change"
+        ntfs_right = "(OI)(CI)RX" if read_only else "(OI)(CI)M"
+        lines.extend((
+            f"$shareName = {share_literal}",
+            f"$sharePath = {path_literal}",
+            (
+                "$existing = Get-SmbShare -Name $shareName "
+                "-ErrorAction SilentlyContinue"
+            ),
+            (
+                "if ($null -eq $existing) { New-SmbShare -Name $shareName "
+                f"-Path $sharePath -{access_parameter} $everyone "
+                "-CachingMode None | Out-Null }"
+            ),
+            (
+                "elseif ([IO.Path]::GetFullPath($existing.Path).TrimEnd('\\') "
+                "-ne [IO.Path]::GetFullPath($sharePath).TrimEnd('\\')) "
+                "{ throw \"Share $shareName points to $($existing.Path), "
+                "expected $sharePath\" }"
+            ),
+            (
+                "Grant-SmbShareAccess -Name $shareName -AccountName "
+                f"$everyone -AccessRight {access_right} -Force | Out-Null"
+            ),
+            (
+                "& icacls.exe $sharePath /grant "
+                f"'*S-1-1-0:{ntfs_right}' /C | Out-Null"
+            ),
+            "if ($LASTEXITCODE -ne 0) { throw \"icacls failed: $sharePath\" }",
+        ))
+    return "\n".join(lines)
+
+
+def run_elevated_powershell(script: str) -> None:
+    """Run one PowerShell script, requesting UAC only when necessary."""
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    arguments = (
+        "-NoProfile -NonInteractive -ExecutionPolicy Bypass "
+        f"-EncodedCommand {encoded}"
+    )
+    if ctypes.windll.shell32.IsUserAnAdmin():
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ],
+            check=True,
+        )
+        return
+
+    process_info = shell.ShellExecuteEx(
+        fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
+        lpVerb="runas",
+        lpFile="powershell.exe",
+        lpParameters=arguments,
+        nShow=win32con.SW_HIDE,
+    )
+    process_handle = process_info["hProcess"]
+    try:
+        win32event.WaitForSingleObject(process_handle, win32event.INFINITE)
+        exit_code = win32process.GetExitCodeProcess(process_handle)
+        if exit_code:
+            raise RuntimeError(
+                f"elevated PowerShell finished with code {exit_code}"
+            )
+    finally:
+        win32api.CloseHandle(process_handle)
+
+
+def ensure_main_network_shares(settings: dict) -> None:
+    """Create the main computer's fixed SMB shares when they are absent."""
+    if support_mode_enabled(settings):
+        return
+    missing = missing_main_network_shares()
+    if not missing:
+        return
+    names = ", ".join(name for name, _path, _read_only in missing)
+    print(f"* Configuring network shares: {names}")
+    try:
+        run_elevated_powershell(network_share_setup_script(missing))
+    except Exception as error:
+        print(f"XXX Cannot configure network shares: {error}")
+        return
+    # Verify that Windows registered every requested share.
+    remaining = missing_main_network_shares()
+    if remaining:
+        print(
+            "XXX Network shares are still unavailable: "
+            + ", ".join(name for name, _path, _read_only in remaining)
+        )
 
 
 def update_RETAIL_change_caches(
@@ -7524,6 +8016,12 @@ def dispatcher() -> None:
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     check_for_updates()
-    ensure_settings_schema()
+    startup_settings = ensure_settings_schema()
+    if support_mode_enabled(startup_settings):
+        startup_settings = synchronize_support_catalog_settings(
+            startup_settings
+        )
+    else:
+        ensure_main_network_shares(startup_settings)
     sync_order_label_templates()
     dispatcher()
