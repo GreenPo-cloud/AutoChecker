@@ -13,11 +13,14 @@ import importlib.util
 import base64
 import copy
 import ctypes
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import winsound
 import xml.etree.ElementTree as ET
 
 
@@ -32,9 +35,9 @@ def ensure_package(module_name: str, pip_name: str | None = None) -> None:
         pip_name = module_name
 
     try:
-        # dymo-sdk starts its .NET runtime during import. Detect the package
-        # without starting that runtime on computers that do not use DYMO.
-        if module_name == "dymo_sdk":
+        # These modules start hardware/audio runtimes during import. Detect
+        # them without starting those runtimes until the feature is used.
+        if module_name in {"dymo_sdk", "pygame"}:
             if importlib.util.find_spec(module_name) is None:
                 raise ImportError(module_name)
         else:
@@ -61,6 +64,7 @@ REQUIRED_PACKAGES = [
     ("requests", "requests"),
     ("keyboard", "keyboard"),
     ("portalocker", "portalocker"),
+    ("comtypes", "comtypes>=1.4,<2"),
     ("pygrabber", "pygrabber"),
     ("pymupdf", "PyMuPDF>=1.28,<2"),
     ("rapidocr_onnxruntime", "rapidocr-onnxruntime>=1.4,<2"),
@@ -68,6 +72,9 @@ REQUIRED_PACKAGES = [
     ("PIL", "Pillow>=10"),
     ("qrcode", "qrcode[pil]>=7.4,<9"),
     ("dymo_sdk", "dymo-sdk"),
+    ("pypdf", "pypdf>=5,<7"),
+    ("pygame", "pygame>=2.6,<3"),
+    ("rapidfuzz", "rapidfuzz>=3,<4"),
     ("win32print", "pywin32>=306"),
 ]
 
@@ -100,6 +107,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import comtypes.client
 import portalocker
 import pymupdf
 import pywintypes
@@ -115,9 +123,16 @@ import win32process
 import win32ui
 from win32com.shell import shell, shellcon
 from PIL import Image, ImageWin
-from pygrabber.dshow_graph import FilterGraph
+from pypdf import PdfReader, PdfWriter
+from rapidfuzz import fuzz
 from send2trash import send2trash
 from serial.tools import list_ports
+
+# pygrabber otherwise asks comtypes to generate DirectShow wrappers inside
+# site-packages. That directory can be read-only on a newly installed PC.
+# In-memory generation is sufficient and avoids a startup PermissionError.
+comtypes.client.gen_dir = None
+from pygrabber.dshow_graph import FilterGraph
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -145,10 +160,14 @@ PHOTO_DELAY = 2.5
 B2B_INDEX_FILENAME = "B2B_Order_Index.txt"
 RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
 RETAIL_DELIVERY_ORDER = ("UPS", "Zasilkovna", "Postal")
+RAW_CHANGE_LABEL_PATTERN = re.compile(
+    r"^change\s+(#?\d+(?:\s*,\s*#?\d+)*)\.pdf$",
+    re.IGNORECASE,
+)
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.16"
+CURRENT_VERSION = "3.20"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -215,6 +234,10 @@ VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/
 PYTHON_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/AutoChecker.py"
 
 PDF_LABEL_OCR_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/pdf_label_ocr.py"
+UPS_SOUND_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+    "main/ups.mp3"
+)
 ORDER_LABEL_SVG_URL = (
     "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
     "main/Etiketka.svg"
@@ -788,6 +811,11 @@ def ensure_settings_schema() -> dict:
             raise ValueError("Settings.json must contain a JSON object")
 
         changed = False
+        # Sound files are local replaceable assets. Older releases stored
+        # their paths in Settings.json; remove that obsolete setting once.
+        if "SOUNDS" in settings:
+            del settings["SOUNDS"]
+            changed = True
         for key, default_value in SETTINGS_SCHEMA_DEFAULTS.items():
             if key not in settings:
                 settings[key] = copy.deepcopy(default_value)
@@ -1700,7 +1728,14 @@ def department_paths(department: str) -> tuple[Path, Path]:
     if Path(department).name != department or department in {".", ".."}:
         raise ValueError(f"Invalid department name: {department!r}")
 
-    department_dir = DESKTOP_DIR / department
+    # RETAIL_UP uses the same orders and storage as RETAIL. Do not create a
+    # separate Desktop/RETAIL_UP directory tree for the packing process.
+    storage_department = (
+        "RETAIL"
+        if department.upper() == RETAIL_UP_DEPARTMENT
+        else department
+    )
+    department_dir = DESKTOP_DIR / storage_department
     photo_dir = department_dir / "Photo"
     statistics_dir = department_dir / "Statistik"
     photo_dir.mkdir(parents=True, exist_ok=True)
@@ -1794,6 +1829,16 @@ class WorkerPerformanceStats:
     def __init__(self, name: str, department: str):
         self.name = name
         self.department = department
+        self.storage_department = (
+            "RETAIL"
+            if department.upper() == RETAIL_UP_DEPARTMENT
+            else department
+        )
+        self.storage_section = (
+            RETAIL_UP_DEPARTMENT
+            if department.upper() == RETAIL_UP_DEPARTMENT
+            else ""
+        )
         self.pending: dict[str, dict] = {}
         self.persisted_counts: dict[str, int] = {}
         self.active_order: str | None = None
@@ -1857,10 +1902,15 @@ class WorkerPerformanceStats:
 
     def _file_path(self, day: datetime.date | None = None) -> Path:
         day = day or datetime.date.today()
-        return (
+        statistics_root = (
             DESKTOP_DIR
-            / self.department
+            / self.storage_department
             / "Worker_Statistics"
+        )
+        if self.storage_section:
+            statistics_root /= self.storage_section
+        return (
+            statistics_root
             / safe_worker_filename(self.name)
             / f"{day:%m.%Y}.json"
         )
@@ -2371,6 +2421,393 @@ def _available_RETAIL_order_sources(
     )
 
 
+def launcher_local_downloads(worker: dict) -> Path:
+    """Return the local browser-download folder used by Admin-style inputs."""
+    downloads = Path(worker.get("LOCAL_DOWNLOADS", Path.home() / "Downloads"))
+    downloads.mkdir(parents=True, exist_ok=True)
+    return downloads
+
+
+def raw_download_is_stable(worker: dict, path: Path) -> bool:
+    """Confirm a browser download stayed unchanged across two launcher polls."""
+    states = worker.setdefault("RAW_DOWNLOAD_STABILITY", {})
+    key = str(path).casefold()
+    try:
+        stat = path.stat()
+        signature = (stat.st_size, stat.st_mtime_ns)
+        if stat.st_size <= 0:
+            states.pop(key, None)
+            return False
+        previous = states.get(key)
+        if previous is not None and previous[0] == signature:
+            states[key] = (signature, previous[1] + 1)
+        else:
+            states[key] = (signature, 0)
+        return states[key][1] >= 1
+    except OSError:
+        states.pop(key, None)
+        return False
+
+
+def launcher_order_part_numbers(worker: dict) -> set[int]:
+    """Return today's Part numbers across local and authoritative Downloads."""
+    directories = [launcher_local_downloads(worker)]
+    directories.extend(Path(path) for path in worker.get("DOWNLOAD_DIRECTORIES", []))
+    return {
+        part_number
+        for source_date, part_number, _path in _available_order_pdfs(directories)
+        if source_date == datetime.date.today()
+    }
+
+
+def launcher_current_label_paths(worker: dict) -> tuple[Path, Path | None]:
+    """Return local and optional shared Label paths for the newest order Part."""
+    parts = launcher_order_part_numbers(worker)
+    if not parts:
+        raise FileNotFoundError("Today's order PDF was not found")
+    filename = (
+        f"{datetime.date.today():%d.%m.%Y} Part {max(parts)} (Label).pdf"
+    )
+    local_path = launcher_local_downloads(worker) / filename
+    shared_path = None
+    if worker.get("SUPPORT"):
+        shared_path = Path(worker["DOWNLOAD_DIRECTORIES"][0]) / filename
+    return local_path, shared_path
+
+
+def copy_file_atomically(source: Path, destination: Path) -> None:
+    """Copy one completed file without exposing a partial destination."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.AutoChecker-{os.getpid()}-{threading.get_ident()}.tmp"
+    )
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def read_pdf_without_leading_junk(path: Path) -> PdfReader:
+    """Open a PDF after removing browser bytes before its %PDF- header."""
+    data = path.read_bytes()
+    header_position = data.find(b"%PDF-")
+    if header_position < 0:
+        raise ValueError(f"PDF header was not found in {path.name}")
+    return PdfReader(io.BytesIO(data[header_position:]), strict=False)
+
+
+def contains_ups_access_point(text: str) -> bool:
+    """Match the two known spellings plus close OCR/text-extraction variants."""
+    normalized = " ".join(text.casefold().split())
+    spellings = ("ups access point", "ups acces point")
+    return any(
+        spelling in normalized
+        or fuzz.partial_ratio(spelling, normalized) >= 90
+        for spelling in spellings
+    )
+
+
+def ensure_default_sound_file() -> None:
+    """Download the default UPS sound once, without replacing user audio."""
+    sound_path = BASE_DIR / "ups.mp3"
+    if sound_path.is_file():
+        return
+    temporary_path = sound_path.with_name(sound_path.name + ".download")
+    try:
+        response = requests.get(UPS_SOUND_URL, timeout=10)
+        if response.status_code != 200 or not response.content:
+            raise RuntimeError(f"HTTP {response.status_code}")
+        temporary_path.write_bytes(response.content)
+        os.replace(temporary_path, sound_path)
+        print(f"* Default sound installed: {sound_path.name}")
+    except Exception as error:
+        temporary_path.unlink(missing_ok=True)
+        print(f"? Cannot install default ups.mp3: {error}")
+
+
+def play_launcher_sound(name: str) -> None:
+    """Play the configured Admin-compatible sound, with a Windows fallback."""
+    sound_path = BASE_DIR / f"{name}.mp3"
+    try:
+        if not sound_path.is_file():
+            raise FileNotFoundError(sound_path)
+        import pygame
+
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        pygame.mixer.stop()
+        pygame.mixer.Sound(str(sound_path)).play()
+    except Exception as error:
+        print(f"? Cannot play {name} sound ({error}); using system alert")
+        try:
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except RuntimeError:
+            pass
+
+
+def notify_ups_access_points(pdf_path: Path) -> list[str]:
+    """Report and sound every unique UPS Access Point order in one PDF."""
+    import pdfplumber
+
+    pattern = re.compile(
+        r"(?m)^(#\d+)(?=[^#]*☐).*?type( STEALTH)?\s*\n(.*?)\s*☐"
+        r".*?(UPS|Zasilkovna|Postal)(.*?)(?=^#\d+|\Z)",
+        re.DOTALL,
+    )
+    detected = []
+    seen = set()
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for order_id, _stealth, _name, _delivery, tail in pattern.findall(text):
+                if order_id in seen or not contains_ups_access_point(tail):
+                    continue
+                seen.add(order_id)
+                detected.append(order_id)
+                print(f"! UPS Access Point detected for order {order_id}")
+                play_launcher_sound("ups")
+    return detected
+
+
+def extract_RETAIL_pdf_order_ids(pdf_path: Path) -> list[str]:
+    """Extract unique #OrderNumber values in their PDF appearance order."""
+    import pdfplumber
+
+    result = []
+    seen = set()
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for order_id in re.findall(r"(?<![\w#])#\d+(?!\d)", text):
+                if order_id not in seen:
+                    seen.add(order_id)
+                    result.append(order_id)
+    return result
+
+
+def queue_or_copy_order_pdf_to_main(worker: dict, source: Path) -> None:
+    """Send an Admin-style PDF to main Downloads in support mode."""
+    if not worker.get("SUPPORT"):
+        return
+    destination = Path(worker["DOWNLOAD_DIRECTORIES"][0]) / source.name
+    try:
+        copy_file_atomically(source, destination)
+        worker.setdefault("PENDING_MAIN_PDFS", {}).pop(str(source), None)
+        print(f"* PDF sent to main computer: {destination}")
+    except Exception as error:
+        worker.setdefault("PENDING_MAIN_PDFS", {})[str(source)] = str(destination)
+        print(f"XXX Cannot send {source.name} to main computer: {error}")
+
+
+def retry_pending_main_pdfs(worker: dict) -> None:
+    for source_text, destination_text in list(
+        worker.setdefault("PENDING_MAIN_PDFS", {}).items()
+    ):
+        source = Path(source_text)
+        try:
+            if not source.is_file():
+                raise FileNotFoundError(source)
+            copy_file_atomically(source, Path(destination_text))
+            del worker["PENDING_MAIN_PDFS"][source_text]
+            print(f"* Pending PDF sent to main computer: {source.name}")
+        except Exception:
+            # Keep it queued. The periodic launcher pass will try again.
+            continue
+
+
+def mark_launcher_change_pdf_stable(
+    worker: dict,
+    path: Path,
+    *,
+    label: bool,
+) -> None:
+    """Allow an atomically completed raw Change PDF to process immediately."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return
+    state_name = (
+        "RETAIL_CHANGE_LABEL_OBSERVED"
+        if label
+        else "RETAIL_CHANGE_OBSERVED"
+    )
+    worker.setdefault(state_name, {})[str(path).casefold()] = (
+        stat.st_mtime_ns,
+        stat.st_size,
+    )
+
+
+def process_pending_admin_download_files(worker: dict) -> bool:
+    """Process Admin-style raw PDF downloads without filesystem events."""
+    downloads = launcher_local_downloads(worker)
+    retry_pending_main_pdfs(worker)
+    processed_any = False
+    failures = worker.setdefault("RAW_DOWNLOAD_FAILURES", {})
+
+    candidates: list[tuple[Path, str, list[str]]] = [
+        (downloads / "mpdf.pdf", "orders", []),
+        (downloads / "qwe.pdf", "labels", []),
+        (downloads / "qwez.pdf", "label_fragment", []),
+        (downloads / "change.pdf", "change_order", []),
+    ]
+    try:
+        for path in downloads.iterdir():
+            if not path.is_file():
+                continue
+            match = RAW_CHANGE_LABEL_PATTERN.fullmatch(path.name)
+            if match is None:
+                continue
+            order_ids = [
+                f"#{value.strip().lstrip('#')}"
+                for value in match.group(1).split(",")
+            ]
+            candidates.append((path, "change_label", order_ids))
+    except OSError as error:
+        print(f"XXX Cannot inspect raw Downloads files: {error}")
+
+    for source, source_kind, filename_order_ids in candidates:
+        raw_name = source.name.casefold()
+        if not source.is_file() or not raw_download_is_stable(worker, source):
+            continue
+        try:
+            signature = (source.stat().st_size, source.stat().st_mtime_ns)
+        except OSError:
+            continue
+        failed = failures.get(raw_name)
+        if (
+            failed is not None
+            and failed[0] == signature
+            and time.monotonic() - failed[1] < ORDER_SOURCE_RETRY_INTERVAL
+        ):
+            continue
+
+        try:
+            lock_path = downloads / ".AutoChecker_raw_downloads.lock"
+            with portalocker.Lock(
+                str(lock_path), mode="a+", encoding="utf-8", timeout=5
+            ):
+                if not source.is_file():
+                    continue
+                if source_kind == "orders":
+                    naming_directory = (
+                        Path(worker["DOWNLOAD_DIRECTORIES"][0])
+                        if worker.get("SUPPORT")
+                        else downloads
+                    )
+                    naming_lock = naming_directory / ".AutoChecker_orders.lock"
+                    with portalocker.Lock(
+                        str(naming_lock), mode="a+", encoding="utf-8", timeout=30
+                    ):
+                        part_number = max(
+                            launcher_order_part_numbers(worker), default=0
+                        ) + 1
+                        destination = downloads / (
+                            f"{datetime.date.today():%d.%m.%Y} "
+                            f"Part {part_number}.pdf"
+                        )
+                        os.replace(source, destination)
+                        # Publish the reserved Part name before another
+                        # support launcher can choose the same number.
+                        queue_or_copy_order_pdf_to_main(worker, destination)
+                    print(f"* Order PDF renamed: {destination.name}")
+                    notify_ups_access_points(destination)
+                elif source_kind == "change_order":
+                    order_ids = extract_RETAIL_pdf_order_ids(source)
+                    if not order_ids:
+                        raise ValueError(
+                            "No order numbers were found in change.pdf"
+                        )
+                    destination = downloads / (
+                        f"Change {', '.join(order_ids)} "
+                        f"({datetime.date.today():%d.%m.%Y}).pdf"
+                    )
+                    notify_ups_access_points(source)
+                    os.replace(source, destination)
+                    print(f"* Change Order PDF renamed: {destination.name}")
+                    report_launcher_order_progress(worker, order_ids)
+                    queue_or_copy_order_pdf_to_main(worker, destination)
+                    monitor_path = (
+                        Path(worker["DOWNLOAD_DIRECTORIES"][0])
+                        / destination.name
+                        if worker.get("SUPPORT")
+                        else destination
+                    )
+                    mark_launcher_change_pdf_stable(
+                        worker, monitor_path, label=False
+                    )
+                elif source_kind == "change_label":
+                    destination = downloads / (
+                        f"Change Label {', '.join(filename_order_ids)} "
+                        f"({datetime.date.today():%d.%m.%Y}).pdf"
+                    )
+                    os.replace(source, destination)
+                    print(f"* Change Label PDF renamed: {destination.name}")
+                    report_launcher_order_progress(
+                        worker, filename_order_ids
+                    )
+                    queue_or_copy_order_pdf_to_main(worker, destination)
+                    monitor_path = (
+                        Path(worker["DOWNLOAD_DIRECTORIES"][0])
+                        / destination.name
+                        if worker.get("SUPPORT")
+                        else destination
+                    )
+                    mark_launcher_change_pdf_stable(
+                        worker, monitor_path, label=True
+                    )
+                elif source_kind == "labels":
+                    destination, _shared = launcher_current_label_paths(worker)
+                    os.replace(source, destination)
+                    print(f"* Label PDF renamed: {destination.name}")
+                    print(
+                        "* Sending is waiting for command: send part "
+                        f"{destination.stem.split(' Part ')[-1].split(' ')[0]}"
+                    )
+                else:
+                    destination, shared = launcher_current_label_paths(worker)
+                    if not destination.is_file() and shared is not None and shared.is_file():
+                        copy_file_atomically(shared, destination)
+                    if not destination.is_file():
+                        raise FileNotFoundError(
+                            "Current Label PDF was not found; download qwe.pdf first"
+                        )
+                    temporary = destination.with_name(
+                        f".{destination.stem}.merging.pdf"
+                    )
+                    writer = PdfWriter()
+                    try:
+                        for pdf_source in (destination, source):
+                            reader = read_pdf_without_leading_junk(pdf_source)
+                            for page in reader.pages:
+                                writer.add_page(page)
+                        with temporary.open("wb") as output:
+                            writer.write(output)
+                        os.replace(temporary, destination)
+                        source.unlink()
+                    finally:
+                        writer.close()
+                        temporary.unlink(missing_ok=True)
+                    print(f"* Label fragment appended: {destination.name}")
+                    print(
+                        "* Sending is waiting for command: send part "
+                        f"{destination.stem.split(' Part ')[-1].split(' ')[0]}"
+                    )
+            worker.setdefault("RAW_DOWNLOAD_STABILITY", {}).pop(
+                str(source).casefold(), None
+            )
+            failures.pop(raw_name, None)
+            processed_any = True
+        except Exception as error:
+            failures[raw_name] = (signature, time.monotonic())
+            print(f"XXX Cannot process {raw_name}: {error}")
+
+    return processed_any
+
+
 def find_latest_pdf(
     previous: bool = False,
     download_directories: list[Path] | None = None,
@@ -2657,6 +3094,8 @@ def RETAIL_UP_ready_statistics_line(worker: dict, order_id: str) -> str:
     status = retail_stat_effective_suffix(matching_line)
     if retail_stat_is_cancelled(matching_line):
         raise ValueError(f"Cancelled order {normalized_order}")
+    # Change Label keeps an existing assembly '+', while Change Order removes
+    # everything before its own boundary from the effective assembly status.
     if "+" not in status:
         raise ValueError(f"Order is not completed {normalized_order}")
 
@@ -2745,10 +3184,7 @@ def append_RETAIL_UP_print_name(worker: dict, order_id: str, name: str) -> bool:
                 continue
             if retail_stat_is_cancelled(line):
                 raise ValueError(f"Cancelled order {normalized_order}")
-            duplicate = (
-                RETAIL_UP_printed_name(retail_stat_effective_suffix(line))
-                is not None
-            )
+            duplicate = retail_stat_packing_name(line) is not None
             lines[index] = line.rstrip("\r\n") + f" {name}\n"
             file.seek(0)
             file.truncate()
@@ -2769,10 +3205,9 @@ def RETAIL_UP_shipping_progress_from_lines(
         if retail_order_id_from_stat_line(line) is None:
             continue
         total += 1
-        status = retail_stat_effective_suffix(line)
         if (
             not retail_stat_is_cancelled(line)
-            and RETAIL_UP_printed_name(status) is not None
+            and retail_stat_packing_name(line) is not None
         ):
             completed += 1
     return completed, total - completed, total
@@ -2800,10 +3235,9 @@ def RETAIL_UP_shipping_progress_by_delivery_from_lines(
         if order_id is None:
             continue
         total += 1
-        status = retail_stat_effective_suffix(line)
         if (
             retail_stat_is_cancelled(line)
-            or RETAIL_UP_printed_name(status) is None
+            or retail_stat_packing_name(line) is None
         ):
             continue
 
@@ -2860,8 +3294,7 @@ def RETAIL_UP_left_by_delivery_from_lines(
             continue
         if retail_stat_is_cancelled(line):
             continue
-        status = retail_stat_effective_suffix(line)
-        if RETAIL_UP_printed_name(status) is not None:
+        if retail_stat_packing_name(line) is not None:
             continue
         left[RETAIL_delivery_from_stat_line(line)] += 1
     return left["UPS"], left["Zasilkovna"], left["Postal"]
@@ -2883,8 +3316,7 @@ def RETAIL_UP_left_and_total_by_delivery_from_lines(
             continue
         delivery = RETAIL_delivery_from_stat_line(line)
         total[delivery] += 1
-        status = retail_stat_effective_suffix(line)
-        if RETAIL_UP_printed_name(status) is None:
+        if retail_stat_packing_name(line) is None:
             left[delivery] += 1
     return (
         (left["UPS"], total["UPS"]),
@@ -3129,6 +3561,53 @@ def find_RETAIL_UP_label_page(
             )
         return pdf_path, page_number, normalized_label_type
     raise LookupError(f"Tracking number not found in Label JSON: {tracking_number}")
+
+
+def change_label_page_type(pdf_path: Path, page_number: int) -> str:
+    """Distinguish Packeta replacement labels for print orientation."""
+    import pdfplumber
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_number < 1 or page_number > len(pdf.pages):
+                raise ValueError(
+                    f"Invalid page {page_number} in {pdf_path.name}"
+                )
+            text = pdf.pages[page_number - 1].extract_text() or ""
+    except Exception as error:
+        raise ValueError(
+            f"Cannot inspect page {page_number} in {pdf_path.name}: {error}"
+        ) from error
+    return "Packeta" if "packeta.com" in text.casefold() else "UPS"
+
+
+def find_RETAIL_UP_change_label_page(
+    worker: dict,
+    order_id: str,
+) -> tuple[Path, int, str] | None:
+    """Find the newest replacement label by its order position in filename."""
+    normalized_order = f"#{order_id.strip().lstrip('#')}"
+    for pdf_path in reversed(
+        available_RETAIL_change_label_pdfs(
+            worker.get("DOWNLOAD_DIRECTORIES")
+        )
+    ):
+        order_ids = RETAIL_change_label_pdf_order_ids(pdf_path)
+        if normalized_order not in order_ids:
+            continue
+        page_number = order_ids.index(normalized_order) + 1
+        reader = read_pdf_without_leading_junk(pdf_path)
+        if page_number > len(reader.pages):
+            raise ValueError(
+                f"{pdf_path.name} has no page {page_number} for "
+                f"{normalized_order}"
+            )
+        return (
+            pdf_path,
+            page_number,
+            change_label_page_type(pdf_path, page_number),
+        )
+    return None
 
 
 def find_order_label_browser() -> Path:
@@ -3667,21 +4146,34 @@ def submit_RETAIL_UP_label(
     """Validate one order, print non-Postal labels, and record the worker."""
     printer_name = str(worker.get("PRINTER", "")).strip()
     ready_line = RETAIL_UP_ready_statistics_line(worker, order_id)
-    postal_order = False
-    try:
-        tracking_number = RETAIL_UP_tracking_from_order_line(
-            order_id, ready_line
+    changed_label = find_RETAIL_UP_change_label_page(worker, order_id)
+    if (
+        changed_label is None
+        and retail_stat_latest_change_kind(ready_line) == "Label"
+    ):
+        raise FileNotFoundError(
+            f"Change Label PDF not found for {order_id.strip()}"
         )
-    except LookupError as error:
-        if str(error) != f"Order {order_id.strip()} is Postal":
-            raise
-        tracking_number = ""
-        postal_order = True
+
+    postal_order = False
+    if changed_label is not None:
+        pdf_path, page_number, label_type = changed_label
+    else:
+        try:
+            tracking_number = RETAIL_UP_tracking_from_order_line(
+                order_id, ready_line
+            )
+        except LookupError as error:
+            if str(error) != f"Order {order_id.strip()} is Postal":
+                raise
+            tracking_number = ""
+            postal_order = True
+        if printer_name and not postal_order:
+            pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
+                worker, tracking_number
+            )
 
     if printer_name and not postal_order:
-        pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
-            worker, tracking_number
-        )
         print_pdf_page(pdf_path, page_number, printer_name, label_type)
         physically_printed = True
     else:
@@ -3800,11 +4292,10 @@ def process_RETAIL_UP_label_range(
                     f"XXX Tracking {tracking_number} not found in statistics"
                 )
                 continue
-            status = retail_stat_effective_suffix(orders[order_id])
             if retail_stat_is_cancelled(orders[order_id]):
                 status_lines.append(f"XXX {order_id} is Cancelled")
                 continue
-            if "+" not in status:
+            if "+" not in retail_stat_effective_suffix(orders[order_id]):
                 status_lines.append(f"XXX {order_id} not ready for packing")
                 continue
             try:
@@ -4122,21 +4613,60 @@ def retail_stat_order_suffix(text: str) -> str:
     return text[match.end():] if match else ""
 
 
-def retail_stat_change_match(text: str) -> re.Match | None:
-    """Return the last whole-word Change marker in an order status suffix."""
-    matches = list(
+def retail_stat_change_matches(text: str) -> list[re.Match]:
+    """Return complete legacy/Order/Label Change markers in status text."""
+    return list(
         re.finditer(
-            r"(?<!\S)Change(?=\s|$)",
+            r"(?<!\S)Change(?:\s+(Order|Label))?(?=\s|$)",
             retail_stat_order_suffix(text),
             re.IGNORECASE,
         )
     )
+
+
+def retail_stat_change_kind(change_match: re.Match) -> str:
+    """Normalize a legacy bare Change to the compatible Order kind."""
+    explicit_kind = change_match.group(1)
+    return explicit_kind.title() if explicit_kind else "Order"
+
+
+def retail_stat_change_match(text: str) -> re.Match | None:
+    """Return the latest complete Change marker of either kind."""
+    matches = retail_stat_change_matches(text)
     return matches[-1] if matches else None
+
+
+def retail_stat_order_change_match(text: str) -> re.Match | None:
+    """Return the latest Change Order (including legacy bare Change)."""
+    matches = [
+        match
+        for match in retail_stat_change_matches(text)
+        if retail_stat_change_kind(match) == "Order"
+    ]
+    return matches[-1] if matches else None
+
+
+def retail_stat_latest_change_kind(text: str) -> str | None:
+    change_match = retail_stat_change_match(text)
+    return retail_stat_change_kind(change_match) if change_match else None
 
 
 def retail_stat_has_change(text: str) -> bool:
     """Return whether a RETAIL line contains a Change history boundary."""
     return retail_stat_change_match(text) is not None
+
+
+def retail_stat_has_order_change(text: str) -> bool:
+    """Return whether an order-content history boundary exists."""
+    return retail_stat_order_change_match(text) is not None
+
+
+def retail_stat_has_label_change(text: str) -> bool:
+    """Return whether a replacement-label history boundary exists."""
+    return any(
+        retail_stat_change_kind(match) == "Label"
+        for match in retail_stat_change_matches(text)
+    )
 
 
 def retail_stat_is_cancelled(text: str) -> bool:
@@ -4151,14 +4681,75 @@ def retail_stat_is_cancelled(text: str) -> bool:
 
 
 def retail_stat_effective_suffix(text: str) -> str:
-    """Return only the live status after the latest Change marker.
+    """Return live assembly status after the latest Change Order marker.
 
-    Text before Change remains in the file as history, but no assembler,
-    completion or cancellation flag from that history affects current work.
+    Change Label does not invalidate assembly. A legacy bare Change retains
+    its old meaning and is treated as Change Order.
     """
+    suffix = retail_stat_order_suffix(text)
+    change_match = retail_stat_order_change_match(text)
+    effective = (
+        suffix[change_match.end():]
+        if change_match is not None
+        else suffix
+    )
+    # A label-only boundary is packaging history, not assembly status. Remove
+    # the marker so that a not-yet-assembled order remains claimable.
+    return re.sub(
+        r"(?<!\S)Change\s+Label(?=\s|$)",
+        "",
+        effective,
+        flags=re.IGNORECASE,
+    )
+
+
+def retail_stat_packing_suffix(text: str) -> str:
+    """Return packing status after the latest Order or Label change."""
     suffix = retail_stat_order_suffix(text)
     change_match = retail_stat_change_match(text)
     return suffix[change_match.end():] if change_match is not None else suffix
+
+
+def retail_stat_packing_name(text: str) -> str | None:
+    """Return the current packer according to the latest change kind."""
+    latest_change = retail_stat_change_match(text)
+    if (
+        latest_change is not None
+        and retail_stat_change_kind(latest_change) == "Label"
+    ):
+        order_suffix = retail_stat_order_suffix(text)
+        latest_order_change = retail_stat_order_change_match(text)
+        live_start = (
+            latest_order_change.end()
+            if latest_order_change is not None
+            else 0
+        )
+        assembly_before_label = order_suffix[
+            live_start:latest_change.start()
+        ]
+        candidate = order_suffix[latest_change.end():]
+        if not re.search(
+            r"(?<!\S)(?:\(\+\)|\+)(?=\s|$)",
+            assembly_before_label,
+        ):
+            # The label changed before assembly finished. In this case text
+            # before the first later '+' belongs to the assembler, and only
+            # text after that completion marker can be a packer name.
+            completion = re.search(
+                r"(?<!\S)(?:\(\+\)|\+)(?=\s|$)",
+                candidate,
+            )
+            if completion is None:
+                return None
+            candidate = candidate[completion.end():]
+        candidate = re.sub(
+            r"(?<!\S)Cancelled(?=\s|$)",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+        return candidate or None
+    return RETAIL_UP_printed_name(retail_stat_packing_suffix(text))
 
 
 def retail_stat_metadata_values(metadata: dict) -> tuple[str, str]:
@@ -4894,9 +5485,28 @@ def process_pending_RETAIL_order_sources(
 
 
 def RETAIL_change_pdf_order_ids(pdf_path: Path) -> list[str]:
-    """Return order IDs encoded by a valid Change PDF filename."""
+    """Return IDs from a dated order-content Change PDF filename."""
     match = re.fullmatch(
-        r"Change\s+.+\s+\(\d{2}\.\d{2}\.\d{4}\)\.pdf",
+        r"Change(?:\s+Order)?\s+(?!Label\b).+\s+"
+        r"\(\d{2}\.\d{2}\.\d{4}\)\.pdf",
+        pdf_path.name,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return []
+    result = []
+    seen = set()
+    for order_id in re.findall(r"#\d+", pdf_path.stem):
+        if order_id not in seen:
+            seen.add(order_id)
+            result.append(order_id)
+    return result
+
+
+def RETAIL_change_label_pdf_order_ids(pdf_path: Path) -> list[str]:
+    """Return IDs in page order from a dated Change Label PDF name."""
+    match = re.fullmatch(
+        r"Change\s+Label\s+.+\s+\(\d{2}\.\d{2}\.\d{4}\)\.pdf",
         pdf_path.name,
         re.IGNORECASE,
     )
@@ -4926,6 +5536,45 @@ def available_RETAIL_change_pdfs(
             continue
         for path in paths:
             if not path.is_file() or not RETAIL_change_pdf_order_ids(path):
+                continue
+            path_key = str(path).casefold()
+            if path_key in seen:
+                continue
+            seen.add(path_key)
+            date_match = re.search(
+                r"\((\d{2}\.\d{2}\.\d{4})\)\.pdf$",
+                path.name,
+                re.IGNORECASE,
+            )
+            try:
+                change_date = datetime.datetime.strptime(
+                    date_match.group(1), "%d.%m.%Y"
+                ).date()
+            except (AttributeError, ValueError):
+                change_date = datetime.date.min
+            try:
+                modified_ns = path.stat().st_mtime_ns
+            except OSError:
+                modified_ns = 0
+            result.append((change_date, modified_ns, path.name.casefold(), path))
+    return [entry[-1] for entry in sorted(result)]
+
+
+def available_RETAIL_change_label_pdfs(
+    download_directories: list[Path] | None,
+) -> list[Path]:
+    """List dated replacement-label PDFs in chronological order."""
+    result: list[tuple[datetime.date, int, str, Path]] = []
+    seen = set()
+    for directory in download_directories or [Path.home() / "Downloads"]:
+        if not directory.is_dir():
+            continue
+        try:
+            paths = list(directory.iterdir())
+        except OSError:
+            continue
+        for path in paths:
+            if not path.is_file() or not RETAIL_change_label_pdf_order_ids(path):
                 continue
             path_key = str(path).casefold()
             if path_key in seen:
@@ -5238,11 +5887,291 @@ def run_elevated_powershell(script: str) -> None:
         win32api.CloseHandle(process_handle)
 
 
+NETWORK_DISCOVERY_FIREWALL_GROUP = "@FirewallAPI.dll,-32752"
+FILE_SHARING_FIREWALL_GROUP = "@FirewallAPI.dll,-28502"
+
+
+def windows_network_discovery_state() -> dict:
+    """Return language-independent state for active Windows networks."""
+    discovery_group = _powershell_single_quoted(
+        NETWORK_DISCOVERY_FIREWALL_GROUP
+    )
+    sharing_group = _powershell_single_quoted(FILE_SHARING_FIREWALL_GROUP)
+    script = "\n".join((
+        "$ErrorActionPreference = 'Stop'",
+        (
+            "$profiles = @(Get-NetConnectionProfile | Where-Object { "
+            "$_.IPv4Connectivity -ne 'Disconnected' -or "
+            "$_.IPv6Connectivity -ne 'Disconnected' })"
+        ),
+        "function Test-PrivateFirewallGroup([string]$Group) {",
+        (
+            "    $rules = @(Get-NetFirewallRule -Group $Group "
+            "-PolicyStore ActiveStore -ErrorAction SilentlyContinue)"
+        ),
+        "    if ($rules.Count -eq 0) { return $true }",
+        "    $privateRules = @($rules | Where-Object {",
+        "        $profileValue = [int]$_.Profile",
+        (
+            "        $profileValue -eq 0 -or "
+            "(($profileValue -band 2) -ne 0)"
+        ),
+        "    })",
+        "    if ($privateRules.Count -eq 0) { return $true }",
+        (
+            "    return @($privateRules | Where-Object { "
+            "[string]$_.Enabled -ne 'True' }).Count -eq 0"
+        ),
+        "}",
+        "$state = [PSCustomObject]@{",
+        "    connected = $profiles.Count",
+        (
+            "    public = @($profiles | Where-Object { "
+            "$_.NetworkCategory -eq 'Public' }).Count"
+        ),
+        (
+            "    private = @($profiles | Where-Object { "
+            "$_.NetworkCategory -eq 'Private' }).Count"
+        ),
+        (
+            "    discovery = Test-PrivateFirewallGroup "
+            f"{discovery_group}"
+        ),
+        (
+            "    sharing = Test-PrivateFirewallGroup "
+            f"{sharing_group}"
+        ),
+        "}",
+        "$state | ConvertTo-Json -Compress",
+    ))
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            detail or f"PowerShell finished with code {result.returncode}"
+        )
+    state = json.loads(result.stdout.strip().lstrip("\ufeff"))
+    if not isinstance(state, dict):
+        raise ValueError("invalid network discovery state")
+    return state
+
+
+def network_discovery_setup_script() -> str:
+    """Build the elevated, idempotent private-network setup script."""
+    discovery_group = _powershell_single_quoted(
+        NETWORK_DISCOVERY_FIREWALL_GROUP
+    )
+    sharing_group = _powershell_single_quoted(FILE_SHARING_FIREWALL_GROUP)
+    return "\n".join((
+        "$ErrorActionPreference = 'Stop'",
+        (
+            "$profiles = @(Get-NetConnectionProfile | Where-Object { "
+            "$_.IPv4Connectivity -ne 'Disconnected' -or "
+            "$_.IPv6Connectivity -ne 'Disconnected' })"
+        ),
+        "$profiles | Where-Object { $_.NetworkCategory -eq 'Public' } |",
+        (
+            "    ForEach-Object { Set-NetConnectionProfile "
+            "-InterfaceIndex $_.InterfaceIndex -NetworkCategory Private }"
+        ),
+        "function Enable-PrivateFirewallGroup([string]$Group) {",
+        (
+            "    $rules = @(Get-NetFirewallRule -Group $Group "
+            "-PolicyStore ActiveStore -ErrorAction SilentlyContinue)"
+        ),
+        "    $privateRules = @($rules | Where-Object {",
+        "        $profileValue = [int]$_.Profile",
+        (
+            "        $profileValue -eq 0 -or "
+            "(($profileValue -band 2) -ne 0)"
+        ),
+        "    })",
+        (
+            "    if ($privateRules.Count -gt 0) { "
+            "$privateRules | Set-NetFirewallRule -Enabled True }"
+        ),
+        "}",
+        f"Enable-PrivateFirewallGroup {discovery_group}",
+        f"Enable-PrivateFirewallGroup {sharing_group}",
+        "foreach ($serviceName in @('fdPHost', 'FDResPub', 'LanmanServer')) {",
+        (
+            "    $service = Get-Service -Name $serviceName "
+            "-ErrorAction SilentlyContinue"
+        ),
+        "    if ($null -ne $service) {",
+        "        Set-Service -Name $serviceName -StartupType Automatic",
+        "        Start-Service -Name $serviceName -ErrorAction SilentlyContinue",
+        "    }",
+        "}",
+    ))
+
+
+def ensure_windows_network_discovery_enabled() -> None:
+    """Make active Windows networks private and enable SMB discovery rules."""
+    if sys.platform != "win32":
+        return
+    try:
+        state = windows_network_discovery_state()
+    except Exception as error:
+        print(f"XXX Cannot check Windows network discovery: {error}")
+        return
+
+    if int(state.get("connected", 0)) == 0:
+        print("? No active network; network discovery check skipped")
+        return
+    if (
+        int(state.get("public", 0)) == 0
+        and bool(state.get("discovery"))
+        and bool(state.get("sharing"))
+    ):
+        print("* Windows network discovery is enabled")
+        return
+
+    print("? Windows network discovery is disabled; enabling it")
+    try:
+        run_elevated_powershell(network_discovery_setup_script())
+        verified = windows_network_discovery_state()
+    except Exception as error:
+        print(f"XXX Cannot enable Windows network discovery: {error}")
+        return
+    if (
+        int(verified.get("public", 0)) == 0
+        and bool(verified.get("discovery"))
+        and bool(verified.get("sharing"))
+    ):
+        print("* Windows network discovery enabled")
+    else:
+        print(
+            "XXX Windows network discovery is still unavailable; "
+            "check Windows network or group policy settings"
+        )
+
+
+WINDOWS_PROTECTED_PRINT_REGISTRY = (
+    r"SOFTWARE\Policies\Microsoft\Windows NT\Printers\WPP"
+)
+
+
+def windows_protected_print_enabled() -> bool:
+    """Read the Windows 11 WPP state without requesting administrator rights."""
+    if sys.platform != "win32":
+        return False
+    try:
+        if sys.getwindowsversion().build < 26100:
+            return False
+    except AttributeError:
+        return False
+
+    import winreg
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            WINDOWS_PROTECTED_PRINT_REGISTRY,
+            0,
+            winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0),
+        ) as key:
+            values = {}
+            for value_name in (
+                "EnabledBy",
+                "WindowsProtectedPrintGroupPolicyState",
+                "WindowsProtectedPrintMode",
+            ):
+                try:
+                    values[value_name] = int(winreg.QueryValueEx(key, value_name)[0])
+                except FileNotFoundError:
+                    values[value_name] = 0
+    except FileNotFoundError:
+        return False
+    return (
+        values.get("WindowsProtectedPrintMode") == 1
+        or values.get("WindowsProtectedPrintGroupPolicyState") == 1
+        or values.get("EnabledBy") == 2
+    )
+
+
+def ensure_windows_protected_print_disabled() -> None:
+    """Disable WPP only when Windows reports that it is currently enabled."""
+    try:
+        enabled = windows_protected_print_enabled()
+    except OSError as error:
+        print(f"XXX Cannot check Windows protected print mode: {error}")
+        return
+    if not enabled:
+        print("* Windows protected print mode is disabled")
+        return
+
+    print("? Windows protected print mode is enabled; disabling it")
+    registry_path = (
+        r"HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\WPP"
+    )
+    script = "\n".join((
+        "$ErrorActionPreference = 'Stop'",
+        f"$path = '{registry_path}'",
+        "New-Item -Path $path -Force | Out-Null",
+        (
+            "New-ItemProperty -Path $path -Name "
+            "'WindowsProtectedPrintMode' -PropertyType DWord "
+            "-Value 0 -Force | Out-Null"
+        ),
+        (
+            "New-ItemProperty -Path $path -Name "
+            "'WindowsProtectedPrintGroupPolicyState' -PropertyType DWord "
+            "-Value 0 -Force | Out-Null"
+        ),
+        (
+            "Remove-ItemProperty -Path $path -Name 'EnabledBy' "
+            "-ErrorAction SilentlyContinue"
+        ),
+        (
+            "Remove-ItemProperty -Path $path -Name "
+            "'WindowsProtectedPrintOobeConfigComplete' "
+            "-ErrorAction SilentlyContinue"
+        ),
+    ))
+    try:
+        run_elevated_powershell(script)
+    except Exception as error:
+        print(f"XXX Cannot disable Windows protected print mode: {error}")
+        return
+    if windows_protected_print_enabled():
+        print(
+            "XXX Windows protected print mode is enforced by system policy; "
+            "contact the administrator"
+        )
+        return
+    print(
+        "* Windows protected print mode disabled; restart Windows if printer "
+        "drivers are not available yet"
+    )
+
+
 def ensure_main_network_shares(settings: dict) -> None:
     """Create the main computer's fixed SMB shares when they are absent."""
     if support_mode_enabled(settings):
         return
-    missing = missing_main_network_shares()
+    try:
+        missing = missing_main_network_shares()
+    except Exception as error:
+        print(f"XXX Cannot check network shares: {error}")
+        return
     if not missing:
         return
     names = ", ".join(name for name, _path, _read_only in missing)
@@ -5253,7 +6182,11 @@ def ensure_main_network_shares(settings: dict) -> None:
         print(f"XXX Cannot configure network shares: {error}")
         return
     # Verify that Windows registered every requested share.
-    remaining = missing_main_network_shares()
+    try:
+        remaining = missing_main_network_shares()
+    except Exception as error:
+        print(f"XXX Cannot verify network shares: {error}")
+        return
     if remaining:
         print(
             "XXX Network shares are still unavailable: "
@@ -5311,8 +6244,11 @@ def update_RETAIL_change_caches(
 def append_RETAIL_change_markers(
     worker: dict,
     order_ids: list[str],
+    marker_kind: str = "Order",
 ) -> tuple[set[str], set[str]]:
-    """Append one Change boundary to every found statistics order line."""
+    """Append one typed Change boundary to every found statistics line."""
+    if marker_kind not in {"Order", "Label"}:
+        raise ValueError(f"Invalid Change marker kind: {marker_kind}")
     target_ids = set(order_ids)
     stat_file = retail_statistics_file(worker)
     found: set[str] = set()
@@ -5326,9 +6262,14 @@ def append_RETAIL_change_markers(
             if order_id not in target_ids:
                 continue
             found.add(order_id)
-            if retail_stat_has_change(raw_text):
+            marker_exists = (
+                retail_stat_has_order_change(raw_text)
+                if marker_kind == "Order"
+                else retail_stat_has_label_change(raw_text)
+            )
+            if marker_exists:
                 continue
-            lines[index] = raw_text + " Change\n"
+            lines[index] = raw_text + f" Change {marker_kind}\n"
             added.add(order_id)
         if added:
             file.seek(0)
@@ -5389,7 +6330,7 @@ def process_RETAIL_change_pdf(
             )
 
         found_ids, added_ids = append_RETAIL_change_markers(
-            worker, expected_ids
+            worker, expected_ids, "Order"
         )
         missing_statistics = set(expected_ids) - found_ids
         if missing_statistics:
@@ -5467,6 +6408,96 @@ def process_pending_RETAIL_change_pdfs(
             send(worker["DISPLAY"], message)
 
     return merged_orders, merged_metadata, newly_changed
+
+
+def process_RETAIL_change_label_pdf(
+    worker: dict,
+    change_pdf: Path,
+) -> set[str]:
+    """Validate a replacement-label PDF and mark its statistics orders."""
+    expected_ids = RETAIL_change_label_pdf_order_ids(change_pdf)
+    if not expected_ids:
+        raise ValueError(f"Invalid Change Label PDF filename: {change_pdf.name}")
+
+    lock_path = change_pdf.parent / ".AutoChecker_change_labels.lock"
+    with portalocker.Lock(
+        str(lock_path), mode="a+", encoding="utf-8", timeout=120
+    ):
+        page_count = len(read_pdf_without_leading_junk(change_pdf).pages)
+        if page_count < len(expected_ids):
+            raise ValueError(
+                f"{change_pdf.name} has {page_count} page(s), but its name "
+                f"contains {len(expected_ids)} order(s)"
+            )
+        found_ids, added_ids = append_RETAIL_change_markers(
+            worker,
+            expected_ids,
+            "Label",
+        )
+        missing_statistics = set(expected_ids) - found_ids
+        if missing_statistics:
+            raise LookupError(
+                "Orders not found in today's statistics: "
+                + ", ".join(sorted(missing_statistics))
+            )
+    return added_ids
+
+
+def process_pending_RETAIL_change_label_pdfs(
+    worker: dict,
+) -> set[str]:
+    """Process stable dated Change Label PDFs once per file signature."""
+    observed = worker.setdefault("RETAIL_CHANGE_LABEL_OBSERVED", {})
+    processed = worker.setdefault("RETAIL_CHANGE_LABEL_PROCESSED", {})
+    failures = worker.setdefault("RETAIL_CHANGE_LABEL_FAILURES", {})
+    newly_changed: set[str] = set()
+    now = time.time()
+
+    for change_pdf in available_RETAIL_change_label_pdfs(
+        worker.get("DOWNLOAD_DIRECTORIES")
+    ):
+        path_key = str(change_pdf).casefold()
+        try:
+            stat = change_pdf.stat()
+        except OSError:
+            continue
+        signature = (stat.st_mtime_ns, stat.st_size)
+        previous_signature = observed.get(path_key)
+        observed[path_key] = signature
+        if processed.get(path_key) == signature:
+            continue
+        if (
+            previous_signature != signature
+            and now - stat.st_mtime < CHANGE_PDF_SCAN_INTERVAL
+        ):
+            continue
+        failed = failures.get(path_key)
+        if (
+            failed is not None
+            and failed[0] == signature
+            and time.monotonic() - failed[1] < CHANGE_PDF_RETRY_INTERVAL
+        ):
+            continue
+        try:
+            added_ids = process_RETAIL_change_label_pdf(worker, change_pdf)
+        except Exception as error:
+            failures[path_key] = (signature, time.monotonic())
+            message = f"XXX Cannot apply {change_pdf.name}: {error}"
+            Printer(message)
+            send(worker["DISPLAY"], message)
+            continue
+
+        processed[path_key] = signature
+        failures.pop(path_key, None)
+        newly_changed.update(added_ids)
+        if added_ids:
+            message = (
+                f"* Order labels changed: {', '.join(sorted(added_ids))}"
+            )
+            Printer(message)
+            send(worker["DISPLAY"], message)
+
+    return newly_changed
 
 
 def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> dict:
@@ -5788,7 +6819,7 @@ def reserve_next_RETAIL_order(worker: dict, orders: dict) -> str | None:
             for index, order_id, raw_text in active_orders:
                 if order_id not in available_order_ids:
                     continue
-                if retail_stat_has_change(raw_text) != changed_order_only:
+                if retail_stat_has_order_change(raw_text) != changed_order_only:
                     continue
                 if retail_stat_effective_suffix(raw_text).strip():
                     continue
@@ -5833,6 +6864,9 @@ def release_RETAIL_order_reservation(worker: dict, order_id: str) -> bool:
                 raw_text,
             )
             if order_match is not None:
+                # Preserve the latest history boundary. This can be either an
+                # order-content change or a label-only change that happened
+                # before the temporary reservation.
                 change_match = retail_stat_change_match(raw_text)
                 keep_until = (
                     order_match.end() + change_match.end()
@@ -6282,10 +7316,15 @@ def automatically_assign_next_RETAIL_order(
     )
 
 
-def draw_RETAIL_order_counters(frame, completed: int, total: int) -> None:
+def draw_RETAIL_order_counters(
+    frame,
+    completed: int,
+    total: int,
+    cancelled: int,
+) -> None:
     """Draw completed, remaining and total order counts on a camera preview."""
     height, width = frame.shape[:2]
-    remaining = max(0, total - completed)
+    remaining = max(0, total - completed - cancelled)
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.7, min(width, height) / 450.0)
     thickness = max(2, round(font_scale * 2))
@@ -6319,38 +7358,39 @@ def draw_RETAIL_order_counters(frame, completed: int, total: int) -> None:
         )
 
 
-def RETAIL_daily_order_counts(worker: dict) -> tuple[int, int]:
-    """Count completed and total orders in today's RETAIL statistics file."""
+def RETAIL_daily_order_counts(worker: dict) -> tuple[int, int, int]:
+    """Count completed, total and cancelled RETAIL orders for today."""
     stat_file = statistics_file(worker)
     try:
         stat = stat_file.stat()
         signature = (stat.st_mtime_ns, stat.st_size)
     except OSError:
         worker.pop("RETAIL_ORDER_COUNTER_CACHE", None)
-        return 0, 0
+        return 0, 0, 0
 
     cached = worker.get("RETAIL_ORDER_COUNTER_CACHE")
     if cached and cached[0] == signature:
-        return cached[1], cached[2]
+        return cached[1], cached[2], cached[3]
 
     completed = 0
     total = 0
+    cancelled = 0
     for line in read_stat_lines(stat_file):
         if retail_order_id_from_stat_line(line) is None:
             continue
         total += 1
-        if (
-            not retail_stat_is_cancelled(line)
-            and "+" in retail_stat_effective_suffix(line)
-        ):
+        if retail_stat_is_cancelled(line):
+            cancelled += 1
+        elif "+" in retail_stat_effective_suffix(line):
             completed += 1
 
     worker["RETAIL_ORDER_COUNTER_CACHE"] = (
         signature,
         completed,
         total,
+        cancelled,
     )
-    return completed, total
+    return completed, total, cancelled
 
 
 
@@ -6723,11 +7763,16 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             if cap is not None and ok:
                 preview = cv2.resize(frame, None, fx=0.15, fy=0.15)
                 if identity.department.upper() == "RETAIL":
-                    completed_orders, total_orders = RETAIL_daily_order_counts(worker)
+                    (
+                        completed_orders,
+                        total_orders,
+                        cancelled_orders,
+                    ) = RETAIL_daily_order_counts(worker)
                     draw_RETAIL_order_counters(
                         preview,
                         completed_orders,
                         total_orders,
+                        cancelled_orders,
                     )
                 cv2.imshow(window_name, preview)
 
@@ -7162,10 +8207,286 @@ def create_launcher_RETAIL_worker(settings: dict) -> dict:
         "STATISTICS": statistics_dir,
         "HAS_CAMERA": False,
         "PRINTER": "",
+        # Raw browser names (mpdf/qwe/qwez) always arrive on this computer.
+        # In support mode only their finalized files are sent to the main PC.
+        "LOCAL_DOWNLOADS": Path.home() / "Downloads",
     }
     configure_worker_storage(worker, settings)
     synchronize_support_statistics(worker)
     return worker
+
+
+def launcher_statistics_order_progress(line: str) -> tuple[bool, bool]:
+    """Return assembled/packed state after the latest Change boundary."""
+    assembled = "+" in retail_stat_effective_suffix(line)
+    packed = retail_stat_packing_name(line) is not None
+    return assembled, packed
+
+
+def print_launcher_completion_summary(
+    delivery: str,
+    completed: int,
+    incomplete: list[str],
+    cancelled: list[str],
+) -> None:
+    if incomplete:
+        active_total = completed + len(incomplete)
+        message = (
+            f"! {delivery} ({completed}/{active_total} completed): "
+            f"incomplete orders: {', '.join(incomplete)}."
+        )
+    else:
+        message = (
+            f"* {delivery} ({completed} completed): all orders are completed."
+        )
+    if cancelled:
+        message += f" Cancelled orders: {', '.join(cancelled)}."
+    print(message)
+
+
+def check_launcher_orders_completion(worker: dict) -> None:
+    """Implement Admin's `check` command against authoritative statistics."""
+    stat_file = retail_statistics_file(worker)
+    if not stat_file.is_file():
+        print(f"XXX Statistics file is unavailable: {stat_file}")
+        return
+    results = {
+        delivery: {"completed": [], "incomplete": [], "cancelled": []}
+        for delivery in RETAIL_DELIVERY_ORDER
+    }
+    for line in read_stat_lines(stat_file):
+        order_id = retail_order_id_from_stat_line(line)
+        if order_id is None:
+            continue
+        status = results[RETAIL_delivery_from_stat_line(line)]
+        if retail_stat_is_cancelled(line):
+            if order_id not in status["cancelled"]:
+                status["cancelled"].append(order_id)
+            continue
+        assembled, packed = launcher_statistics_order_progress(line)
+        target = "completed" if assembled and packed else "incomplete"
+        if order_id not in status[target]:
+            status[target].append(order_id)
+
+    display_names = {
+        "UPS": "UPS",
+        "Zasilkovna": "Zasilkovna (Packeta)",
+        "Postal": "Postal",
+    }
+    for delivery in RETAIL_DELIVERY_ORDER:
+        status = results[delivery]
+        print_launcher_completion_summary(
+            display_names[delivery],
+            len(status["completed"]),
+            status["incomplete"],
+            status["cancelled"],
+        )
+
+
+def report_launcher_order_progress(
+    worker: dict,
+    order_ids: list[str],
+) -> None:
+    """Print Admin-compatible assembly/packing warnings for changed orders."""
+    stat_file = retail_statistics_file(worker)
+    if not stat_file.is_file():
+        print(f"XXX Statistics file is unavailable: {stat_file}")
+        return
+    lines = read_stat_lines(stat_file)
+    requested = set(order_ids)
+    found = set()
+    part_number = None
+    number_in_part = 0
+    for line in lines:
+        header = re.search(
+            r"-{10}.*?\sPart\s+(\d+)\.pdf-{10}",
+            line,
+            re.IGNORECASE,
+        )
+        if header is not None:
+            part_number = int(header.group(1))
+            number_in_part = 0
+            continue
+        stored_order = retail_order_id_from_stat_line(line)
+        if stored_order is None:
+            continue
+        number_in_part += 1
+        if stored_order not in requested:
+            continue
+        found.add(stored_order)
+        assembled, packed = launcher_statistics_order_progress(line)
+        location = (
+            f"Part {part_number if part_number is not None else 'unknown'}, "
+            f"number {number_in_part}"
+        )
+        if assembled:
+            print(f"? Order {stored_order} is already assembled; {location}")
+        if packed:
+            print(f"? Order {stored_order} is already packed; {location}")
+        if not assembled and not packed:
+            print(f"* Order {stored_order} is active; {location}")
+    for missing_order in order_ids:
+        if missing_order not in found:
+            print(f"XXX Order not found in today's statistics: {missing_order}")
+
+
+def toggle_launcher_order_cancelled(worker: dict, order_id: str) -> bool:
+    """Add Cancelled, or interactively remove an existing marker."""
+    normalized_order = f"#{order_id.strip().lstrip('#')}"
+    stat_file = retail_statistics_file(worker)
+    if not stat_file.is_file():
+        print(f"XXX Statistics file is unavailable: {stat_file}")
+        return False
+
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        line_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if retail_order_id_from_stat_line(line) == normalized_order
+            ),
+            None,
+        )
+        if line_index is None:
+            print(f"XXX Active order not found: {normalized_order}")
+            return False
+        raw_text = lines[line_index].rstrip("\r\n")
+        already_cancelled = retail_stat_is_cancelled(raw_text)
+        assembled, packed = launcher_statistics_order_progress(raw_text)
+        if not already_cancelled:
+            lines[line_index] = raw_text + " Cancelled\n"
+            file.seek(0)
+            file.truncate()
+            file.writelines(lines)
+            file.flush()
+            mirror_statistics_lines(worker, stat_file, lines)
+
+    if not already_cancelled:
+        print(f"* Order {normalized_order} cancelled successfully")
+        if assembled:
+            print(f"? Order {normalized_order} was already assembled")
+        if packed:
+            print(f"? Order {normalized_order} was already packed")
+        return True
+
+    print(
+        f"? Order {normalized_order} is already cancelled. "
+        "Remove cancellation? Enter y or n:"
+    )
+    try:
+        answer = input("> ").strip().casefold()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer not in {"y", "yes", "у", "да"}:
+        print(f"* Cancellation kept for order {normalized_order}")
+        return True
+
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        for index, line in enumerate(lines):
+            raw_text = line.rstrip("\r\n")
+            if retail_order_id_from_stat_line(raw_text) != normalized_order:
+                continue
+            order_match = re.search(
+                rf"(?<!\S){re.escape(normalized_order)}(?=\s|$)",
+                raw_text,
+            )
+            if order_match is None:
+                break
+            suffix = raw_text[order_match.end():]
+            cleaned_suffix = re.sub(
+                r"(?<!\S)Cancelled(?=\s|$)",
+                "",
+                suffix,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            cleaned_suffix = " ".join(cleaned_suffix.split())
+            lines[index] = (
+                raw_text[:order_match.end()]
+                + (f" {cleaned_suffix}" if cleaned_suffix else "")
+                + "\n"
+            )
+            file.seek(0)
+            file.truncate()
+            file.writelines(lines)
+            file.flush()
+            mirror_statistics_lines(worker, stat_file, lines)
+            print(f"* Cancellation removed from order {normalized_order}")
+            return True
+    print(f"XXX Order not found while removing cancellation: {normalized_order}")
+    return False
+
+
+def send_launcher_label_part(worker: dict, part_number: int) -> bool:
+    """Implement `send part N`; it is meaningful only on a support PC."""
+    if not worker.get("SUPPORT"):
+        print(
+            "XXX send part is unavailable when support is false: "
+            "this is already the main computer"
+        )
+        return False
+    filename = (
+        f"{datetime.date.today():%d.%m.%Y} Part {part_number} (Label).pdf"
+    )
+    source = launcher_local_downloads(worker) / filename
+    if not source.is_file():
+        print(f"XXX Today's Label PDF was not found: {source.name}")
+        return False
+    destination = Path(worker["DOWNLOAD_DIRECTORIES"][0]) / filename
+    try:
+        copy_file_atomically(source, destination)
+    except Exception as error:
+        print(f"XXX Cannot send {filename}: {error}")
+        return False
+    print(f"* Label PDF sent to main computer: {destination}")
+    return True
+
+
+def handle_launcher_console_command(
+    command: str,
+    worker: dict,
+) -> None:
+    """Handle the maintained subset of Admin console commands."""
+    if not command:
+        return
+    if command.casefold() == "help":
+        print("check                 - check today's RETAIL orders")
+        print("cancel [#]1234567     - add or remove Cancelled")
+        print("send part N           - send today's Label PDF to the main PC")
+        return
+    if command.casefold() == "check":
+        check_launcher_orders_completion(worker)
+        return
+    cancel_match = re.fullmatch(r"cancel\s+#?(\d+)", command, re.IGNORECASE)
+    if cancel_match:
+        toggle_launcher_order_cancelled(worker, cancel_match.group(1))
+        return
+    send_match = re.fullmatch(r"send\s+part\s+(\d+)", command, re.IGNORECASE)
+    if send_match:
+        part_number = int(send_match.group(1))
+        if part_number < 1:
+            print("XXX Part number must be 1 or greater")
+        else:
+            send_launcher_label_part(worker, part_number)
+        return
+    print("XXX Unknown command. Type: help")
+
+
+def launcher_console_loop(worker: dict) -> None:
+    print("* Commands: check | cancel [#]1234567 | send part N | help")
+    while True:
+        try:
+            command = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        try:
+            handle_launcher_console_command(command, worker)
+        except Exception as error:
+            print(f"XXX Console command failed: {error}")
 
 
 def dispatcher() -> None:
@@ -7202,16 +8523,30 @@ def dispatcher() -> None:
     ensure_worker_statistics_files(settings)
 
     launcher_retail_worker = None
+    launcher_console_started = False
     try:
         launcher_retail_worker = create_launcher_RETAIL_worker(settings)
+        process_pending_admin_download_files(launcher_retail_worker)
         process_pending_RETAIL_order_sources(
             launcher_retail_worker, settings
         )
         process_pending_RETAIL_change_pdfs(
             launcher_retail_worker, settings
         )
+        process_pending_RETAIL_change_label_pdfs(
+            launcher_retail_worker
+        )
     except Exception as error:
         print(f"XXX RETAIL order monitor initialization failed: {error}")
+
+    if launcher_retail_worker is not None:
+        threading.Thread(
+            target=launcher_console_loop,
+            args=(launcher_retail_worker,),
+            name="AutoChecker console commands",
+            daemon=True,
+        ).start()
+        launcher_console_started = True
 
     idle_displays: dict[str, serial.Serial] = {}
     workers: dict[str, multiprocessing.Process] = {}
@@ -7342,12 +8677,28 @@ def dispatcher() -> None:
                         launcher_retail_worker = create_launcher_RETAIL_worker(
                             settings
                         )
+                    if not launcher_console_started:
+                        threading.Thread(
+                            target=launcher_console_loop,
+                            args=(launcher_retail_worker,),
+                            name="AutoChecker console commands",
+                            daemon=True,
+                        ).start()
+                        launcher_console_started = True
+                    process_pending_admin_download_files(
+                        launcher_retail_worker
+                    )
                     imported_order_ids = process_pending_RETAIL_order_sources(
                         launcher_retail_worker, settings
                     )
                     changed_orders, _changed_metadata, _new_markers = (
                         process_pending_RETAIL_change_pdfs(
                             launcher_retail_worker, settings
+                        )
+                    )
+                    changed_label_ids = (
+                        process_pending_RETAIL_change_label_pdfs(
+                            launcher_retail_worker
                         )
                     )
                     refreshed_order_ids = (
@@ -7358,6 +8709,11 @@ def dispatcher() -> None:
                             worker_update_queues,
                             worker_identities,
                             refreshed_order_ids,
+                        )
+                    if changed_label_ids:
+                        broadcast_RETAIL_UP_header(
+                            worker_update_queues,
+                            worker_identities,
                         )
                 except Exception as error:
                     print(f"XXX RETAIL order monitor error: {error}")
@@ -8016,6 +9372,9 @@ def dispatcher() -> None:
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     check_for_updates()
+    ensure_default_sound_file()
+    ensure_windows_network_discovery_enabled()
+    ensure_windows_protected_print_disabled()
     startup_settings = ensure_settings_schema()
     if support_mode_enabled(startup_settings):
         startup_settings = synchronize_support_catalog_settings(
