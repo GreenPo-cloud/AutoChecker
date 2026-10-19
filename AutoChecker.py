@@ -13,6 +13,7 @@ import importlib.util
 import base64
 import copy
 import ctypes
+import getpass
 import io
 import os
 import shutil
@@ -167,19 +168,31 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.22"
+CURRENT_VERSION = "3.23"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
     "downloads": "Downloads",
-    "photos": "AutoChecker_Photo",
-    "statistics": "AutoChecker_Statistik",
+    "retail": "AutoChecker_RETAIL",
+    "b2b": "AutoChecker_B2B",
     "settings": "AutoChecker_Settings",
+}
+LEGACY_SUPPORT_SHARES = {
+    "AutoChecker_Photo": DESKTOP_DIR / "RETAIL" / "Photo",
+    "AutoChecker_Statistik": DESKTOP_DIR / "RETAIL" / "Statistik",
 }
 DEFAULT_SUPPORT_PATHS = {
     "downloads": rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['downloads']}",
-    "photos": rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['photos']}",
-    "statistics": rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['statistics']}",
+    "retail": rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['retail']}",
+    "b2b": rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['b2b']}",
+    "photos": (
+        rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['retail']}"
+        r"\Photo"
+    ),
+    "statistics": (
+        rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['retail']}"
+        r"\Statistik"
+    ),
     "settings": (
         rf"\\{DEFAULT_MAIN_COMPUTER_NAME}\{SUPPORT_SHARE_NAMES['settings']}"
         r"\Settings.json"
@@ -225,9 +238,12 @@ SETTINGS_SCHEMA_DEFAULTS = {
     "CHECK": {},
     "ORDER_LABEL": DEFAULT_ORDER_LABEL_SETTINGS,
     "support": False,
+    "support_username": "",
     "main_computer_name": DEFAULT_MAIN_COMPUTER_NAME,
     "support_paths": DEFAULT_SUPPORT_PATHS,
 }
+
+SUPPORT_NETWORK_AUTH_BLOCKED = False
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -1551,7 +1567,7 @@ def upload_display_data(
         if setting_name in {
             "DEPARTMENT", "DISPLAY", "OTHER", "PRINTER", "SCANNER",
             "FEM_BONUS", "AUTO_BONUS", "support", "support_paths",
-            "main_computer_name",
+            "support_username", "main_computer_name",
         }:
             continue
         if setting_name == "FOCUS":
@@ -1821,30 +1837,42 @@ def support_mode_enabled(settings: dict) -> bool:
 
 def configured_support_paths(settings: dict) -> dict[str, Path]:
     """Validate and return the fixed shared resources used in support mode."""
-    configured = settings.get("support_paths", {})
-    if not isinstance(configured, dict):
-        raise ValueError("support_paths must be a dictionary")
-
+    # Always rebuild the paths from one sanitized computer name.  This makes
+    # startup self-healing when an older Settings.json contains a stale share
+    # name, an extra slash, or whitespace around a UNC component.
     expected = support_paths_for_computer(
         settings.get("main_computer_name", DEFAULT_MAIN_COMPUTER_NAME)
     )
-    result = {}
-    for key, expected_path in expected.items():
-        raw_path = str(configured.get(key, expected_path)).strip()
-        if not raw_path:
-            raise ValueError(f"support_paths.{key} is empty")
-        result[key] = Path(raw_path)
+    result = {key: Path(path) for key, path in expected.items()}
 
-    if not result["downloads"].is_dir():
-        raise FileNotFoundError(
-            f"Support downloads folder is unavailable: {result['downloads']}"
-        )
-    for key in ("photos", "statistics"):
-        result[key].mkdir(parents=True, exist_ok=True)
-        if not result[key].is_dir():
+    def require_directory(key: str, create: bool = False) -> None:
+        path = result[key]
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        # stat() preserves the real WinError (for example 1909).  Path.is_dir
+        # can turn that useful authentication error into a misleading False.
+        try:
+            path.stat()
+        except FileNotFoundError as error:
             raise FileNotFoundError(
-                f"Support {key} folder is unavailable: {result[key]}"
+                f"Support {key} folder is unavailable: {path}"
+            ) from error
+        if not path.is_dir():
+            raise NotADirectoryError(
+                f"Support {key} folder is unavailable: {path}"
             )
+
+    require_directory("downloads")
+    require_directory("retail")
+    require_directory("b2b")
+    require_directory("photos", create=True)
+    require_directory("statistics", create=True)
+    try:
+        result["settings"].stat()
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"Main Settings.json is unavailable: {result['settings']}"
+        ) from error
     if not result["settings"].is_file():
         raise FileNotFoundError(
             f"Main Settings.json is unavailable: {result['settings']}"
@@ -1865,14 +1893,20 @@ def configure_worker_storage(worker: dict, settings: dict) -> None:
     )
     worker["RETAIL_STATISTICS"] = local_retail_statistics
     worker["RETAIL_LOCAL_STATISTICS"] = local_retail_statistics
-    if department not in {"RETAIL", RETAIL_UP_DEPARTMENT}:
-        return
     if not support_mode_enabled(settings):
         return
 
     shared = configured_support_paths(settings)
     worker["SUPPORT"] = True
     worker["DOWNLOAD_DIRECTORIES"] = [shared["downloads"]]
+    if department == "B2B":
+        shared_B2B_statistics = shared["b2b"] / "Statistik"
+        shared_B2B_statistics.mkdir(parents=True, exist_ok=True)
+        worker["STATISTICS"] = shared_B2B_statistics
+        worker["B2B_HISTORY"] = shared["b2b"] / "History"
+        return
+    if department not in {"RETAIL", RETAIL_UP_DEPARTMENT}:
+        return
     worker["SUPPORT_FOTO"] = shared["photos"]
     worker["RETAIL_STATISTICS"] = shared["statistics"]
     worker["STATISTICS_MIRROR_DIR"] = local_retail_statistics
@@ -4426,6 +4460,7 @@ def prepare_B2B_order_history(
     history_dir.mkdir(parents=True, exist_ok=True)
     order_dir = history_dir / order_name
     pdf_filename = f"{order_name}.pdf"
+    progress_file = order_dir / f"{order_name}_Sborka.txt"
 
     # Two displays may scan the same newly downloaded order nearly
     # simultaneously. Keep folder creation and moving under one lock.
@@ -4442,11 +4477,22 @@ def prepare_B2B_order_history(
             archived_pdf = order_dir / pdf_filename
             existing_pdf = _case_insensitive_file(order_dir, pdf_filename)
             if existing_pdf is not None:
-                return None, "archive_conflict"
-            try:
-                shutil.move(str(downloaded_pdf), str(archived_pdf))
-            except (OSError, shutil.Error):
-                return None, "move_failed"
+                archived_pdf = existing_pdf
+                progress_action = (
+                    "resuming saved progress"
+                    if progress_file.is_file()
+                    else "starting new progress"
+                )
+                print(
+                    f"* B2B order {order_name} already has an archived PDF; "
+                    f"{progress_action}. Duplicate Downloads PDF was left "
+                    "unchanged"
+                )
+            else:
+                try:
+                    shutil.move(str(downloaded_pdf), str(archived_pdf))
+                except (OSError, shutil.Error):
+                    return None, "move_failed"
         else:
             print(
                 f"? B2B PDF {pdf_filename} was not found; checked: "
@@ -4461,7 +4507,6 @@ def prepare_B2B_order_history(
         photo_dir = order_dir / "Photo"
         photo_dir.mkdir(parents=True, exist_ok=True)
 
-    progress_file = order_dir / f"{order_name}_Sborka.txt"
     worker["ACTIVE_STAT_FILE"] = progress_file
     worker["B2B_PDF_NAME"] = archived_pdf.name
     worker["B2B_PDF_PATH"] = archived_pdf
@@ -5730,7 +5775,12 @@ def merge_RETAIL_change_cache(
 
 def normalized_main_computer_name(value: object) -> str:
     """Validate the DNS/Windows name used to build support UNC paths."""
-    name = str(value).strip().lstrip("\\")
+    # Accept either a plain host name or an accidentally pasted UNC prefix,
+    # but never retain whitespace next to a path separator.  A value such as
+    # ``"\\\\GREENPO\\ "`` previously produced invalid paths on support PCs.
+    raw_name = str(value).strip().replace("/", "\\")
+    name_parts = [part.strip() for part in raw_name.split("\\") if part.strip()]
+    name = name_parts[0] if name_parts else ""
     if (
         not name
         or len(name) > 63
@@ -5744,10 +5794,13 @@ def support_paths_for_computer(computer_name: object) -> dict[str, str]:
     """Build the fixed support paths from one main-computer name."""
     name = normalized_main_computer_name(computer_name)
     root = rf"\\{name}"
+    retail_root = root + "\\" + SUPPORT_SHARE_NAMES["retail"]
     return {
         "downloads": root + "\\" + SUPPORT_SHARE_NAMES["downloads"],
-        "photos": root + "\\" + SUPPORT_SHARE_NAMES["photos"],
-        "statistics": root + "\\" + SUPPORT_SHARE_NAMES["statistics"],
+        "retail": retail_root,
+        "b2b": root + "\\" + SUPPORT_SHARE_NAMES["b2b"],
+        "photos": retail_root + "\\Photo",
+        "statistics": retail_root + "\\Statistik",
         "settings": (
             root
             + "\\"
@@ -5755,6 +5808,188 @@ def support_paths_for_computer(computer_name: object) -> dict[str, str]:
             + "\\Settings.json"
         ),
     }
+
+
+SUPPORT_AUTH_ERROR_CODES = {
+    5,     # Access denied
+    13,    # Python's EACCES wrapper for a Windows access-denied error
+    86,    # Invalid password
+    1219,  # Conflicting credentials already connected to the server
+    1326,  # Unknown user name or bad password
+    1330,  # Password expired
+    1331,  # Account disabled
+    1907,  # Password must be changed
+    1909,  # Account locked out
+}
+
+
+def exception_windows_error_codes(error: BaseException) -> set[int]:
+    """Collect Windows error codes from one exception and its causes."""
+    codes: set[int] = set()
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        for attribute in ("winerror", "errno"):
+            value = getattr(current, attribute, None)
+            if isinstance(value, int):
+                codes.add(value)
+        if current.args and isinstance(current.args[0], int):
+            codes.add(current.args[0])
+        current = current.__cause__ or current.__context__
+    return codes
+
+
+def is_support_authentication_error(error: BaseException) -> bool:
+    """Return whether an SMB failure requires user/account intervention."""
+    if exception_windows_error_codes(error).intersection(
+        SUPPORT_AUTH_ERROR_CODES
+    ):
+        return True
+    message = str(error).casefold()
+    markers = (
+        "account is currently locked",
+        "account has been locked",
+        "учетная запись пользователя заблокирована",
+        "user account has expired",
+        "logon failure",
+        "неверное имя пользователя или пароль",
+    )
+    return any(marker in message for marker in markers)
+
+
+def support_account_is_locked(error: BaseException) -> bool:
+    """Return whether Windows explicitly reports account lockout."""
+    return (
+        1909 in exception_windows_error_codes(error)
+        or "заблокирована" in str(error).casefold()
+        or "locked" in str(error).casefold()
+    )
+
+
+def probe_support_network(settings: dict) -> None:
+    """Read metadata from the two shares required before launcher startup."""
+    paths = support_paths_for_computer(
+        settings.get("main_computer_name", DEFAULT_MAIN_COMPUTER_NAME)
+    )
+    Path(paths["downloads"]).stat()
+    Path(paths["settings"]).stat()
+
+
+def connect_support_network_session(settings: dict) -> bool:
+    """Prompt once for a Windows password when SMB authentication fails."""
+    global SUPPORT_NETWORK_AUTH_BLOCKED
+    try:
+        probe_support_network(settings)
+        SUPPORT_NETWORK_AUTH_BLOCKED = False
+        return True
+    except OSError as error:
+        if not is_support_authentication_error(error):
+            print(f"XXX Cannot access main AutoChecker computer: {error}")
+            return False
+        if support_account_is_locked(error):
+            SUPPORT_NETWORK_AUTH_BLOCKED = True
+            print(
+                "XXX The Windows account used for the main AutoChecker "
+                "computer is locked. Unlock it on the main computer, then "
+                "restart AutoChecker; automatic network retries are paused"
+            )
+            return False
+
+        computer_name = normalized_main_computer_name(
+            settings.get("main_computer_name", DEFAULT_MAIN_COMPUTER_NAME)
+        )
+        if not sys.stdin or not sys.stdin.isatty():
+            SUPPORT_NETWORK_AUTH_BLOCKED = True
+            print(
+                f"XXX Windows credentials are required for {computer_name}; "
+                "run AutoChecker in an interactive console"
+            )
+            return False
+
+        default_user = str(settings.get("support_username", "")).strip()
+        prompt = f"Windows user for {computer_name}"
+        if default_user:
+            prompt += f" [{default_user}]"
+        username = input(prompt + " (blank cancels): ").strip() or default_user
+        if not username:
+            SUPPORT_NETWORK_AUTH_BLOCKED = True
+            print("? Network sign-in cancelled; automatic retries are paused")
+            return False
+        password = getpass.getpass(
+            "Windows account password (Windows Hello PIN is not accepted): "
+        )
+        if not password:
+            SUPPORT_NETWORK_AUTH_BLOCKED = True
+            print("? Empty password was not submitted; automatic retries are paused")
+            return False
+        connection_username = username
+        if "\\" not in username and "@" not in username:
+            connection_username = f"{computer_name}\\{username}"
+
+        try:
+            import win32netcon
+            import win32wnet
+
+            win32wnet.WNetAddConnection2(
+                win32netcon.RESOURCETYPE_DISK,
+                None,
+                rf"\\{computer_name}\IPC$",
+                None,
+                connection_username,
+                password,
+                0,
+            )
+            probe_support_network(settings)
+        except Exception as connection_error:
+            SUPPORT_NETWORK_AUTH_BLOCKED = True
+            if 1219 in exception_windows_error_codes(connection_error):
+                print(
+                    f"XXX Windows already has a connection to {computer_name} "
+                    "with different credentials. Disconnect that Windows "
+                    "network connection and restart AutoChecker"
+                )
+            else:
+                print(
+                    f"XXX Cannot sign in to {computer_name}: "
+                    f"{connection_error}"
+                )
+            return False
+
+        if settings.get("support_username") != connection_username:
+            settings["support_username"] = connection_username
+            save_settings(settings)
+        SUPPORT_NETWORK_AUTH_BLOCKED = False
+        print(f"* Connected to main AutoChecker computer {computer_name}")
+        return True
+
+
+def read_json_snapshot(path: Path, attempts: int = 5) -> dict:
+    """Read a stable JSON snapshot without requesting an SMB write lock."""
+    last_error: Exception | None = None
+    previous_text = None
+    for _attempt in range(attempts):
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+            if previous_text is None:
+                previous_text = text
+                time.sleep(0.1)
+                continue
+            if text != previous_text:
+                previous_text = text
+                time.sleep(0.1)
+                continue
+            document = json.loads(text)
+            if not isinstance(document, dict):
+                raise ValueError(f"{path.name} root is not an object")
+            return document
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            last_error = error
+            previous_text = None
+            time.sleep(0.1)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Cannot read {path}")
 
 
 def synchronize_support_catalog_settings(settings: dict) -> dict:
@@ -5765,16 +6000,10 @@ def synchronize_support_catalog_settings(settings: dict) -> dict:
         support_paths_for_computer(settings["main_computer_name"])["settings"]
     )
     try:
-        with portalocker.Lock(
-            str(remote_path),
-            mode="r",
-            encoding="utf-8",
-            timeout=30,
-            flags=portalocker.LOCK_SH | portalocker.LOCK_NB,
-        ) as remote_file:
-            remote_settings = json.load(remote_file)
-        if not isinstance(remote_settings, dict):
-            raise ValueError("remote Settings.json root is not an object")
+        # AutoChecker_Settings is intentionally read-only for support PCs.
+        # Windows/SMB can reject portalocker's byte-range lock on a read-only
+        # UNC handle with Errno 22, so use a stable double-read snapshot.
+        remote_settings = read_json_snapshot(remote_path)
     except Exception as error:
         print(f"XXX Cannot update product settings from {remote_path}: {error}")
         return settings
@@ -5817,8 +6046,10 @@ def main_share_directories() -> dict[str, Path]:
     """Return local folders exposed by the main AutoChecker computer."""
     return {
         "downloads": Path.home() / "Downloads",
-        "photos": DESKTOP_DIR / "RETAIL" / "Photo",
-        "statistics": DESKTOP_DIR / "RETAIL" / "Statistik",
+        # Share the department roots so all current and future subfolders are
+        # immediately available without adding more SMB shares.
+        "retail": DESKTOP_DIR / "RETAIL",
+        "b2b": DESKTOP_DIR / "B2B",
         # Windows shares directories, not individual files. The project
         # folder is therefore exposed read-only and Settings.json stays at
         # its root.
@@ -5875,6 +6106,33 @@ def missing_main_network_shares() -> list[tuple[str, Path, bool]]:
     return missing
 
 
+def removable_legacy_network_shares() -> list[tuple[str, Path]]:
+    """Return only obsolete shares that still point to our old folders."""
+    import win32net
+
+    removable = []
+    for share_name, expected_path in LEGACY_SUPPORT_SHARES.items():
+        try:
+            share = win32net.NetShareGetInfo(None, share_name, 2)
+        except pywintypes.error as error:
+            if exception_windows_error_codes(error).intersection({2, 2310}):
+                continue
+            raise
+        actual_path = Path(str(share.get("path", "")))
+        try:
+            matches = actual_path.resolve() == expected_path.resolve()
+        except OSError:
+            matches = str(actual_path).casefold() == str(expected_path).casefold()
+        if matches:
+            removable.append((share_name, expected_path))
+        else:
+            print(
+                f"? Legacy share {share_name} points to {actual_path}; "
+                "it was not removed"
+            )
+    return removable
+
+
 def _powershell_single_quoted(value: object) -> str:
     """Quote one value for a PowerShell single-quoted string literal."""
     return "'" + str(value).replace("'", "''") + "'"
@@ -5882,6 +6140,7 @@ def _powershell_single_quoted(value: object) -> str:
 
 def network_share_setup_script(
     shares: list[tuple[str, Path, bool]],
+    legacy_shares: list[tuple[str, Path]],
 ) -> str:
     """Build an idempotent elevated script for SMB and NTFS permissions."""
     lines = [
@@ -5925,6 +6184,23 @@ def network_share_setup_script(
                 f"'*S-1-1-0:{ntfs_right}' /C | Out-Null"
             ),
             "if ($LASTEXITCODE -ne 0) { throw \"icacls failed: $sharePath\" }",
+        ))
+    for share_name, expected_path in legacy_shares:
+        share_literal = _powershell_single_quoted(share_name)
+        path_literal = _powershell_single_quoted(expected_path)
+        lines.extend((
+            f"$legacyName = {share_literal}",
+            f"$legacyPath = {path_literal}",
+            (
+                "$legacy = Get-SmbShare -Name $legacyName "
+                "-ErrorAction SilentlyContinue"
+            ),
+            (
+                "if ($null -ne $legacy -and "
+                "[IO.Path]::GetFullPath($legacy.Path).TrimEnd('\\') -eq "
+                "[IO.Path]::GetFullPath($legacyPath).TrimEnd('\\')) { "
+                "Remove-SmbShare -Name $legacyName -Force }"
+            ),
         ))
     return "\n".join(lines)
 
@@ -6303,15 +6579,24 @@ def ensure_main_network_shares(settings: dict) -> None:
         return
     try:
         missing = missing_main_network_shares()
+        legacy_shares = removable_legacy_network_shares()
     except Exception as error:
         print(f"XXX Cannot check network shares: {error}")
         return
-    if not missing:
+    if not missing and not legacy_shares:
         return
-    names = ", ".join(name for name, _path, _read_only in missing)
-    print(f"* Configuring network shares: {names}")
+    if missing:
+        names = ", ".join(name for name, _path, _read_only in missing)
+        print(f"* Configuring network shares: {names}")
+    if legacy_shares:
+        print(
+            "* Removing obsolete network shares: "
+            + ", ".join(name for name, _path in legacy_shares)
+        )
     try:
-        run_elevated_powershell(network_share_setup_script(missing))
+        run_elevated_powershell(
+            network_share_setup_script(missing, legacy_shares)
+        )
     except Exception as error:
         print(f"XXX Cannot configure network shares: {error}")
         return
@@ -6325,6 +6610,12 @@ def ensure_main_network_shares(settings: dict) -> None:
         print(
             "XXX Network shares are still unavailable: "
             + ", ".join(name for name, _path, _read_only in remaining)
+        )
+    remaining_legacy = removable_legacy_network_shares()
+    if remaining_legacy:
+        print(
+            "XXX Obsolete network shares are still available: "
+            + ", ".join(name for name, _path in remaining_legacy)
         )
 
 
@@ -6738,13 +7029,22 @@ def parse_orders_B2B(
     B2B_match_names: dict[str, str] = {}
     for line in lines[start_index:end_index]:
         match = re.fullmatch(r"(.+?)\s+(\d+(?:\+\d+)?)\s+(\d+)", line)
-        if not match:
+        gift_match = re.fullmatch(r"(.+?)\s+GIFT\s+(\d+)", line, re.IGNORECASE)
+        if match:
+            name, package_size, quantity = match.groups()
+            display_name = f"{name} - {package_size} fem"
+        elif gift_match:
+            # B2B invoices omit the package-size column for GIFT rows.  These
+            # are individual one-seed promotional packs, so keep them as a
+            # Bonus item (last-priority scan) and match the normal 1-fem code.
+            name, quantity = gift_match.groups()
+            package_size = "1"
+            display_name = f"{name} - Bonus {package_size} fem"
+        else:
             message = f"XXX Cannot parse B2B position: {line}"
             Printer(message)
             send(worker["DISPLAY"], message)
             return {}
-        name, package_size, quantity = match.groups()
-        display_name = f"{name} - {package_size} fem"
         resolved = resolve_B2B_catalog_product(name, config)
         if resolved is not None:
             catalog_name, catalog = resolved
@@ -7096,9 +7396,13 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
 
         statistics_dir = DESKTOP_DIR / department / "Statistik"
         mirror_dir = None
-        if department == "RETAIL" and support_mode_enabled(settings):
-            statistics_dir = configured_support_paths(settings)["statistics"]
-            mirror_dir = DESKTOP_DIR / "RETAIL" / "Statistik"
+        if support_mode_enabled(settings):
+            shared_paths = configured_support_paths(settings)
+            if department == "RETAIL":
+                statistics_dir = shared_paths["statistics"]
+                mirror_dir = DESKTOP_DIR / "RETAIL" / "Statistik"
+            elif department == "B2B":
+                statistics_dir = shared_paths["b2b"] / "Statistik"
         target = (
             statistics_dir / B2B_INDEX_FILENAME
             if department == "B2B"
@@ -7687,7 +7991,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             send(display, message)
 
         if identity.department.upper() == "B2B":
-            B2B_history = statistics_dir.parent / "History"
+            B2B_history = Path(worker["STATISTICS"]).parent / "History"
             B2B_history.mkdir(parents=True, exist_ok=True)
             worker["B2B_HISTORY"] = B2B_history
         # RETAIL uses the PDF order list. B2B will load its order PDF when it
@@ -8164,11 +8468,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                             if pdf_path is None:
                                 performance_stats.record_scan()
                                 performance_stats.record_mistake()
-                                if history_error == "archive_conflict":
-                                    message = (
-                                        f"XXX Order already exists in History: {code}"
-                                    )
-                                elif history_error == "move_failed":
+                                if history_error == "move_failed":
                                     message = (
                                         f"XXX Cannot move order PDF to History: {code}"
                                     )
@@ -8661,20 +8961,38 @@ def dispatcher() -> None:
 
     launcher_retail_worker = None
     launcher_console_started = False
-    try:
-        launcher_retail_worker = create_launcher_RETAIL_worker(settings)
-        process_pending_admin_download_files(launcher_retail_worker)
-        process_pending_RETAIL_order_sources(
-            launcher_retail_worker, settings
+    retail_monitor_last_error: str | None = None
+    retail_monitor_auth_blocked = SUPPORT_NETWORK_AUTH_BLOCKED
+    if retail_monitor_auth_blocked:
+        print(
+            "? RETAIL order monitor is paused until network credentials "
+            "are fixed and AutoChecker is restarted"
         )
-        process_pending_RETAIL_change_pdfs(
-            launcher_retail_worker, settings
-        )
-        process_pending_RETAIL_change_label_pdfs(
-            launcher_retail_worker
-        )
-    except Exception as error:
-        print(f"XXX RETAIL order monitor initialization failed: {error}")
+    else:
+        try:
+            launcher_retail_worker = create_launcher_RETAIL_worker(settings)
+            process_pending_admin_download_files(launcher_retail_worker)
+            process_pending_RETAIL_order_sources(
+                launcher_retail_worker, settings
+            )
+            process_pending_RETAIL_change_pdfs(
+                launcher_retail_worker, settings
+            )
+            process_pending_RETAIL_change_label_pdfs(
+                launcher_retail_worker
+            )
+        except Exception as error:
+            retail_monitor_last_error = str(error)
+            print(
+                "XXX RETAIL order monitor initialization failed: "
+                f"{error}"
+            )
+            if is_support_authentication_error(error):
+                retail_monitor_auth_blocked = True
+                print(
+                    "? RETAIL order monitor stopped its automatic network "
+                    "retries to prevent a Windows account lockout"
+                )
 
     if launcher_retail_worker is not None:
         threading.Thread(
@@ -8805,7 +9123,10 @@ def dispatcher() -> None:
                         display_ports.pop(display_number, None)
                         disconnected_ports_waiting_removal.add(port)
 
-            if time.monotonic() >= next_retail_order_scan:
+            if (
+                time.monotonic() >= next_retail_order_scan
+                and not retail_monitor_auth_blocked
+            ):
                 next_retail_order_scan = (
                     time.monotonic() + ORDER_SOURCE_SCAN_INTERVAL
                 )
@@ -8852,8 +9173,24 @@ def dispatcher() -> None:
                             worker_update_queues,
                             worker_identities,
                         )
+                    if retail_monitor_last_error is not None:
+                        print("* RETAIL order monitor connection restored")
+                        retail_monitor_last_error = None
                 except Exception as error:
-                    print(f"XXX RETAIL order monitor error: {error}")
+                    error_text = str(error)
+                    if error_text != retail_monitor_last_error:
+                        print(f"XXX RETAIL order monitor error: {error}")
+                        retail_monitor_last_error = error_text
+                    next_retail_order_scan = (
+                        time.monotonic() + ORDER_SOURCE_RETRY_INTERVAL
+                    )
+                    if is_support_authentication_error(error):
+                        retail_monitor_auth_blocked = True
+                        print(
+                            "? RETAIL order monitor stopped its automatic "
+                            "network retries to prevent a Windows account "
+                            "lockout; fix credentials and restart AutoChecker"
+                        )
 
             if time.monotonic() >= next_port_scan:
                 try:
@@ -9514,9 +9851,12 @@ if __name__ == "__main__":
     ensure_windows_protected_print_disabled()
     startup_settings = ensure_settings_schema()
     if support_mode_enabled(startup_settings):
-        startup_settings = synchronize_support_catalog_settings(
-            startup_settings
-        )
+        if connect_support_network_session(startup_settings):
+            startup_settings = synchronize_support_catalog_settings(
+                startup_settings
+            )
+        else:
+            print("? Product settings were not updated from the main computer")
     else:
         ensure_main_network_shares(startup_settings)
     sync_order_label_templates()
