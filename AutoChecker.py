@@ -2214,6 +2214,14 @@ def Printer(message: str) -> None:
     print(message)
 
 
+def print_console_red(message: str) -> None:
+    """Print one high-priority console warning in red when interactive."""
+    if sys.stdout and sys.stdout.isatty():
+        print(f"\033[91m{message}\033[0m")
+    else:
+        print(message)
+
+
 def cleanup_old_photos(folder: Path, older_days: int = 120,
                        extensions: set[str] | None = None) -> int:
     """Move old files (optionally filtered by extension) to the Recycle Bin."""
@@ -3207,22 +3215,26 @@ def RETAIL_UP_ready_statistics_line(worker: dict, order_id: str) -> str:
     return matching_line
 
 
+class RETAILTrackingNumberEmptyError(LookupError):
+    """A non-Postal order has no tracking number in RETAIL statistics."""
+
+
 def RETAIL_UP_tracking_from_order_line(order_id: str, line: str) -> str:
-    """Extract and normalize the tracking prefix from one statistics line."""
+    """Extract tracking while treating the explicit delivery field as truth."""
     normalized_order = order_id.strip()
-    order_position = line.find(normalized_order)
-    if order_position < 0:
+    if retail_order_id_from_stat_line(line) != normalized_order:
         raise LookupError(
             f"Order {normalized_order} is missing from its statistics line"
         )
-    prefix = line[:order_position].strip()
-    tracking_number = prefix.split(maxsplit=1)[0] if prefix else ""
-    tracking_number = re.sub(r"[^A-Za-z0-9]", "", tracking_number).upper()
-    is_ups = bool(re.fullmatch(r"1ZR[A-Z0-9]+", tracking_number))
-    is_zasilkovna = bool(re.fullmatch(r"Z\d{5,}", tracking_number))
-    if not (is_ups or is_zasilkovna):
+    delivery = RETAIL_delivery_from_stat_line(line)
+    tracking_number = RETAIL_tracking_from_stat_line(line)
+    if tracking_number:
+        return tracking_number
+    if delivery == "Postal":
         raise LookupError(f"Order {normalized_order} is Postal")
-    return tracking_number
+    raise RETAILTrackingNumberEmptyError(
+        f"Order {normalized_order} tracking number is empty"
+    )
 
 
 def RETAIL_UP_tracking_from_statistics(
@@ -3346,15 +3358,10 @@ def RETAIL_UP_shipping_progress_by_delivery_from_lines(
         ):
             continue
 
-        order_position = line.find(order_id)
-        prefix = line[:order_position].strip() if order_position >= 0 else ""
-        first_value = prefix.split(maxsplit=1)[0] if prefix else ""
-        tracking_number = re.sub(
-            r"[^A-Za-z0-9]", "", first_value
-        ).upper()
-        if tracking_number.startswith("1ZR"):
+        delivery = RETAIL_delivery_from_stat_line(line)
+        if delivery == "UPS":
             completed_ups += 1
-        elif re.match(r"^Z\d{5,}", tracking_number):
+        elif delivery == "Zasilkovna":
             completed_zasilkovna += 1
         else:
             completed_postal += 1
@@ -4252,33 +4259,43 @@ def submit_RETAIL_UP_label(
     printer_name = str(worker.get("PRINTER", "")).strip()
     ready_line = RETAIL_UP_ready_statistics_line(worker, order_id)
     changed_label = find_RETAIL_UP_change_label_page(worker, order_id)
+
+    postal_order = False
+    tracking_missing = False
+    try:
+        tracking_number = RETAIL_UP_tracking_from_order_line(
+            order_id, ready_line
+        )
+    except RETAILTrackingNumberEmptyError:
+        tracking_number = ""
+        tracking_missing = True
+    except LookupError as error:
+        if str(error) != f"Order {order_id.strip()} is Postal":
+            raise
+        tracking_number = ""
+        postal_order = True
+
     if (
-        changed_label is None
+        not tracking_missing
+        and changed_label is None
         and retail_stat_latest_change_kind(ready_line) == "Label"
     ):
         raise FileNotFoundError(
             f"Change Label PDF not found for {order_id.strip()}"
         )
 
-    postal_order = False
-    if changed_label is not None:
+    if tracking_missing:
+        # The explicit UPS/Zasilkovna field is authoritative. Record the
+        # packer, but never pretend that a missing label is a Postal order.
+        changed_label = None
+    elif changed_label is not None:
         pdf_path, page_number, label_type = changed_label
-    else:
-        try:
-            tracking_number = RETAIL_UP_tracking_from_order_line(
-                order_id, ready_line
-            )
-        except LookupError as error:
-            if str(error) != f"Order {order_id.strip()} is Postal":
-                raise
-            tracking_number = ""
-            postal_order = True
-        if printer_name and not postal_order:
-            pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
-                worker, tracking_number
-            )
+    elif printer_name and not postal_order:
+        pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
+            worker, tracking_number
+        )
 
-    if printer_name and not postal_order:
+    if printer_name and not postal_order and not tracking_missing:
         print_pdf_page(pdf_path, page_number, printer_name, label_type)
         physically_printed = True
     else:
@@ -4289,7 +4306,9 @@ def submit_RETAIL_UP_label(
     duplicate_print = append_RETAIL_UP_print_name(
         worker, order_id, recorded_name
     )
-    if physically_printed:
+    if tracking_missing:
+        status_message = "XXX tracking number is empty"
+    elif physically_printed:
         status_message = (
             f"? Dublicate print label {order_id.lstrip('#')} "
             f"page {page_number}"
@@ -4735,6 +4754,41 @@ def retail_order_id_from_stat_line(text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def RETAIL_delivery_from_tracking_number(tracking_number: object) -> str:
+    """Infer delivery only for legacy lines that have no explicit field."""
+    normalized = normalize_RETAIL_UP_tracking_number(str(tracking_number))
+    if re.fullmatch(r"1ZR[A-Z0-9]+", normalized):
+        return "UPS"
+    if re.fullmatch(r"Z\d{5,}", normalized):
+        return "Zasilkovna"
+    return "Postal"
+
+
+def RETAIL_stat_prefix_values(line: str) -> tuple[str, str]:
+    """Return explicit delivery and tracking from old or new stat formats."""
+    order_id = retail_order_id_from_stat_line(line)
+    order_position = line.find(order_id) if order_id is not None else -1
+    prefix = line[:order_position].strip() if order_position >= 0 else ""
+    values = prefix.split()
+    explicit_delivery = (
+        normalize_RETAIL_delivery(values[0]) if values else ""
+    )
+    tracking_index = 1 if explicit_delivery else 0
+    tracking_number = ""
+    if len(values) > tracking_index:
+        candidate = normalize_RETAIL_UP_tracking_number(
+            values[tracking_index]
+        )
+        if RETAIL_delivery_from_tracking_number(candidate) != "Postal":
+            tracking_number = candidate
+    return explicit_delivery, tracking_number
+
+
+def RETAIL_tracking_from_stat_line(line: str) -> str:
+    """Return the normalized tracking number without guessing from names."""
+    return RETAIL_stat_prefix_values(line)[1]
+
+
 def retail_stat_order_suffix(text: str) -> str:
     """Return only assembler/status text following the RETAIL order number."""
     match = re.search(r"(?<!\S)#\d+(?=\s|$)", text)
@@ -4890,6 +4944,15 @@ def retail_stat_metadata_values(metadata: dict) -> tuple[str, str]:
     return tracking_number, customer_name
 
 
+def retail_stat_shipping_value(metadata: dict) -> str:
+    """Return the visible `Delivery TrackNumber` statistics field."""
+    tracking_number, _customer_name = retail_stat_metadata_values(metadata)
+    delivery = normalize_RETAIL_delivery(metadata.get("delivery", ""))
+    if not delivery:
+        delivery = RETAIL_delivery_from_tracking_number(tracking_number)
+    return f"{delivery} {tracking_number}".rstrip()
+
+
 def normalize_RETAIL_delivery(value: object) -> str:
     """Return the canonical supported delivery name, or an empty string."""
     normalized = str(value).strip().casefold()
@@ -4946,17 +5009,18 @@ def RETAIL_part_totals(
 
 
 def retail_stat_order_prefix(order_id: str, metadata: dict, *,
-                             tracking_width: int | None = None,
+                             shipping_width: int | None = None,
                              customer_width: int | None = None) -> str:
-    tracking_number, customer_name = retail_stat_metadata_values(metadata)
-    tracking_width = (
-        len(tracking_number) if tracking_width is None else tracking_width
+    _tracking_number, customer_name = retail_stat_metadata_values(metadata)
+    shipping_value = retail_stat_shipping_value(metadata)
+    shipping_width = (
+        len(shipping_value) if shipping_width is None else shipping_width
     )
     customer_width = (
         len(customer_name) if customer_width is None else customer_width
     )
     return (
-        f"{tracking_number:<{tracking_width}}   "
+        f"{shipping_value:<{shipping_width}}   "
         f"{customer_name:<{customer_width}}   {order_id}"
     )
 
@@ -4981,15 +5045,20 @@ def save_part_to_statistics(
         parsed_orders,
         metadata_by_order,
     )
-    tracking_width = max(
-        (len(values[0]) for values in metadata_values.values()),
+    shipping_width = max(
+        (
+            len(retail_stat_shipping_value(
+                metadata_by_order.get(order_id, {})
+            ))
+            for order_id in parsed_orders
+        ),
         default=0,
     )
     customer_width = max(
         (len(values[1]) for values in metadata_values.values()),
         default=0,
     )
-    natural_order_column = tracking_width + 3 + customer_width + 3
+    natural_order_column = shipping_width + 3 + customer_width + 3
     order_column = max(natural_order_column, len(header_prefix) + 3)
     customer_width += order_column - natural_order_column
     header = (
@@ -5016,7 +5085,7 @@ def save_part_to_statistics(
                 retail_stat_order_prefix(
                     order_id,
                     metadata_by_order.get(order_id, {}),
-                    tracking_width=tracking_width,
+                    shipping_width=shipping_width,
                     customer_width=customer_width,
                 ) + "\n"
                 for order_id in ordered_order_ids
@@ -5050,7 +5119,7 @@ def save_part_to_statistics(
                 prefix = retail_stat_order_prefix(
                     order_id,
                     metadata_by_order.get(order_id, {}),
-                    tracking_width=tracking_width,
+                    shipping_width=shipping_width,
                     customer_width=customer_width,
                 )
                 existing_index = existing_indexes.get(order_id)
@@ -5098,6 +5167,99 @@ def save_part_to_statistics(
         file.writelines(lines)
         file.flush()
         mirror_statistics_lines(worker, stat_file, lines)
+
+
+def migrate_RETAIL_statistics_delivery_fields(
+    worker: dict,
+    metadata_by_order: dict[str, dict],
+) -> bool:
+    """Add the explicit Delivery field to existing RETAIL order lines."""
+    if not metadata_by_order:
+        return False
+    stat_file = retail_statistics_file(worker)
+    if not stat_file.is_file():
+        return False
+
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        order_ids = [
+            order_id
+            for line in lines
+            if (order_id := retail_order_id_from_stat_line(line))
+            in metadata_by_order
+        ]
+        if not order_ids:
+            return False
+
+        shipping_width = max(
+            len(retail_stat_shipping_value(metadata_by_order[order_id]))
+            for order_id in order_ids
+        )
+        customer_width = max(
+            len(retail_stat_metadata_values(metadata_by_order[order_id])[1])
+            for order_id in order_ids
+        )
+        header_prefixes = [
+            match.group(1)
+            for line in lines
+            if (
+                match := re.match(
+                    r"^(----------.*?\.pdf----------)",
+                    line.rstrip("\r\n"),
+                    re.IGNORECASE,
+                )
+            )
+        ]
+        natural_order_column = shipping_width + 3 + customer_width + 3
+        order_column = max(
+            natural_order_column,
+            max((len(prefix) + 3 for prefix in header_prefixes), default=0),
+        )
+        customer_width += order_column - natural_order_column
+
+        changed = False
+        for index, line in enumerate(lines):
+            raw_text = line.rstrip("\r\n")
+            order_id = retail_order_id_from_stat_line(raw_text)
+            if order_id in metadata_by_order:
+                order_match = re.search(
+                    rf"(?<!\S){re.escape(order_id)}(?=\s|$)",
+                    raw_text,
+                )
+                suffix = raw_text[order_match.end():] if order_match else ""
+                replacement = retail_stat_order_prefix(
+                    order_id,
+                    metadata_by_order[order_id],
+                    shipping_width=shipping_width,
+                    customer_width=customer_width,
+                ) + suffix
+                if replacement != raw_text:
+                    lines[index] = replacement + "\n"
+                    changed = True
+                continue
+
+            header_match = re.match(
+                r"^(----------.*?\.pdf----------)\s*(Pack:.*)$",
+                raw_text,
+                re.IGNORECASE,
+            )
+            if header_match is not None:
+                replacement = (
+                    f"{header_match.group(1):<{order_column}}"
+                    f"{header_match.group(2)}"
+                )
+                if replacement != raw_text:
+                    lines[index] = replacement + "\n"
+                    changed = True
+
+        if changed:
+            file.seek(0)
+            file.truncate()
+            file.writelines(lines)
+            file.flush()
+            mirror_statistics_lines(worker, stat_file, lines)
+        return changed
 
 
 def find_RETAIL_pdf_statistics_section(
@@ -5390,6 +5552,33 @@ def decode_RETAIL_order_cache(
     return parsed, metadata_by_order
 
 
+def warn_RETAIL_orders_without_tracking(
+    metadata_by_order: dict[str, dict],
+) -> list[str]:
+    """Sound and report UPS/Packeta orders missing their tracking number."""
+    missing_orders = [
+        order_id
+        for order_id, metadata in metadata_by_order.items()
+        if normalize_RETAIL_delivery(metadata.get("delivery", ""))
+        in {"UPS", "Zasilkovna"}
+        and not normalize_RETAIL_UP_tracking_number(
+            metadata.get("tracking_number", "")
+        )
+    ]
+    if not missing_orders:
+        return []
+
+    play_launcher_sound("ups")
+    for order_id in missing_orders:
+        delivery = normalize_RETAIL_delivery(
+            metadata_by_order[order_id].get("delivery", "")
+        )
+        print_console_red(
+            f"XXX Order without tracking number: {order_id} ({delivery})"
+        )
+    return missing_orders
+
+
 def load_or_create_RETAIL_order_cache(
     pdf_path: Path,
     config: dict,
@@ -5412,6 +5601,7 @@ def load_or_create_RETAIL_order_cache(
         parsed, metadata_by_order = parse_RETAIL_pdf_document(pdf_path, config)
         if not parsed:
             raise ValueError(f"No RETAIL orders found in {pdf_path.name}")
+        warn_RETAIL_orders_without_tracking(metadata_by_order)
         document = RETAIL_order_cache_document(parsed, metadata_by_order)
         file.seek(0)
         file.truncate()
@@ -5499,6 +5689,10 @@ def load_RETAIL_orders_from_statistics(
         for order_id in ordered_ids
         if order_id in loaded_orders
     }
+    migrate_RETAIL_statistics_delivery_fields(
+        worker,
+        worker["RETAIL_ORDER_META"],
+    )
     return OrderedDict(
         (order_id, loaded_orders[order_id])
         for order_id in ordered_ids
@@ -7201,17 +7395,11 @@ def update_order_in_statistics(worker: dict, order_id: str, *, add_name: bool = 
 
 
 def RETAIL_delivery_from_stat_line(line: str) -> str:
-    """Classify a statistics order as UPS, Zasilkovna or Postal."""
-    order_id = retail_order_id_from_stat_line(line)
-    order_position = line.find(order_id) if order_id is not None else -1
-    prefix = line[:order_position].strip() if order_position >= 0 else ""
-    first_value = prefix.split(maxsplit=1)[0] if prefix else ""
-    tracking_number = re.sub(r"[^A-Za-z0-9]", "", first_value).upper()
-    if tracking_number.startswith("1ZR"):
-        return "UPS"
-    if re.match(r"^Z\d{5,}", tracking_number):
-        return "Zasilkovna"
-    return "Postal"
+    """Classify by the explicit first field, with legacy-track fallback."""
+    explicit_delivery, tracking_number = RETAIL_stat_prefix_values(line)
+    if explicit_delivery:
+        return explicit_delivery
+    return RETAIL_delivery_from_tracking_number(tracking_number)
 
 
 def reserve_next_RETAIL_order(worker: dict, orders: dict) -> str | None:
@@ -7645,7 +7833,7 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
         for name, quantity in orders[current_order]
     )
 
-    if regular_ready and code in config.get("OTHER_BONUS", {}):
+    if (is_B2B or regular_ready) and code in config.get("OTHER_BONUS", {}):
         product_name = config["OTHER_BONUS"][code]
 
     item_name, quantity = (
@@ -7654,7 +7842,9 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
             product_name,
             B2B_match_names,
             counts,
-            allow_bonus=regular_ready,
+            # RETAIL deliberately keeps Bonus positions until all normal
+            # positions are complete. B2B has no scan-order restriction.
+            allow_bonus=is_B2B or regular_ready,
         )
         if product_name else (None, None)
     )
@@ -8650,6 +8840,9 @@ def create_launcher_RETAIL_worker(settings: dict) -> dict:
     }
     configure_worker_storage(worker, settings)
     synchronize_support_statistics(worker)
+    # Besides loading known orders, this upgrades existing statistics lines
+    # to the explicit `Delivery TrackNumber` prefix on launcher startup.
+    load_RETAIL_orders_from_statistics(worker, settings)
     return worker
 
 
