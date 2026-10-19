@@ -167,7 +167,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.20"
+CURRENT_VERSION = "3.22"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -255,16 +255,6 @@ DYMO_STEALTH_ORDER_LABEL_URL = (
     "main/DYMO%20STEALTH%20Etiketka.dymo"
 )
 
-DISPLAY_VERSION_URL = (
-    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
-    "main/Display_version.txt"
-)
-DISPLAY_BUILD_URL = (
-    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
-    "main/build/esp32.esp32.esp32s3"
-)
-DISPLAY_APP_FILENAME = "Display.ino.bin"
-DISPLAY_PARTITIONS_FILENAME = "Display.ino.partitions.bin"
 DISPLAY_FLASH_BAUDRATE = 460800
 DISPLAY_UPDATE_TIMEOUT = 180
 DISPLAY_RESTART_TIMEOUT = 12.0
@@ -280,12 +270,47 @@ DYMO_ORDER_LABEL_TEMPLATE = BASE_DIR / "DYMO Etiketka.dymo"
 DYMO_STEALTH_ORDER_LABEL_TEMPLATE = BASE_DIR / "DYMO STEALTH Etiketka.dymo"
 DYMO_ROLL_SELECTED = 2
 DYMO_PRINT_DELAY = 1.0
-EXPECTED_DISPLAY_APP_SLOTS = (
+EXPECTED_CYD_APP_SLOTS = (
     (0x10000, 0x140000, "app0"),
     (0x150000, 0x140000, "app1"),
 )
+EXPECTED_BYD_APP_SLOTS = (
+    (0x10000, 0x300000, "app0"),
+    (0x310000, 0x300000, "app1"),
+)
+DISPLAY_FIRMWARE_CONFIG = {
+    "CYD": {
+        "version_url": (
+            "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+            "main/CYD/Display_version.txt"
+        ),
+        "build_url": (
+            "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+            "main/CYD/build/esp32.esp32.esp32s3"
+        ),
+        "app_filename": "Display.ino.bin",
+        "partitions_filename": "Display.ino.partitions.bin",
+        "chip": "esp32s3",
+        "expected_app_slots": EXPECTED_CYD_APP_SLOTS,
+    },
+    "BYD": {
+        "version_url": (
+            "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+            "main/BYD/Display_version.txt"
+        ),
+        "build_url": (
+            "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+            "main/BYD/build/esp32.esp32.esp32p4"
+        ),
+        "app_filename": "P4_V2_Test.ino.bin",
+        "partitions_filename": "P4_V2_Test.ino.partitions.bin",
+        "chip": "esp32p4",
+        "expected_app_slots": EXPECTED_BYD_APP_SLOTS,
+    },
+}
 DISPLAY_HANDSHAKE_PATTERN = re.compile(
-    r"Display:([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5});([^;\s]+)",
+    r"Display:([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5});"
+    r"([^;\s]+)(?:;(CYD|BYD))?",
     re.IGNORECASE,
 )
 
@@ -294,7 +319,7 @@ DISPLAY_HANDSHAKE_PATTERN = re.compile(
 PDF_HISTORY_CURSOR: Path | None = None
 OTHER_CACHE_SIGNATURE: tuple[int, int] | None = None
 OTHER_CACHE_RULES: list[tuple[str, str]] = []
-DISPLAY_FIRMWARE_CACHE: tuple[bytes, bytes] | None = None
+DISPLAY_FIRMWARE_CACHE: dict[str, tuple[bytes, bytes]] = {}
 
 
 def _version_key(version: str) -> tuple[int, ...] | None:
@@ -466,20 +491,25 @@ def load_label_ocr_processor():
     return process_pending_label_pdfs
 
 
-def get_latest_display_version() -> str | None:
-    """Return the published display firmware version, or None when offline."""
-    try:
-        response = requests.get(DISPLAY_VERSION_URL, timeout=5)
-        response.raise_for_status()
-        version = response.text.strip()
-        if _version_key(version) is None:
-            print(f"XXX Invalid display update version: {version!r}")
-            return None
-        print(f"* Latest display firmware version: {version}")
-        return version
-    except requests.RequestException as error:
-        print(f"XXX Display update check failed: {error}")
-        return None
+def get_latest_display_versions() -> dict[str, str]:
+    """Return published firmware versions keyed by CYD/BYD display type."""
+    versions: dict[str, str] = {}
+    for display_type, config in DISPLAY_FIRMWARE_CONFIG.items():
+        try:
+            response = requests.get(str(config["version_url"]), timeout=5)
+            response.raise_for_status()
+            version = response.text.strip()
+            if _version_key(version) is None:
+                print(
+                    f"XXX Invalid {display_type} display update version: "
+                    f"{version!r}"
+                )
+                continue
+            versions[display_type] = version
+            print(f"* Latest {display_type} display firmware version: {version}")
+        except requests.RequestException as error:
+            print(f"XXX {display_type} display update check failed: {error}")
+    return versions
 
 
 def normalise_display_mac(value: str) -> str | None:
@@ -490,15 +520,22 @@ def normalise_display_mac(value: str) -> str | None:
     return ":".join(compact[index:index + 2] for index in range(0, 12, 2)).upper()
 
 
-def _download_display_firmware() -> tuple[bytes, bytes]:
-    """Download and validate the application image and its partition table once."""
-    global DISPLAY_FIRMWARE_CACHE
-    if DISPLAY_FIRMWARE_CACHE is not None:
-        return DISPLAY_FIRMWARE_CACHE
+def _download_display_firmware(display_type: str) -> tuple[bytes, bytes]:
+    """Download and validate one display type's firmware artifacts once."""
+    display_type = display_type.upper()
+    config = DISPLAY_FIRMWARE_CONFIG.get(display_type)
+    if config is None:
+        raise RuntimeError(f"Unsupported display type: {display_type}")
+    if display_type in DISPLAY_FIRMWARE_CACHE:
+        return DISPLAY_FIRMWARE_CACHE[display_type]
 
     downloaded: list[bytes] = []
-    for filename in (DISPLAY_APP_FILENAME, DISPLAY_PARTITIONS_FILENAME):
-        response = requests.get(f"{DISPLAY_BUILD_URL}/{filename}", timeout=30)
+    filenames = (
+        str(config["app_filename"]),
+        str(config["partitions_filename"]),
+    )
+    for filename in filenames:
+        response = requests.get(f"{config['build_url']}/{filename}", timeout=30)
         response.raise_for_status()
         if not response.content:
             raise RuntimeError(f"Downloaded firmware file is empty: {filename}")
@@ -506,12 +543,14 @@ def _download_display_firmware() -> tuple[bytes, bytes]:
 
     application, partitions = downloaded
     if application[0] != 0xE9:
-        raise RuntimeError("Display.ino.bin is not an ESP application image")
+        raise RuntimeError(
+            f"{config['app_filename']} is not an ESP application image"
+        )
     if len(partitions) < 32 or partitions[:2] != b"\xAA\x50":
         raise RuntimeError("Display partition table has an invalid format")
 
-    DISPLAY_FIRMWARE_CACHE = application, partitions
-    return DISPLAY_FIRMWARE_CACHE
+    DISPLAY_FIRMWARE_CACHE[display_type] = application, partitions
+    return DISPLAY_FIRMWARE_CACHE[display_type]
 
 
 def _application_partitions(partitions: bytes) -> list[tuple[int, int, str]]:
@@ -531,18 +570,24 @@ def _application_partitions(partitions: bytes) -> list[tuple[int, int, str]]:
     return result
 
 
-def update_display_firmware(port: str, display_mac: str,
+def update_display_firmware(port: str, display_mac: str, display_type: str,
                             latest_version: str) -> bool:
     """Flash the application into every app slot without erasing NVS."""
     try:
-        application, partition_data = _download_display_firmware()
+        display_type = display_type.upper()
+        config = DISPLAY_FIRMWARE_CONFIG.get(display_type)
+        if config is None:
+            raise RuntimeError(f"Unsupported display type: {display_type}")
+
+        application, partition_data = _download_display_firmware(display_type)
         app_slots = _application_partitions(partition_data)
         if not app_slots:
             raise RuntimeError("No application slots found in partition table")
-        if tuple(app_slots) != EXPECTED_DISPLAY_APP_SLOTS:
+        expected_app_slots = config["expected_app_slots"]
+        if expected_app_slots is not None and tuple(app_slots) != expected_app_slots:
             raise RuntimeError(
-                "Display partition layout changed; perform one manual full flash "
-                "before enabling automatic updates"
+                f"{display_type} display partition layout changed; perform one "
+                "manual full flash before enabling automatic updates"
             )
         oversized = [label for _, size, label in app_slots if len(application) > size]
         if oversized:
@@ -551,14 +596,14 @@ def update_display_firmware(port: str, display_mac: str,
             )
 
         with tempfile.TemporaryDirectory(prefix="AutoChecker-display-") as temp_dir:
-            firmware_path = Path(temp_dir) / DISPLAY_APP_FILENAME
+            firmware_path = Path(temp_dir) / str(config["app_filename"])
             firmware_path.write_bytes(application)
             command = [
                 sys.executable,
                 "-m",
                 "esptool",
                 "--chip",
-                "esp32s3",
+                str(config["chip"]),
                 "--port",
                 port,
                 "--baud",
@@ -573,15 +618,18 @@ def update_display_firmware(port: str, display_mac: str,
                 command.extend((hex(offset), str(firmware_path)))
 
             print(
-                f"* Updating display {display_mac} on {port} "
+                f"* Updating {display_type} display {display_mac} on {port} "
                 f"to firmware {latest_version}"
             )
             subprocess.run(command, check=True, timeout=DISPLAY_UPDATE_TIMEOUT)
-        print(f"* Display {display_mac} firmware update completed")
+        print(f"* {display_type} display {display_mac} firmware update completed")
         return True
     except (requests.RequestException, OSError, subprocess.SubprocessError,
             RuntimeError) as error:
-        print(f"XXX Display {display_mac} firmware update failed: {error}")
+        print(
+            f"XXX {display_type} display {display_mac} firmware update failed: "
+            f"{error}"
+        )
         return False
 
 
@@ -1073,8 +1121,8 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
     return settings
 
 
-def _probe_autochecker_display(port: str) -> tuple[str, str] | None:
-    """Ask one COM device for its MAC and firmware version."""
+def _probe_autochecker_display(port: str) -> tuple[str, str, str] | None:
+    """Ask one COM device for its MAC, firmware version, and CYD/BYD type."""
     display = None
     try:
         print(f"? Checking display port: {port}")
@@ -1107,17 +1155,24 @@ def _probe_autochecker_display(port: str) -> tuple[str, str] | None:
                 if _version_key(version) is None:
                     print(f"XXX {port} returned invalid firmware version: {version!r}")
                     return None
+                display_type = (match.group(3) or "CYD").upper()
+                if match.group(3) is None:
+                    print(
+                        f"? Display {display_mac} uses the two-field legacy "
+                        "handshake; treating it as CYD"
+                    )
                 print(
-                    f"* Display found: {display_mac} ({port}), firmware {version}"
+                    f"* {display_type} display found: {display_mac} ({port}), "
+                    f"firmware {version}"
                 )
-                return display_mac, version
+                return display_mac, version, display_type
 
             legacy = re.fullmatch(r"AutoChecker\s+(\d+)", answer, re.IGNORECASE)
             if legacy:
                 print(
                     f"XXX Display on {port} uses the old AutoChecker "
                     f"{legacy.group(1)} handshake; flash firmware that replies "
-                    "Display:{MAC};{version}"
+                    "Display:{MAC};{version};{CYD|BYD}"
                 )
                 return None
         if answers:
@@ -1131,14 +1186,17 @@ def _probe_autochecker_display(port: str) -> tuple[str, str] | None:
     return None
 
 
-def identify_autochecker_display(port: str,
-                                 latest_version: str | None) -> str | None:
+def identify_autochecker_display(
+    port: str,
+    latest_versions: dict[str, str],
+) -> str | None:
     """Identify a display, update old firmware, and return its stable MAC."""
     identity = _probe_autochecker_display(port)
     if identity is None:
         return None
 
-    display_mac, installed_version = identity
+    display_mac, installed_version, display_type = identity
+    latest_version = latest_versions.get(display_type)
     installed_key = _version_key(installed_version)
     latest_key = _version_key(latest_version) if latest_version is not None else None
     if (
@@ -1146,7 +1204,12 @@ def identify_autochecker_display(port: str,
         and latest_key is not None
         and latest_key > installed_key
     ):
-        if update_display_firmware(port, display_mac, latest_version):
+        if update_display_firmware(
+            port,
+            display_mac,
+            display_type,
+            latest_version,
+        ):
             # esptool resets the board. Confirm both its identity and the version
             # before the launcher hands the port to normal serial processing.
             deadline = time.monotonic() + DISPLAY_RESTART_TIMEOUT
@@ -1163,11 +1226,17 @@ def identify_autochecker_display(port: str,
                     f"XXX Display {display_mac} did not answer after firmware update"
                 )
                 return None
-            updated_mac, updated_version = updated_identity
+            updated_mac, updated_version, updated_type = updated_identity
             if updated_mac != display_mac:
                 print(
                     f"XXX Display MAC changed after update: "
                     f"{display_mac} -> {updated_mac}"
+                )
+                return None
+            if updated_type != display_type:
+                print(
+                    f"XXX Display type changed after update: "
+                    f"{display_type} -> {updated_type}"
                 )
                 return None
             if _version_key(updated_version) < latest_key:
@@ -1182,13 +1251,15 @@ def identify_autochecker_display(port: str,
     return display_mac
 
 
-def find_autochecker_displays(latest_version: str | None) -> dict[str, str]:
+def find_autochecker_displays(
+    latest_versions: dict[str, str],
+) -> dict[str, str]:
     """Return {display MAC: COM port} from the <WHO?> handshake."""
     displays: dict[str, str] = {}
     for port_info in list_ports.comports():
         display_mac = identify_autochecker_display(
             port_info.device,
-            latest_version,
+            latest_versions,
         )
         if display_mac is not None:
             displays[display_mac] = port_info.device
@@ -4462,8 +4533,9 @@ def _format_B2B_progress_section(
     extras: defaultdict,
     no_barcode_items: list[tuple[str, int]],
     contributors: dict[str, list[str]],
+    errors: set[str],
 ) -> list[str]:
-    """Build aligned status/name columns for one B2B order."""
+    """Build aligned B2B position rows followed by recorded scan errors."""
     rows = []
     for name, quantity in items:
         if (name, quantity) in no_barcode_items:
@@ -4491,14 +4563,16 @@ def _format_B2B_progress_section(
     section = [header + "\n"]
     for left_text, (_, _, names, _) in zip(status_and_names, rows):
         section.append(f"{left_text:<{name_column_end}}    NAME: {names}\n")
+    section.extend(f"XXX {error}\n" for error in sorted(errors, key=str.casefold))
     section.append("\n")
     return section
 
 
 def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaultdict,
                       extras: defaultdict,
+                      errors: set[str],
                       no_barcode_items: list[tuple[str, int]]) -> None:
-    """Restore counts and contributor names, creating the section if needed."""
+    """Restore counts, contributors and scan errors, creating the section if needed."""
     stat_file = worker["ACTIVE_STAT_FILE"]
     header = f"----------{worker['B2B_PDF_NAME']}----------"
     contributors: dict[str, list[str]] = {}
@@ -4512,7 +4586,8 @@ def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
                 file.write("\n")
             file.writelines(
                 _format_B2B_progress_section(
-                    header, items, counts, extras, no_barcode_items, contributors
+                    header, items, counts, extras, no_barcode_items, contributors,
+                    errors,
                 )
             )
             file.flush()
@@ -4522,6 +4597,12 @@ def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
             match_names = worker.get("B2B_MATCH_NAMES", {})
             last_item_name = None
             for line in lines[start + 1:end]:
+                stripped_line = line.strip()
+                if stripped_line.startswith("XXX "):
+                    error_text = stripped_line[4:].strip()
+                    if error_text:
+                        errors.add(error_text)
+                    continue
                 if "NAME:" not in line:
                     continue
                 status_text, names_text = line.rstrip("\n").split("NAME:", 1)
@@ -4570,8 +4651,10 @@ def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
 
 def save_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaultdict,
                       extras: defaultdict,
-                      no_barcode_items: list[tuple[str, int]], changed_item: str | None = None) -> None:
-    """Atomically rewrite one B2B order section with current position progress."""
+                      errors: set[str],
+                      no_barcode_items: list[tuple[str, int]],
+                      changed_item: str | None = None) -> None:
+    """Atomically rewrite one B2B order section with progress and scan errors."""
     contributors = worker.setdefault("B2B_POSITION_NAMES", {})
     if changed_item is not None:
         names = contributors.setdefault(changed_item, [])
@@ -4581,7 +4664,7 @@ def save_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
     stat_file = worker["ACTIVE_STAT_FILE"]
     header = f"----------{worker['B2B_PDF_NAME']}----------"
     section = _format_B2B_progress_section(
-        header, items, counts, extras, no_barcode_items, contributors
+        header, items, counts, extras, no_barcode_items, contributors, errors
     )
 
     with _locked_statistics_file(stat_file) as file:
@@ -5847,44 +5930,93 @@ def network_share_setup_script(
 
 
 def run_elevated_powershell(script: str) -> None:
-    """Run one PowerShell script, requesting UAC only when necessary."""
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    """Run an elevated PowerShell script and preserve its real error text."""
+    result_handle, result_name = tempfile.mkstemp(
+        prefix="AutoChecker-elevated-",
+        suffix=".json",
+    )
+    os.close(result_handle)
+    result_file = Path(result_name)
+    result_file.unlink(missing_ok=True)
+    result_path = _powershell_single_quoted(str(result_file))
+    wrapped_script = "\n".join((
+        "$ErrorActionPreference = 'Stop'",
+        "try {",
+        "    & {",
+        "        " + script.replace("\n", "\n        "),
+        "    }",
+        "    $result = @{ ok = $true; error = ''; details = '' }",
+        "} catch {",
+        "    $result = @{",
+        "        ok = $false",
+        "        error = $_.Exception.Message",
+        "        details = ($_ | Out-String)",
+        "    }",
+        "}",
+        (
+            "$result | ConvertTo-Json -Compress | Set-Content "
+            f"-LiteralPath {result_path} -Encoding UTF8"
+        ),
+        "if (-not $result.ok) { exit 1 }",
+    ))
+    encoded = base64.b64encode(
+        wrapped_script.encode("utf-16-le")
+    ).decode("ascii")
     arguments = (
         "-NoProfile -NonInteractive -ExecutionPolicy Bypass "
         f"-EncodedCommand {encoded}"
     )
-    if ctypes.windll.shell32.IsUserAnAdmin():
-        subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-EncodedCommand",
-                encoded,
-            ],
-            check=True,
-        )
-        return
-
-    process_info = shell.ShellExecuteEx(
-        fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
-        lpVerb="runas",
-        lpFile="powershell.exe",
-        lpParameters=arguments,
-        nShow=win32con.SW_HIDE,
-    )
-    process_handle = process_info["hProcess"]
     try:
-        win32event.WaitForSingleObject(process_handle, win32event.INFINITE)
-        exit_code = win32process.GetExitCodeProcess(process_handle)
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            completed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                check=False,
+            )
+            exit_code = completed.returncode
+        else:
+            process_info = shell.ShellExecuteEx(
+                fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
+                lpVerb="runas",
+                lpFile="powershell.exe",
+                lpParameters=arguments,
+                nShow=win32con.SW_HIDE,
+            )
+            process_handle = process_info["hProcess"]
+            try:
+                win32event.WaitForSingleObject(
+                    process_handle,
+                    win32event.INFINITE,
+                )
+                exit_code = win32process.GetExitCodeProcess(process_handle)
+            finally:
+                win32api.CloseHandle(process_handle)
+
         if exit_code:
+            detail = ""
+            if result_file.is_file():
+                try:
+                    result = json.loads(
+                        result_file.read_text(encoding="utf-8-sig")
+                    )
+                    detail = str(
+                        result.get("details") or result.get("error") or ""
+                    ).strip()
+                except (OSError, ValueError, TypeError):
+                    detail = ""
             raise RuntimeError(
-                f"elevated PowerShell finished with code {exit_code}"
+                detail
+                or f"elevated PowerShell finished with code {exit_code}"
             )
     finally:
-        win32api.CloseHandle(process_handle)
+        result_file.unlink(missing_ok=True)
 
 
 NETWORK_DISCOVERY_FIREWALL_GROUP = "@FirewallAPI.dll,-32752"
@@ -5994,7 +6126,7 @@ def network_discovery_setup_script() -> str:
         "function Enable-PrivateFirewallGroup([string]$Group) {",
         (
             "    $rules = @(Get-NetFirewallRule -Group $Group "
-            "-PolicyStore ActiveStore -ErrorAction SilentlyContinue)"
+            "-PolicyStore PersistentStore -ErrorAction SilentlyContinue)"
         ),
         "    $privateRules = @($rules | Where-Object {",
         "        $profileValue = [int]$_.Profile",
@@ -6003,10 +6135,12 @@ def network_discovery_setup_script() -> str:
             "(($profileValue -band 2) -ne 0)"
         ),
         "    })",
+        "    foreach ($rule in $privateRules) {",
         (
-            "    if ($privateRules.Count -gt 0) { "
-            "$privateRules | Set-NetFirewallRule -Enabled True }"
+            "        Set-NetFirewallRule -PolicyStore PersistentStore "
+            "-Name $rule.Name -Enabled True"
         ),
+        "    }",
         "}",
         f"Enable-PrivateFirewallGroup {discovery_group}",
         f"Enable-PrivateFirewallGroup {sharing_group}",
@@ -7172,10 +7306,12 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                     no_barcode_items.append((item, quantity))
         if worker.get("DEPARTMENT", "").upper() == "B2B":
             load_B2B_progress(
-                worker, orders[current_order], counts, extras, no_barcode_items
+                worker, orders[current_order], counts, extras, errors,
+                no_barcode_items,
             )
             save_B2B_progress(
-                worker, orders[current_order], counts, extras, no_barcode_items
+                worker, orders[current_order], counts, extras, errors,
+                no_barcode_items,
             )
         else:
             update_order_in_statistics(worker, current_order, add_name=True)
@@ -7233,9 +7369,10 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
             extras[item_name] = counts[item_name] - quantity
             photo_pending = False
 
-    if worker.get("DEPARTMENT", "").upper() == "B2B" and changed_item is not None:
+    if worker.get("DEPARTMENT", "").upper() == "B2B":
         save_B2B_progress(
-            worker, orders[current_order], counts, extras, no_barcode_items, changed_item
+            worker, orders[current_order], counts, extras, errors,
+            no_barcode_items, changed_item,
         )
 
     show_status(
@@ -8491,7 +8628,7 @@ def launcher_console_loop(worker: dict) -> None:
 
 def dispatcher() -> None:
     """Own idle display ports and hand each busy port to its worker process."""
-    latest_display_version = get_latest_display_version()
+    latest_display_versions = get_latest_display_versions()
 
     cleanup_launcher_photos()
     cameras = find_autochecker_cameras()
@@ -8507,7 +8644,7 @@ def dispatcher() -> None:
 
     # Camera focus defaults do not depend on whether a display is currently on.
     settings = ensure_detected_settings(cameras, {})
-    display_ports = find_autochecker_displays(latest_display_version)
+    display_ports = find_autochecker_displays(latest_display_versions)
     if not display_ports:
         print("? No AutoChecker displays found; monitoring new COM ports")
 
@@ -8763,7 +8900,7 @@ def dispatcher() -> None:
                     observed_ports.add(port)
                     display_number = identify_autochecker_display(
                         port,
-                        latest_display_version,
+                        latest_display_versions,
                     )
                     if display_number is None:
                         port_info = current_port_infos.get(port)
