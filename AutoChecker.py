@@ -171,7 +171,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.25"
+CURRENT_VERSION = "3.26"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -1931,6 +1931,7 @@ def configure_worker_storage(worker: dict, settings: dict) -> None:
     if department == "B2B":
         worker["B2B_LOCAL_HISTORY"] = DESKTOP_DIR / "B2B" / "History"
         worker["B2B_LOCAL_DOWNLOAD_DIRECTORIES"] = local_B2B_downloads
+        worker["B2B_HISTORY"] = worker["B2B_LOCAL_HISTORY"]
 
     worker["DOWNLOAD_DIRECTORIES"] = (
         [Path.home() / "Downloads"]
@@ -1946,10 +1947,6 @@ def configure_worker_storage(worker: dict, settings: dict) -> None:
     worker["SUPPORT"] = True
     worker["DOWNLOAD_DIRECTORIES"] = [shared["downloads"]]
     if department == "B2B":
-        shared_B2B_statistics = shared["b2b"] / "Statistik"
-        shared_B2B_statistics.mkdir(parents=True, exist_ok=True)
-        worker["STATISTICS"] = shared_B2B_statistics
-        worker["B2B_HISTORY"] = shared["b2b"] / "History"
         worker["B2B_NETWORK_HISTORY"] = shared["b2b"] / "History"
         worker["B2B_NETWORK_DOWNLOAD_DIRECTORIES"] = [shared["downloads"]]
         # Retain the combined list for older helpers. prepare_B2B_order_history
@@ -4615,18 +4612,18 @@ def prepare_B2B_order_history(
         if path_key(path) not in local_download_keys
     ]
 
-    stages: list[tuple[str, str, Path | list[Path], Path | None]] = [
-        ("local History", "history", local_history, None),
-        ("local Downloads", "downloads", local_downloads, local_history),
+    stages: list[tuple[str, str, Path | list[Path], bool]] = [
+        ("local History", "history", local_history, False),
+        ("local Downloads", "downloads", local_downloads, False),
     ]
     if network_history is not None:
-        stages.append(("network History", "history", network_history, None))
+        stages.append(("network History", "history", network_history, True))
     if network_downloads:
         stages.append((
             "network Downloads",
             "downloads",
             network_downloads,
-            network_history,
+            True,
         ))
 
     checked_locations: list[str] = []
@@ -4634,7 +4631,8 @@ def prepare_B2B_order_history(
     archived_pdf: Path | None = None
     order_dir: Path | None = None
 
-    for stage_name, stage_kind, source, target_history in stages:
+    for stage_name, stage_kind, source, is_network_source in stages:
+        source_pdf: Path | None = None
         if stage_kind == "history":
             history_dir = Path(source)
             checked_locations.append(str(history_dir))
@@ -4654,30 +4652,30 @@ def prepare_B2B_order_history(
                 continue
             if existing_pdf is None:
                 continue
-            order_dir = existing_order_dir
-            archived_pdf = existing_pdf
-            print(f"* B2B PDF found in {stage_name}: {archived_pdf}")
-            break
+            if not is_network_source:
+                order_dir = existing_order_dir
+                archived_pdf = existing_pdf
+                print(f"* B2B PDF found in {stage_name}: {archived_pdf}")
+                break
+            source_pdf = existing_pdf
+        else:
+            download_dirs = [Path(path) for path in source]
+            checked_locations.extend(str(path) for path in download_dirs)
+            try:
+                source_pdf, _checked_downloads = find_downloaded_B2B_pdf(
+                    pdf_filename,
+                    download_dirs,
+                )
+            except OSError as error:
+                access_errors.append(f"{stage_name}: {error}")
+                continue
+            if source_pdf is None:
+                continue
 
-        download_dirs = [Path(path) for path in source]
-        checked_locations.extend(str(path) for path in download_dirs)
-        try:
-            downloaded_pdf, _checked_downloads = find_downloaded_B2B_pdf(
-                pdf_filename,
-                download_dirs,
-            )
-        except OSError as error:
-            access_errors.append(f"{stage_name}: {error}")
-            continue
-        if downloaded_pdf is None:
-            continue
-        if target_history is None:
-            access_errors.append(
-                f"{stage_name}: matching History folder is not configured"
-            )
-            continue
-
-        history_dir = Path(target_history)
+        # The network is only a source of the order PDF.  Every active B2B
+        # order uses the local History folder for its PDF copy, progress file,
+        # photos and index entry.
+        history_dir = local_history
         try:
             history_dir.mkdir(parents=True, exist_ok=True)
             order_dir = (
@@ -4701,13 +4699,18 @@ def prepare_B2B_order_history(
                     )
                 else:
                     archived_pdf = order_dir / pdf_filename
-                    shutil.move(str(downloaded_pdf), str(archived_pdf))
+                    if is_network_source:
+                        shutil.copy2(str(source_pdf), str(archived_pdf))
+                        operation = "copied"
+                    else:
+                        shutil.move(str(source_pdf), str(archived_pdf))
+                        operation = "moved"
                     print(
-                        f"* B2B PDF moved from {stage_name} to "
-                        f"{history_dir}"
+                        f"* B2B PDF {operation} from {stage_name} to "
+                        f"{archived_pdf}"
                     )
         except (OSError, shutil.Error) as error:
-            print(f"XXX Cannot archive B2B PDF {downloaded_pdf}: {error}")
+            print(f"XXX Cannot archive B2B PDF {source_pdf}: {error}")
             return None, "move_failed"
         break
 
@@ -7801,8 +7804,6 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
             if department == "RETAIL":
                 statistics_dir = shared_paths["statistics"]
                 mirror_dir = DESKTOP_DIR / "RETAIL" / "Statistik"
-            elif department == "B2B":
-                statistics_dir = shared_paths["b2b"] / "Statistik"
         target = (
             statistics_dir / B2B_INDEX_FILENAME
             if department == "B2B"
