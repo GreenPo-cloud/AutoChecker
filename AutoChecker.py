@@ -153,6 +153,8 @@ CAMERA_SCAN_INTERVAL = 1.5
 CAMERA_STABLE_POLLS = 2
 PRINTER_SCAN_INTERVAL = 1.5
 PRINTER_STABLE_POLLS = 2
+SCANNER_IDENTITY_TIMEOUT = 15
+SCANNER_IDENTITY_RETRY_INTERVAL = 10.0
 SCAN_INTERVAL = 0.2
 CHANGE_PDF_SCAN_INTERVAL = 2.0
 CHANGE_PDF_RETRY_INTERVAL = 10.0
@@ -169,7 +171,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.24"
+CURRENT_VERSION = "3.25"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -337,6 +339,7 @@ PDF_HISTORY_CURSOR: Path | None = None
 OTHER_CACHE_SIGNATURE: tuple[int, int] | None = None
 OTHER_CACHE_RULES: list[tuple[str, str]] = []
 DISPLAY_FIRMWARE_CACHE: dict[str, tuple[bytes, bytes]] = {}
+SCANNER_IDENTITY_RETRY_PORTS: set[str] = set()
 
 
 def _version_key(version: str) -> tuple[int, ...] | None:
@@ -1314,10 +1317,18 @@ def read_windows_port_identity(port_info) -> tuple[str, str]:
     serial_number = str(getattr(port_info, "serial_number", "") or "").strip()
     if os.name != "nt":
         return description, serial_number
+    description_key = description.casefold()
+    if serial_number and all(
+        token in description_key for token in ("scanner", "bar", "code")
+    ):
+        # pyserial already supplied everything needed. Avoid a comparatively
+        # expensive PowerShell/PnP walk on the common path.
+        return description, serial_number
 
+    port_name = str(port_info.device)
     script = r"""
 $portName = $env:AUTOCHECKER_SCANNER_PORT
-$device = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+$device = Get-PnpDevice -Class Ports -PresentOnly -ErrorAction SilentlyContinue |
     Where-Object { $_.FriendlyName -like "*($portName)*" } |
     Select-Object -First 1
 if ($null -eq $device) { exit 2 }
@@ -1361,7 +1372,7 @@ if (-not $serialNumber -and $leafInstanceId) {
 } | ConvertTo-Json -Compress
 """
     environment = os.environ.copy()
-    environment["AUTOCHECKER_SCANNER_PORT"] = str(port_info.device)
+    environment["AUTOCHECKER_SCANNER_PORT"] = port_name
     try:
         result = subprocess.run(
             [
@@ -1375,11 +1386,12 @@ if (-not $serialNumber -and $leafInstanceId) {
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=8,
+            timeout=SCANNER_IDENTITY_TIMEOUT,
             check=False,
             creationflags=subprocess.CREATE_NO_WINDOW,
             env=environment,
         )
+        SCANNER_IDENTITY_RETRY_PORTS.discard(port_name)
         if result.returncode == 0 and result.stdout.strip():
             properties = json.loads(result.stdout.strip().lstrip("\ufeff"))
             description = str(
@@ -1388,8 +1400,15 @@ if (-not $serialNumber -and $leafInstanceId) {
             serial_number = str(
                 properties.get("serial_number") or serial_number
             ).strip()
+    except subprocess.TimeoutExpired:
+        SCANNER_IDENTITY_RETRY_PORTS.add(port_name)
+        print(
+            f"? PnP query for {port_name} timed out after "
+            f"{SCANNER_IDENTITY_TIMEOUT} seconds; scanner detection will retry"
+        )
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
-        print(f"? Cannot read PnP properties for {port_info.device}: {error}")
+        SCANNER_IDENTITY_RETRY_PORTS.add(port_name)
+        print(f"? Cannot read PnP properties for {port_name}: {error}")
     return description, serial_number
 
 
@@ -1450,6 +1469,7 @@ def identify_external_scanner(port_info, *, announce: bool = True) -> str | None
             f"* Scanner found: {scanner_name} ({port_info.device}), "
             f"serial {serial_number}, {description or 'no description'}"
         )
+    SCANNER_IDENTITY_RETRY_PORTS.discard(str(port_info.device))
     return scanner_name
 
 
@@ -1907,11 +1927,15 @@ def configure_worker_storage(worker: dict, settings: dict) -> None:
     department = str(worker.get("DEPARTMENT", "")).upper()
     local_retail_statistics = DESKTOP_DIR / "RETAIL" / "Statistik"
     local_retail_statistics.mkdir(parents=True, exist_ok=True)
+    local_B2B_downloads = B2B_download_directories()
+    if department == "B2B":
+        worker["B2B_LOCAL_HISTORY"] = DESKTOP_DIR / "B2B" / "History"
+        worker["B2B_LOCAL_DOWNLOAD_DIRECTORIES"] = local_B2B_downloads
 
     worker["DOWNLOAD_DIRECTORIES"] = (
         [Path.home() / "Downloads"]
         if department == "RETAIL"
-        else B2B_download_directories()
+        else local_B2B_downloads
     )
     worker["RETAIL_STATISTICS"] = local_retail_statistics
     worker["RETAIL_LOCAL_STATISTICS"] = local_retail_statistics
@@ -1926,6 +1950,14 @@ def configure_worker_storage(worker: dict, settings: dict) -> None:
         shared_B2B_statistics.mkdir(parents=True, exist_ok=True)
         worker["STATISTICS"] = shared_B2B_statistics
         worker["B2B_HISTORY"] = shared["b2b"] / "History"
+        worker["B2B_NETWORK_HISTORY"] = shared["b2b"] / "History"
+        worker["B2B_NETWORK_DOWNLOAD_DIRECTORIES"] = [shared["downloads"]]
+        # Retain the combined list for older helpers. prepare_B2B_order_history
+        # uses the explicit four-stage order stored above.
+        worker["DOWNLOAD_DIRECTORIES"] = [
+            *local_B2B_downloads,
+            shared["downloads"],
+        ]
         return
     if department not in {"RETAIL", RETAIL_UP_DEPARTMENT}:
         return
@@ -3055,6 +3087,49 @@ def B2B_order_name(pdf_reference: str) -> str | None:
     ):
         return None
     return name
+
+
+def _normalise_B2B_disk_name(value: object) -> str:
+    """Normalise an order folder/PDF name for tolerant SMB lookup."""
+    name = str(value).strip()
+    if name.startswith("#"):
+        name = name[1:].strip()
+    if name.casefold().endswith(".pdf"):
+        name = name[:-4].strip()
+    return name.casefold()
+
+
+def _B2B_pdf_in_folder(folder: Path, order_name: str) -> Path | None:
+    """Find one B2B PDF despite case, a leading #, or surrounding spaces."""
+    expected = _normalise_B2B_disk_name(order_name)
+    try:
+        entries = list(folder.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    for path in entries:
+        if (
+            path.suffix.casefold() == ".pdf"
+            and _normalise_B2B_disk_name(path.name) == expected
+            and path.is_file()
+        ):
+            return path
+    return None
+
+
+def _B2B_order_folder(history_dir: Path, order_name: str) -> Path | None:
+    """Find an existing History order folder using the same tolerant name."""
+    expected = _normalise_B2B_disk_name(order_name)
+    try:
+        entries = list(history_dir.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    for path in entries:
+        if (
+            _normalise_B2B_disk_name(path.name) == expected
+            and path.is_dir()
+        ):
+            return path
+    return None
 
 
 def _case_insensitive_file(folder: Path, filename: str) -> Path | None:
@@ -4483,10 +4558,17 @@ def find_downloaded_B2B_pdf(
 ) -> tuple[Path | None, list[Path]]:
     """Find a B2B PDF in the configured Windows Downloads locations."""
     directories = download_directories or B2B_download_directories()
-    for directory in directories:
-        found = _case_insensitive_file(directory, filename)
-        if found is not None:
-            return found, directories
+    order_name = _normalise_B2B_disk_name(filename)
+    # A newly copied SMB file can take a fraction of a second to become
+    # visible to another computer. Retry briefly before falling back to
+    # History or reporting an unknown order.
+    for attempt in range(3):
+        for directory in directories:
+            found = _B2B_pdf_in_folder(Path(directory), order_name)
+            if found is not None:
+                return found, directories
+        if attempt < 2:
+            time.sleep(0.25)
     return None, directories
 
 
@@ -4494,63 +4576,158 @@ def prepare_B2B_order_history(
     worker: dict,
     order_id: str,
 ) -> tuple[Path | None, str | None]:
-    """Archive a downloaded B2B PDF or reopen it from its History folder."""
+    """Find a B2B PDF in the required local-then-network order."""
     order_name = B2B_order_name(order_id)
     if order_name is None:
         return None, "invalid_order"
 
-    history_dir = worker.get(
-        "B2B_HISTORY", worker["STATISTICS"].parent / "History"
-    )
-    history_dir.mkdir(parents=True, exist_ok=True)
-    order_dir = history_dir / order_name
     pdf_filename = f"{order_name}.pdf"
-    progress_file = order_dir / f"{order_name}_Sborka.txt"
-
-    # Two displays may scan the same newly downloaded order nearly
-    # simultaneously. Keep folder creation and moving under one lock.
-    history_lock = history_dir / ".history.lock"
-    with portalocker.Lock(
-        str(history_lock), mode="a+", encoding="utf-8", timeout=30
-    ):
-        downloaded_pdf, checked_downloads = find_downloaded_B2B_pdf(
-            pdf_filename,
-            worker.get("DOWNLOAD_DIRECTORIES"),
+    local_history = Path(
+        worker.get("B2B_LOCAL_HISTORY", DESKTOP_DIR / "B2B" / "History")
+    )
+    local_downloads = [
+        Path(path)
+        for path in worker.get(
+            "B2B_LOCAL_DOWNLOAD_DIRECTORIES",
+            B2B_download_directories(),
         )
-        if downloaded_pdf is not None:
-            order_dir.mkdir(parents=True, exist_ok=True)
-            archived_pdf = order_dir / pdf_filename
-            existing_pdf = _case_insensitive_file(order_dir, pdf_filename)
-            if existing_pdf is not None:
-                archived_pdf = existing_pdf
-                progress_action = (
-                    "resuming saved progress"
-                    if progress_file.is_file()
-                    else "starting new progress"
-                )
-                print(
-                    f"* B2B order {order_name} already has an archived PDF; "
-                    f"{progress_action}. Duplicate Downloads PDF was left "
-                    "unchanged"
-                )
-            else:
-                try:
-                    shutil.move(str(downloaded_pdf), str(archived_pdf))
-                except (OSError, shutil.Error):
-                    return None, "move_failed"
-        else:
-            print(
-                f"? B2B PDF {pdf_filename} was not found; checked: "
-                + ", ".join(str(path) for path in checked_downloads)
-            )
-            if not order_dir.is_dir():
-                return None, "unknown_order"
-            archived_pdf = _case_insensitive_file(order_dir, pdf_filename)
-            if archived_pdf is None:
-                return None, "unknown_order"
+    ]
+    network_history_value = worker.get("B2B_NETWORK_HISTORY")
+    network_history = (
+        Path(network_history_value)
+        if network_history_value is not None
+        else None
+    )
+    network_downloads = [
+        Path(path)
+        for path in worker.get("B2B_NETWORK_DOWNLOAD_DIRECTORIES", [])
+    ]
 
+    def path_key(path: Path) -> str:
+        return str(path).rstrip("\\/").casefold()
+
+    local_download_keys = {path_key(path) for path in local_downloads}
+    if network_history is not None and path_key(network_history) == path_key(local_history):
+        network_history = None
+    network_downloads = [
+        path
+        for path in network_downloads
+        if path_key(path) not in local_download_keys
+    ]
+
+    stages: list[tuple[str, str, Path | list[Path], Path | None]] = [
+        ("local History", "history", local_history, None),
+        ("local Downloads", "downloads", local_downloads, local_history),
+    ]
+    if network_history is not None:
+        stages.append(("network History", "history", network_history, None))
+    if network_downloads:
+        stages.append((
+            "network Downloads",
+            "downloads",
+            network_downloads,
+            network_history,
+        ))
+
+    checked_locations: list[str] = []
+    access_errors: list[str] = []
+    archived_pdf: Path | None = None
+    order_dir: Path | None = None
+
+    for stage_name, stage_kind, source, target_history in stages:
+        if stage_kind == "history":
+            history_dir = Path(source)
+            checked_locations.append(str(history_dir))
+            try:
+                existing_order_dir = _B2B_order_folder(
+                    history_dir,
+                    order_name,
+                )
+                if existing_order_dir is None:
+                    continue
+                existing_pdf = _B2B_pdf_in_folder(
+                    existing_order_dir,
+                    order_name,
+                )
+            except OSError as error:
+                access_errors.append(f"{history_dir}: {error}")
+                continue
+            if existing_pdf is None:
+                continue
+            order_dir = existing_order_dir
+            archived_pdf = existing_pdf
+            print(f"* B2B PDF found in {stage_name}: {archived_pdf}")
+            break
+
+        download_dirs = [Path(path) for path in source]
+        checked_locations.extend(str(path) for path in download_dirs)
+        try:
+            downloaded_pdf, _checked_downloads = find_downloaded_B2B_pdf(
+                pdf_filename,
+                download_dirs,
+            )
+        except OSError as error:
+            access_errors.append(f"{stage_name}: {error}")
+            continue
+        if downloaded_pdf is None:
+            continue
+        if target_history is None:
+            access_errors.append(
+                f"{stage_name}: matching History folder is not configured"
+            )
+            continue
+
+        history_dir = Path(target_history)
+        try:
+            history_dir.mkdir(parents=True, exist_ok=True)
+            order_dir = (
+                _B2B_order_folder(history_dir, order_name)
+                or history_dir / order_name
+            )
+            # Two displays may scan the same newly downloaded order at once.
+            # Lock the destination History while checking and moving the PDF.
+            history_lock = history_dir / ".history.lock"
+            with portalocker.Lock(
+                str(history_lock), mode="a+", encoding="utf-8", timeout=30
+            ):
+                order_dir.mkdir(parents=True, exist_ok=True)
+                existing_pdf = _B2B_pdf_in_folder(order_dir, order_name)
+                if existing_pdf is not None:
+                    archived_pdf = existing_pdf
+                    print(
+                        f"* B2B order {order_name} already has an archived "
+                        f"PDF in {history_dir}; duplicate {stage_name} PDF "
+                        "was left unchanged"
+                    )
+                else:
+                    archived_pdf = order_dir / pdf_filename
+                    shutil.move(str(downloaded_pdf), str(archived_pdf))
+                    print(
+                        f"* B2B PDF moved from {stage_name} to "
+                        f"{history_dir}"
+                    )
+        except (OSError, shutil.Error) as error:
+            print(f"XXX Cannot archive B2B PDF {downloaded_pdf}: {error}")
+            return None, "move_failed"
+        break
+
+    if archived_pdf is None or order_dir is None:
+        print(
+            f"? B2B PDF {pdf_filename} was not found; checked in order: "
+            + " -> ".join(checked_locations)
+        )
+        if access_errors:
+            print("XXX B2B storage access errors: " + " | ".join(access_errors))
+            return None, "storage_unavailable"
+        return None, "unknown_order"
+
+    progress_file = order_dir / f"{order_name}_Sborka.txt"
+    try:
         photo_dir = order_dir / "Photo"
         photo_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        print(f"XXX Cannot prepare B2B order folder {order_dir}: {error}")
+        return None, "storage_unavailable"
 
     worker["ACTIVE_STAT_FILE"] = progress_file
     worker["B2B_PDF_NAME"] = archived_pdf.name
@@ -8699,6 +8876,11 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                                     message = (
                                         f"XXX Cannot move order PDF to History: {code}"
                                     )
+                                elif history_error == "storage_unavailable":
+                                    message = (
+                                        "XXX B2B network storage is unavailable; "
+                                        "check the console"
+                                    )
                                 else:
                                     message = f"XXX Unknown order {code}"
                                 Printer(message)
@@ -9243,6 +9425,11 @@ def dispatcher() -> None:
     settings_update_requests: multiprocessing.Queue = multiprocessing.Queue()
     observed_ports = {port_info.device for port_info in list_ports.comports()}
     disconnected_ports_waiting_removal: set[str] = set()
+    scanner_identity_retry_deadlines = {
+        port: time.monotonic() + 1.0
+        for port in SCANNER_IDENTITY_RETRY_PORTS
+        if port not in set(display_ports.values()) | set(scanners.values())
+    }
     next_port_scan = time.monotonic() + PORT_SCAN_INTERVAL
     next_camera_scan = time.monotonic() + CAMERA_SCAN_INTERVAL
     pending_camera_snapshot: dict[int, int] | None = None
@@ -9434,6 +9621,7 @@ def dispatcher() -> None:
                     current_port_infos = {}
                     current_ports = observed_ports
 
+                scan_time = time.monotonic()
                 observed_ports.intersection_update(current_ports)
                 disconnected_ports_waiting_removal.intersection_update(current_ports)
                 disconnected_scanners = [
@@ -9457,12 +9645,28 @@ def dispatcher() -> None:
                     )
 
                 known_ports = set(display_ports.values()) | set(scanners.values())
+                for port in list(scanner_identity_retry_deadlines):
+                    if port not in current_ports or port in known_ports:
+                        scanner_identity_retry_deadlines.pop(port, None)
+                        SCANNER_IDENTITY_RETRY_PORTS.discard(port)
+                for port in SCANNER_IDENTITY_RETRY_PORTS:
+                    if port in current_ports and port not in known_ports:
+                        scanner_identity_retry_deadlines.setdefault(
+                            port,
+                            scan_time + SCANNER_IDENTITY_RETRY_INTERVAL,
+                        )
+                retry_ports = {
+                    port
+                    for port, deadline in scanner_identity_retry_deadlines.items()
+                    if deadline <= scan_time
+                    and port not in disconnected_ports_waiting_removal
+                }
                 new_ports = (
                     current_ports
                     - observed_ports
                     - known_ports
                     - disconnected_ports_waiting_removal
-                )
+                ) | retry_ports
                 for port in sorted(new_ports):
                     observed_ports.add(port)
                     display_number = identify_autochecker_display(
@@ -9475,7 +9679,15 @@ def dispatcher() -> None:
                             continue
                         scanner_name = identify_external_scanner(port_info)
                         if scanner_name is None:
+                            if port in SCANNER_IDENTITY_RETRY_PORTS:
+                                scanner_identity_retry_deadlines[port] = (
+                                    time.monotonic()
+                                    + SCANNER_IDENTITY_RETRY_INTERVAL
+                                )
+                            else:
+                                scanner_identity_retry_deadlines.pop(port, None)
                             continue
+                        scanner_identity_retry_deadlines.pop(port, None)
                         duplicate = next(
                             (
                                 existing_name
@@ -9503,6 +9715,8 @@ def dispatcher() -> None:
                             worker_identities,
                         )
                         continue
+                    scanner_identity_retry_deadlines.pop(port, None)
+                    SCANNER_IDENTITY_RETRY_PORTS.discard(port)
                     if display_number in display_ports:
                         print(
                             f"XXX Duplicate AutoChecker {display_number} on {port}; "
