@@ -172,7 +172,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.30"
+CURRENT_VERSION = "3.31"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -248,6 +248,9 @@ SETTINGS_SCHEMA_DEFAULTS = {
 }
 
 SUPPORT_NETWORK_AUTH_BLOCKED = False
+SUPPORT_NETWORK_STATE_ENV = "AUTOCHECKER_SUPPORT_NETWORK_STATE"
+SUPPORT_NETWORK_ONLINE = "online"
+SUPPORT_NETWORK_OFFLINE = "offline"
 
 VERSION_URL = "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/main/version.txt"
 
@@ -1878,6 +1881,21 @@ def support_mode_enabled(settings: dict) -> bool:
     return settings.get("support") is True
 
 
+def set_support_network_state(available: bool) -> None:
+    """Publish the main-PC state to launcher children on Windows spawn."""
+    os.environ[SUPPORT_NETWORK_STATE_ENV] = (
+        SUPPORT_NETWORK_ONLINE if available else SUPPORT_NETWORK_OFFLINE
+    )
+
+
+def support_network_is_known_offline() -> bool:
+    """Return whether startup already proved the main PC is unavailable."""
+    return (
+        os.environ.get(SUPPORT_NETWORK_STATE_ENV)
+        == SUPPORT_NETWORK_OFFLINE
+    )
+
+
 def configured_support_paths(settings: dict) -> dict[str, Path]:
     """Validate and return the fixed shared resources used in support mode."""
     # Always rebuild the paths from one sanitized computer name.  This makes
@@ -1924,11 +1942,27 @@ def configured_support_paths(settings: dict) -> dict[str, Path]:
 
 
 def configure_worker_storage(worker: dict, settings: dict) -> None:
-    """Select local or shared RETAIL storage and retain local mirror paths."""
+    """Use shared storage when reachable, otherwise keep the worker local."""
     department = str(worker.get("DEPARTMENT", "")).upper()
+    local_photo_dir, local_statistics_dir = department_paths(department)
     local_retail_statistics = DESKTOP_DIR / "RETAIL" / "Statistik"
     local_retail_statistics.mkdir(parents=True, exist_ok=True)
     local_B2B_downloads = B2B_download_directories()
+
+    # This function can be called again after a network disconnect. Always
+    # restore a complete local baseline before attempting UNC paths.
+    for key in (
+        "SUPPORT",
+        "SUPPORT_FOTO",
+        "STATISTICS_MIRROR_DIR",
+        "B2B_NETWORK_HISTORY",
+        "B2B_NETWORK_DOWNLOAD_DIRECTORIES",
+    ):
+        worker.pop(key, None)
+    worker["SUPPORT_REQUESTED"] = support_mode_enabled(settings)
+    worker["SUPPORT_OFFLINE"] = False
+    worker["FOTO"] = local_photo_dir
+    worker["STATISTICS"] = local_statistics_dir
     if department == "B2B":
         worker["B2B_LOCAL_HISTORY"] = DESKTOP_DIR / "B2B" / "History"
         worker["B2B_LOCAL_DOWNLOAD_DIRECTORIES"] = local_B2B_downloads
@@ -1944,7 +1978,24 @@ def configure_worker_storage(worker: dict, settings: dict) -> None:
     if not support_mode_enabled(settings):
         return
 
-    shared = configured_support_paths(settings)
+    if support_network_is_known_offline():
+        worker["SUPPORT_OFFLINE"] = True
+        return
+
+    try:
+        shared = configured_support_paths(settings)
+    except (OSError, ValueError) as error:
+        set_support_network_state(False)
+        worker["SUPPORT_OFFLINE"] = True
+        if not worker.get("_SUPPORT_FALLBACK_ANNOUNCED"):
+            print(
+                "? Main AutoChecker computer is unavailable; using local "
+                f"folders: {error}"
+            )
+            worker["_SUPPORT_FALLBACK_ANNOUNCED"] = True
+        return
+
+    set_support_network_state(True)
     worker["SUPPORT"] = True
     worker["DOWNLOAD_DIRECTORIES"] = [shared["downloads"]]
     if department == "B2B":
@@ -6709,10 +6760,15 @@ def connect_support_network_session(settings: dict) -> bool:
     try:
         probe_support_network(settings)
         SUPPORT_NETWORK_AUTH_BLOCKED = False
+        set_support_network_state(True)
         return True
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        set_support_network_state(False)
         if not is_support_authentication_error(error):
-            print(f"XXX Cannot access main AutoChecker computer: {error}")
+            print(
+                "? Main AutoChecker computer is unavailable; AutoChecker "
+                f"will use local folders: {error}"
+            )
             return False
         if support_account_is_locked(error):
             SUPPORT_NETWORK_AUTH_BLOCKED = True
@@ -6787,6 +6843,7 @@ def connect_support_network_session(settings: dict) -> bool:
             settings["support_username"] = connection_username
             save_settings(settings)
         SUPPORT_NETWORK_AUTH_BLOCKED = False
+        set_support_network_state(True)
         print(f"* Connected to main AutoChecker computer {computer_name}")
         return True
 
@@ -8242,11 +8299,22 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
 
         statistics_dir = DESKTOP_DIR / department / "Statistik"
         mirror_dir = None
-        if support_mode_enabled(settings):
-            shared_paths = configured_support_paths(settings)
-            if department == "RETAIL":
-                statistics_dir = shared_paths["statistics"]
-                mirror_dir = DESKTOP_DIR / "RETAIL" / "Statistik"
+        if (
+            support_mode_enabled(settings)
+            and not support_network_is_known_offline()
+        ):
+            try:
+                shared_paths = configured_support_paths(settings)
+            except (OSError, ValueError) as error:
+                set_support_network_state(False)
+                print(
+                    "? Main AutoChecker computer became unavailable; "
+                    f"cancelling against local statistics: {error}"
+                )
+            else:
+                if department == "RETAIL":
+                    statistics_dir = shared_paths["statistics"]
+                    mirror_dir = DESKTOP_DIR / "RETAIL" / "Statistik"
         target = (
             statistics_dir / B2B_INDEX_FILENAME
             if department == "B2B"
@@ -9833,37 +9901,30 @@ def dispatcher() -> None:
     launcher_retail_worker = None
     launcher_console_started = False
     retail_monitor_last_error: str | None = None
-    retail_monitor_auth_blocked = SUPPORT_NETWORK_AUTH_BLOCKED
-    if retail_monitor_auth_blocked:
+    retail_monitor_auth_blocked = False
+    if SUPPORT_NETWORK_AUTH_BLOCKED:
         print(
-            "? RETAIL order monitor is paused until network credentials "
-            "are fixed and AutoChecker is restarted"
+            "? Main-computer credentials are unavailable; RETAIL order "
+            "monitor will continue with local folders"
         )
-    else:
-        try:
-            launcher_retail_worker = create_launcher_RETAIL_worker(settings)
-            process_pending_admin_download_files(launcher_retail_worker)
-            process_pending_RETAIL_order_sources(
-                launcher_retail_worker, settings
-            )
-            process_pending_RETAIL_change_pdfs(
-                launcher_retail_worker, settings
-            )
-            process_pending_RETAIL_change_label_pdfs(
-                launcher_retail_worker
-            )
-        except Exception as error:
-            retail_monitor_last_error = str(error)
-            print(
-                "XXX RETAIL order monitor initialization failed: "
-                f"{error}"
-            )
-            if is_support_authentication_error(error):
-                retail_monitor_auth_blocked = True
-                print(
-                    "? RETAIL order monitor stopped its automatic network "
-                    "retries to prevent a Windows account lockout"
-                )
+    try:
+        launcher_retail_worker = create_launcher_RETAIL_worker(settings)
+        process_pending_admin_download_files(launcher_retail_worker)
+        process_pending_RETAIL_order_sources(
+            launcher_retail_worker, settings
+        )
+        process_pending_RETAIL_change_pdfs(
+            launcher_retail_worker, settings
+        )
+        process_pending_RETAIL_change_label_pdfs(
+            launcher_retail_worker
+        )
+    except Exception as error:
+        retail_monitor_last_error = str(error)
+        print(
+            "XXX RETAIL order monitor initialization failed: "
+            f"{error}"
+        )
 
     if launcher_retail_worker is not None:
         threading.Thread(
@@ -10050,7 +10111,7 @@ def dispatcher() -> None:
                             worker_identities,
                         )
                     if retail_monitor_last_error is not None:
-                        print("* RETAIL order monitor connection restored")
+                        print("* RETAIL order monitor resumed")
                         retail_monitor_last_error = None
                 except Exception as error:
                     error_text = str(error)
@@ -10060,12 +10121,21 @@ def dispatcher() -> None:
                     next_retail_order_scan = (
                         time.monotonic() + ORDER_SOURCE_RETRY_INTERVAL
                     )
-                    if is_support_authentication_error(error):
-                        retail_monitor_auth_blocked = True
+                    if (
+                        launcher_retail_worker is not None
+                        and launcher_retail_worker.get("SUPPORT")
+                        and (
+                            isinstance(error, OSError)
+                            or is_support_authentication_error(error)
+                        )
+                    ):
+                        set_support_network_state(False)
+                        configure_worker_storage(
+                            launcher_retail_worker, settings
+                        )
                         print(
-                            "? RETAIL order monitor stopped its automatic "
-                            "network retries to prevent a Windows account "
-                            "lockout; fix credentials and restart AutoChecker"
+                            "? RETAIL order monitor switched to local folders "
+                            "because the main computer is unavailable"
                         )
 
             if time.monotonic() >= next_port_scan:
@@ -10760,7 +10830,10 @@ if __name__ == "__main__":
                 startup_settings
             )
         else:
-            print("? Product settings were not updated from the main computer")
+            print(
+                "? Product settings were not updated from the main computer; "
+                "the local Settings.json will be used"
+            )
     else:
         ensure_main_network_shares(startup_settings)
     sync_order_label_templates()
