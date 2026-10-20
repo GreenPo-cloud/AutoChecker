@@ -172,7 +172,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.28"
+CURRENT_VERSION = "3.29"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -5895,6 +5895,22 @@ def product_count_base_name(name: object) -> str:
     ).strip()
 
 
+def product_count_item_key(name: object) -> str:
+    """Normalize a complete order-row name without removing package size."""
+    return re.sub(r"\s+", " ", str(name)).strip().casefold()
+
+
+def product_count_exclusion_keys(exclusions: object) -> set[str]:
+    """Return normalized full position names stored as EXCEPTIONS keys."""
+    if not isinstance(exclusions, dict):
+        return set()
+    return {
+        product_count_item_key(name)
+        for name in exclusions
+        if str(name).strip()
+    }
+
+
 def counted_product_name(
     item_name: object,
     config: dict,
@@ -5932,6 +5948,7 @@ def counted_product_name(
 def RETAIL_product_count_contribution(
     cache_path: Path,
     config: dict,
+    exclusions: set[str] | None = None,
 ) -> dict[str, int]:
     """Count PRODUCTS rows in both current and legacy Order JSON schemas.
 
@@ -5970,6 +5987,11 @@ def RETAIL_product_count_contribution(
             continue
 
         for item_name in raw_items:
+            if (
+                is_bonus_item(str(item_name))
+                or product_count_item_key(item_name) in (exclusions or set())
+            ):
+                continue
             product_name = counted_product_name(item_name, config)
             if product_name is not None:
                 counts[product_name] += 1
@@ -5979,6 +6001,7 @@ def RETAIL_product_count_contribution(
 def B2B_product_count_contribution(
     progress_path: Path,
     config: dict,
+    exclusions: set[str] | None = None,
 ) -> dict[str, int]:
     """Count PRODUCTS rows stored in one B2B _Sborka text file."""
     counts: dict[str, int] = defaultdict(int)
@@ -5992,9 +6015,13 @@ def B2B_product_count_contribution(
         )
         if match is None:
             continue
-        product_name = counted_product_name(
-            match.group(1), config, B2B=True
-        )
+        item_name = match.group(1)
+        if (
+            is_bonus_item(item_name)
+            or product_count_item_key(item_name) in (exclusions or set())
+        ):
+            continue
+        product_name = counted_product_name(item_name, config, B2B=True)
         if product_name is not None:
             counts[product_name] += 1
     return dict(counts)
@@ -6086,10 +6113,18 @@ def refresh_product_count_file(
             previous = {}
         previous_products = previous.get("PRODUCTS", {})
         previous_files = previous.get("PROCESSED_FILES", {})
+        previous_exclusions = previous.get("EXCEPTIONS", {})
         if not isinstance(previous_products, dict):
             previous_products = {}
         if not isinstance(previous_files, dict):
             previous_files = {}
+        exclusions = (
+            previous_exclusions
+            if isinstance(previous_exclusions, dict)
+            else {}
+        )
+        exclusion_keys = product_count_exclusion_keys(exclusions)
+        exclusion_signature = sorted(exclusion_keys)
         # Count.json is ordered by frequency, so its key order normally
         # differs from Settings.json. Only catalogue membership determines
         # whether cached per-file contributions need to be recalculated.
@@ -6110,6 +6145,7 @@ def refresh_product_count_file(
                 and old_record.get("date") == source_date.isoformat()
                 and old_record.get("modified_ns") == stat.st_mtime_ns
                 and old_record.get("size") == stat.st_size
+                and old_record.get("EXCEPTIONS") == exclusion_signature
                 and isinstance(old_record.get("PRODUCTS"), dict)
             )
             if can_reuse:
@@ -6123,7 +6159,9 @@ def refresh_product_count_file(
                 }
             else:
                 try:
-                    contribution = parser(source_path, config)
+                    contribution = parser(
+                        source_path, config, exclusion_keys
+                    )
                 except Exception as error:
                     print(
                         f"XXX Cannot count products in {source_path}: {error}"
@@ -6131,6 +6169,7 @@ def refresh_product_count_file(
                     if (
                         not catalog_changed
                         and isinstance(old_record, dict)
+                        and old_record.get("EXCEPTIONS") == exclusion_signature
                         and isinstance(old_record.get("PRODUCTS"), dict)
                     ):
                         contribution = {
@@ -6152,6 +6191,7 @@ def refresh_product_count_file(
                 "date": source_date.isoformat(),
                 "modified_ns": stat.st_mtime_ns,
                 "size": stat.st_size,
+                "EXCEPTIONS": exclusion_signature,
                 "PRODUCTS": contribution,
             }
             for name, value in contribution.items():
@@ -6169,13 +6209,16 @@ def refresh_product_count_file(
             (name, total.get(name, 0)) for name in sorted_catalog
         )
         unchanged = (
-            previous_products == product_counts
+            "EXCEPTIONS" in previous
+            and previous_exclusions == exclusions
+            and previous_products == product_counts
             and previous_files == processed_files
         )
         if unchanged:
             return False
 
         document = OrderedDict((
+            ("EXCEPTIONS", exclusions),
             ("PRODUCTS", product_counts),
             ("PROCESSED_FILES", processed_files),
             ("UPDATED_AT", datetime.datetime.now().isoformat(timespec="seconds")),
