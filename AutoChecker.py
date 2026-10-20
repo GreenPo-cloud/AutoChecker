@@ -147,6 +147,7 @@ DISPLAY_WRITE_TIMEOUT = 5.0
 HANDSHAKE_TIMEOUT = 1.0
 DISPLAY_BOOT_DELAY = 1.5
 ESP_ROM_PREFIX = "ESP-ROM:"
+DISPLAY_BOOT_TOKEN = "ESP_ROM_PREFIX"
 PORT_SCAN_INTERVAL = 1.5
 CAMERA_SCAN_INTERVAL = 1.5
 CAMERA_STABLE_POLLS = 2
@@ -168,7 +169,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.23"
+CURRENT_VERSION = "3.24"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -1137,6 +1138,11 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
     return settings
 
 
+def is_display_boot_message(line: str) -> bool:
+    """Return True for a real ESP-ROM line or the BYD reset token."""
+    return line == DISPLAY_BOOT_TOKEN or line.startswith(ESP_ROM_PREFIX)
+
+
 def _probe_autochecker_display(port: str) -> tuple[str, str, str] | None:
     """Ask one COM device for its MAC, firmware version, and CYD/BYD type."""
     display = None
@@ -1154,6 +1160,8 @@ def _probe_autochecker_display(port: str) -> tuple[str, str, str] | None:
         display.reset_input_buffer()
         display.write(b"<WHO?>\n")
         display.flush()
+        who_attempt = 1
+        max_who_attempts = 3
 
         deadline = time.monotonic() + HANDSHAKE_TIMEOUT
         answers: list[str] = []
@@ -1162,6 +1170,20 @@ def _probe_autochecker_display(port: str) -> tuple[str, str, str] | None:
             if not answer:
                 continue
             answers.append(answer)
+            if is_display_boot_message(answer):
+                if who_attempt >= max_who_attempts:
+                    break
+                print(
+                    f"? {port} restarted during <WHO?>; waiting and "
+                    "asking again"
+                )
+                time.sleep(DISPLAY_BOOT_DELAY)
+                display.reset_input_buffer()
+                display.write(b"<WHO?>\n")
+                display.flush()
+                who_attempt += 1
+                deadline = time.monotonic() + HANDSHAKE_TIMEOUT
+                continue
             match = DISPLAY_HANDSHAKE_PATTERN.fullmatch(answer)
             if match:
                 display_mac = normalise_display_mac(match.group(1))
@@ -2985,7 +3007,11 @@ def mirror_statistics_lines(
 
 def synchronize_support_statistics(worker: dict) -> None:
     """Refresh today's local mirror from the authoritative network file."""
-    if not worker.get("SUPPORT"):
+    if (
+        not worker.get("SUPPORT")
+        or str(worker.get("DEPARTMENT", "")).upper()
+        not in {"RETAIL", RETAIL_UP_DEPARTMENT}
+    ):
         return
     shared_file = retail_statistics_file(worker)
     if not shared_file.is_file():
@@ -6491,6 +6517,7 @@ def run_elevated_powershell(script: str) -> None:
 
 NETWORK_DISCOVERY_FIREWALL_GROUP = "@FirewallAPI.dll,-32752"
 FILE_SHARING_FIREWALL_GROUP = "@FirewallAPI.dll,-28502"
+NETWORK_DISCOVERY_CHECK_TIMEOUT = 45
 
 
 def windows_network_discovery_state() -> dict:
@@ -6546,24 +6573,30 @@ def windows_network_discovery_state() -> dict:
         "}",
         "$state | ConvertTo-Json -Compress",
     ))
-    result = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
-        check=False,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=NETWORK_DISCOVERY_CHECK_TIMEOUT,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(
+            "Windows network discovery check timed out after "
+            f"{NETWORK_DISCOVERY_CHECK_TIMEOUT} seconds"
+        ) from None
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(
@@ -6633,6 +6666,9 @@ def ensure_windows_network_discovery_enabled() -> None:
         return
     try:
         state = windows_network_discovery_state()
+    except TimeoutError as error:
+        print(f"? {error}; launcher will continue")
+        return
     except Exception as error:
         print(f"XXX Cannot check Windows network discovery: {error}")
         return
@@ -6948,7 +6984,7 @@ def process_RETAIL_change_pdf(
                 + ", ".join(sorted(missing_caches))
             )
 
-        found_ids, added_ids = append_RETAIL_change_markers(
+        _found_ids, added_ids = append_RETAIL_change_markers(
             worker, expected_ids, "Order"
         )
         missing_statistics = set(expected_ids) - found_ids
@@ -7053,12 +7089,11 @@ def process_RETAIL_change_label_pdf(
             expected_ids,
             "Label",
         )
-        missing_statistics = set(expected_ids) - found_ids
-        if missing_statistics:
-            raise LookupError(
-                "Orders not found in today's statistics: "
-                + ", ".join(sorted(missing_statistics))
-            )
+        # A replacement label may belong to an order that was completed on a
+        # previous day and therefore was not carried into today's statistics.
+        # The PDF remains available for historical lookup, but there is no
+        # current order line to reopen.  Treat that case as already handled so
+        # the launcher does not retry and report it every monitor cycle.
     return added_ids
 
 
@@ -8137,7 +8172,9 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
         print(f"* Photo folder: {photo_dir}")
         print(f"* Statistics folder: {worker['STATISTICS']}")
         if worker.get("SUPPORT"):
-            print(f"* Support photo folder: {worker['SUPPORT_FOTO']}")
+            support_photo_dir = worker.get("SUPPORT_FOTO")
+            if support_photo_dir is not None:
+                print(f"* Support photo folder: {support_photo_dir}")
             print(
                 "* Support downloads folder: "
                 f"{worker['DOWNLOAD_DIRECTORIES'][0]}"
@@ -8430,7 +8467,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                             if scanner_line.startswith("Scan:")
                             else f"Scan:{scanner_line}"
                         )
-            if line.startswith(ESP_ROM_PREFIX):
+            if is_display_boot_message(line):
                 print(f"? AutoChecker {display_number} reset detected")
                 display_reset_event.set()
                 break
@@ -9730,7 +9767,7 @@ def dispatcher() -> None:
                     )
                     continue
 
-                if line.startswith(ESP_ROM_PREFIX):
+                if is_display_boot_message(line):
                     reset_recovery_deadlines[display_number] = (
                         time.monotonic() + DISPLAY_BOOT_DELAY
                     )
@@ -10040,9 +10077,10 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
     check_for_updates()
     ensure_default_sound_file()
-    ensure_windows_network_discovery_enabled()
-    ensure_windows_protected_print_disabled()
     startup_settings = ensure_settings_schema()
+    if not support_mode_enabled(startup_settings):
+        ensure_windows_network_discovery_enabled()
+    ensure_windows_protected_print_disabled()
     if support_mode_enabled(startup_settings):
         if connect_support_network_session(startup_settings):
             startup_settings = synchronize_support_catalog_settings(
