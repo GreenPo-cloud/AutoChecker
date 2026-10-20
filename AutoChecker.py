@@ -172,7 +172,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.27"
+CURRENT_VERSION = "3.28"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -5933,11 +5933,43 @@ def RETAIL_product_count_contribution(
     cache_path: Path,
     config: dict,
 ) -> dict[str, int]:
-    """Count each PRODUCTS row once, regardless of size and order quantity."""
-    parsed, _metadata = load_RETAIL_order_cache_file(cache_path)
+    """Count PRODUCTS rows in both current and legacy Order JSON schemas.
+
+    Operational loading deliberately validates every metadata field, but old
+    cache files can predate fields such as Delivery. Demand statistics only
+    need the Order list, so do not reject an otherwise usable historical file.
+    """
+    with portalocker.Lock(
+        str(cache_path), mode="r", encoding="utf-8", timeout=120
+    ) as file:
+        document = json.load(file)
+    if not isinstance(document, dict):
+        raise ValueError("Order JSON root must be an object")
+
     counts: dict[str, int] = defaultdict(int)
-    for items in parsed.values():
-        for item_name, _quantity in items:
+    for entry in document.values():
+        if not isinstance(entry, dict):
+            continue
+        order = entry.get("Order")
+        if isinstance(order, dict):
+            raw_items = list(order)
+        elif isinstance(order, list):
+            raw_items = []
+            for item in order:
+                if isinstance(item, dict):
+                    item_name = item.get("Name", item.get("name"))
+                elif isinstance(item, (list, tuple)) and item:
+                    item_name = item[0]
+                elif isinstance(item, str):
+                    item_name = item
+                else:
+                    item_name = None
+                if item_name is not None:
+                    raw_items.append(item_name)
+        else:
+            continue
+
+        for item_name in raw_items:
             product_name = counted_product_name(item_name, config)
             if product_name is not None:
                 counts[product_name] += 1
