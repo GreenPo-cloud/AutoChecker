@@ -160,6 +160,7 @@ CHANGE_PDF_SCAN_INTERVAL = 2.0
 CHANGE_PDF_RETRY_INTERVAL = 10.0
 ORDER_SOURCE_SCAN_INTERVAL = 2.0
 ORDER_SOURCE_RETRY_INTERVAL = 10.0
+PRODUCT_COUNT_MAX_AGE_DAYS = 90
 PHOTO_DELAY = 2.5
 B2B_INDEX_FILENAME = "B2B_Order_Index.txt"
 RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
@@ -171,7 +172,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.26"
+CURRENT_VERSION = "3.27"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -4804,8 +4805,12 @@ def _format_B2B_progress_section(
     no_barcode_items: list[tuple[str, int]],
     contributors: dict[str, list[str]],
     errors: set[str],
+    extra_contributors: dict[str, list[str]] | None = None,
+    error_contributors: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """Build aligned B2B position rows followed by recorded scan errors."""
+    extra_contributors = extra_contributors or {}
+    error_contributors = error_contributors or {}
     rows = []
     for name, quantity in items:
         if (name, quantity) in no_barcode_items:
@@ -4818,7 +4823,8 @@ def _format_B2B_progress_section(
         rows.append((status, name, names, False))
         extra_quantity = extras.get(name, 0)
         if extra_quantity:
-            rows.append((f"{extra_quantity} !!! EXTRA", "", names, True))
+            extra_names = ", ".join(extra_contributors.get(name, []))
+            rows.append((f"{extra_quantity} !!! EXTRA", "", extra_names, True))
 
     status_width = max(
         (len(status) for status, _, _, is_extra in rows if not is_extra),
@@ -4833,7 +4839,9 @@ def _format_B2B_progress_section(
     section = [header + "\n"]
     for left_text, (_, _, names, _) in zip(status_and_names, rows):
         section.append(f"{left_text:<{name_column_end}}    NAME: {names}\n")
-    section.extend(f"XXX {error}\n" for error in sorted(errors, key=str.casefold))
+    for error in sorted(errors, key=str.casefold):
+        names = ", ".join(error_contributors.get(error, []))
+        section.append(f"XXX {error}    NAME: {names}\n")
     section.append("\n")
     return section
 
@@ -4846,6 +4854,8 @@ def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
     stat_file = worker["ACTIVE_STAT_FILE"]
     header = f"----------{worker['B2B_PDF_NAME']}----------"
     contributors: dict[str, list[str]] = {}
+    extra_contributors: dict[str, list[str]] = {}
+    error_contributors: dict[str, list[str]] = {}
     with _locked_statistics_file(stat_file) as file:
         file.seek(0)
         lines = file.readlines()
@@ -4857,7 +4867,7 @@ def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
             file.writelines(
                 _format_B2B_progress_section(
                     header, items, counts, extras, no_barcode_items, contributors,
-                    errors,
+                    errors, extra_contributors, error_contributors,
                 )
             )
             file.flush()
@@ -4869,9 +4879,23 @@ def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
             for line in lines[start + 1:end]:
                 stripped_line = line.strip()
                 if stripped_line.startswith("XXX "):
-                    error_text = stripped_line[4:].strip()
+                    error_payload = stripped_line[4:].strip()
+                    if "NAME:" in error_payload:
+                        error_text, error_names = error_payload.rsplit(
+                            "NAME:", 1
+                        )
+                        error_text = error_text.strip()
+                        stored_error_names = [
+                            part.strip()
+                            for part in error_names.split(",")
+                            if part.strip()
+                        ]
+                    else:
+                        error_text = error_payload
+                        stored_error_names = []
                     if error_text:
                         errors.add(error_text)
+                        error_contributors[error_text] = stored_error_names
                     continue
                 if "NAME:" not in line:
                     continue
@@ -4888,6 +4912,11 @@ def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
                         counts[last_item_name] = (
                             item_quantities[last_item_name] + extra_quantity
                         )
+                        extra_contributors[last_item_name] = [
+                            part.strip()
+                            for part in names_text.split(",")
+                            if part.strip()
+                        ]
                     continue
                 status_match = re.fullmatch(
                     r"(\+|\?|\d+\s+\?|\d+/\d+)\s+(.+?)\s*",
@@ -4917,6 +4946,8 @@ def load_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
                     counts[name] = int(status.split("/", 1)[0])
                 contributors[name] = [part.strip() for part in names_text.split(",") if part.strip()]
     worker["B2B_POSITION_NAMES"] = contributors
+    worker["B2B_EXTRA_NAMES"] = extra_contributors
+    worker["B2B_ERROR_NAMES"] = error_contributors
 
 
 def save_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaultdict,
@@ -4926,15 +4957,24 @@ def save_B2B_progress(worker: dict, items: list[tuple[str, int]], counts: defaul
                       changed_item: str | None = None) -> None:
     """Atomically rewrite one B2B order section with progress and scan errors."""
     contributors = worker.setdefault("B2B_POSITION_NAMES", {})
+    extra_contributors = worker.setdefault("B2B_EXTRA_NAMES", {})
+    error_contributors = worker.setdefault("B2B_ERROR_NAMES", {})
     if changed_item is not None:
-        names = contributors.setdefault(changed_item, [])
+        item_quantity = dict(items).get(changed_item, 0)
+        target = (
+            extra_contributors
+            if counts.get(changed_item, 0) > item_quantity
+            else contributors
+        )
+        names = target.setdefault(changed_item, [])
         if worker["NAME"] not in names:
             names.append(worker["NAME"])
 
     stat_file = worker["ACTIVE_STAT_FILE"]
     header = f"----------{worker['B2B_PDF_NAME']}----------"
     section = _format_B2B_progress_section(
-        header, items, counts, extras, no_barcode_items, contributors, errors
+        header, items, counts, extras, no_barcode_items, contributors, errors,
+        extra_contributors, error_contributors,
     )
 
     with _locked_statistics_file(stat_file) as file:
@@ -5828,6 +5868,310 @@ def load_RETAIL_order_cache_file(
         return decode_RETAIL_order_cache(json.load(file))
 
 
+def product_count_catalog(config: dict) -> list[str]:
+    """Return unique PRODUCTS values in their Settings.json order."""
+    products = config.get("PRODUCTS", {})
+    if not isinstance(products, dict):
+        return []
+    result = []
+    seen = set()
+    for value in products.values():
+        name = str(value).strip()
+        key = name.casefold()
+        if name and key not in seen:
+            seen.add(key)
+            result.append(name)
+    return result
+
+
+def product_count_base_name(name: object) -> str:
+    """Remove Bonus and package size for demand-frequency statistics."""
+    normalized = normalize(bonus_barcode_name(str(name)))
+    return re.sub(
+        r"\s*-\s*\d+(?:\+\d+)?\s*fem\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def counted_product_name(
+    item_name: object,
+    config: dict,
+    *,
+    B2B: bool = False,
+) -> str | None:
+    """Resolve an order row to its canonical PRODUCTS value."""
+    catalog = product_count_catalog(config)
+    catalog_by_name = {
+        normalize(name).casefold(): name
+        for name in catalog
+    }
+    catalog_by_base = {
+        product_count_base_name(name).casefold(): name
+        for name in catalog
+    }
+    base_name = product_count_base_name(item_name)
+    direct = (
+        catalog_by_name.get(normalize(base_name).casefold())
+        or catalog_by_base.get(base_name.casefold())
+    )
+    if direct is not None or not B2B:
+        return direct
+
+    resolved = resolve_B2B_catalog_product(base_name, config)
+    if resolved is None or resolved[1] != "PRODUCTS":
+        return None
+    resolved_name = resolved[0]
+    return (
+        catalog_by_name.get(normalize(resolved_name).casefold())
+        or catalog_by_base.get(product_count_base_name(resolved_name).casefold())
+    )
+
+
+def RETAIL_product_count_contribution(
+    cache_path: Path,
+    config: dict,
+) -> dict[str, int]:
+    """Count each PRODUCTS row once, regardless of size and order quantity."""
+    parsed, _metadata = load_RETAIL_order_cache_file(cache_path)
+    counts: dict[str, int] = defaultdict(int)
+    for items in parsed.values():
+        for item_name, _quantity in items:
+            product_name = counted_product_name(item_name, config)
+            if product_name is not None:
+                counts[product_name] += 1
+    return dict(counts)
+
+
+def B2B_product_count_contribution(
+    progress_path: Path,
+    config: dict,
+) -> dict[str, int]:
+    """Count PRODUCTS rows stored in one B2B _Sborka text file."""
+    counts: dict[str, int] = defaultdict(int)
+    for line in read_stat_lines(progress_path):
+        if "NAME:" not in line:
+            continue
+        left_text = line.split("NAME:", 1)[0].strip()
+        match = re.fullmatch(
+            r"(?:\+|\d+/\d+|\d+\s+\?)\s+(.+?)\s*",
+            left_text,
+        )
+        if match is None:
+            continue
+        product_name = counted_product_name(
+            match.group(1), config, B2B=True
+        )
+        if product_name is not None:
+            counts[product_name] += 1
+    return dict(counts)
+
+
+def RETAIL_product_count_sources(
+    worker: dict,
+) -> list[tuple[str, datetime.date, Path]]:
+    """Return one recent Order JSON per RETAIL part name."""
+    cutoff = datetime.date.today() - datetime.timedelta(
+        days=PRODUCT_COUNT_MAX_AGE_DAYS
+    )
+    by_name: dict[str, tuple[str, datetime.date, Path]] = {}
+    for source_date, _part, _canonical, _pdf, cache_path in (
+        _available_RETAIL_order_sources(worker.get("DOWNLOAD_DIRECTORIES"))
+    ):
+        if source_date < cutoff or cache_path is None:
+            continue
+        source_id = cache_path.name
+        key = source_id.casefold()
+        candidate = (source_id, source_date, cache_path)
+        current = by_name.get(key)
+        if current is None:
+            by_name[key] = candidate
+            continue
+        try:
+            if cache_path.stat().st_mtime_ns > current[2].stat().st_mtime_ns:
+                by_name[key] = candidate
+        except OSError:
+            pass
+    return sorted(by_name.values(), key=lambda item: (item[1], item[0].casefold()))
+
+
+def B2B_product_count_sources() -> list[tuple[str, datetime.date, Path]]:
+    """Return recent local B2B progress files; network text is never read."""
+    history = DESKTOP_DIR / "B2B" / "History"
+    if not history.is_dir():
+        return []
+    cutoff = datetime.date.today() - datetime.timedelta(
+        days=PRODUCT_COUNT_MAX_AGE_DAYS
+    )
+    result = []
+    try:
+        paths = list(history.rglob("*_Sborka.txt"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        source_date = datetime.date.fromtimestamp(stat.st_mtime)
+        if source_date < cutoff:
+            continue
+        try:
+            source_id = path.relative_to(history).as_posix()
+        except ValueError:
+            source_id = path.name
+        result.append((source_id, source_date, path))
+    return sorted(result, key=lambda item: (item[1], item[0].casefold()))
+
+
+def refresh_product_count_file(
+    department: str,
+    sources: list[tuple[str, datetime.date, Path]],
+    config: dict,
+) -> bool:
+    """Incrementally rebuild a 90-day PRODUCTS frequency snapshot."""
+    department = department.upper()
+    count_path = DESKTOP_DIR / department / "Count.json"
+    count_path.parent.mkdir(parents=True, exist_ok=True)
+    catalog = product_count_catalog(config)
+    parser = (
+        RETAIL_product_count_contribution
+        if department == "RETAIL"
+        else B2B_product_count_contribution
+    )
+
+    with portalocker.Lock(
+        str(count_path), mode="a+", encoding="utf-8", timeout=120
+    ) as file:
+        file.seek(0)
+        raw = file.read().strip()
+        try:
+            previous = json.loads(raw) if raw else {}
+        except (TypeError, json.JSONDecodeError):
+            previous = {}
+        if not isinstance(previous, dict):
+            previous = {}
+        previous_products = previous.get("PRODUCTS", {})
+        previous_files = previous.get("PROCESSED_FILES", {})
+        if not isinstance(previous_products, dict):
+            previous_products = {}
+        if not isinstance(previous_files, dict):
+            previous_files = {}
+        # Count.json is ordered by frequency, so its key order normally
+        # differs from Settings.json. Only catalogue membership determines
+        # whether cached per-file contributions need to be recalculated.
+        catalog_changed = set(previous_products) != set(catalog)
+
+        processed_files: OrderedDict[str, dict] = OrderedDict()
+        total: dict[str, int] = defaultdict(int)
+        catalog_set = set(catalog)
+        for source_id, source_date, source_path in sources:
+            try:
+                stat = source_path.stat()
+            except OSError:
+                continue
+            old_record = previous_files.get(source_id, {})
+            can_reuse = (
+                not catalog_changed
+                and isinstance(old_record, dict)
+                and old_record.get("date") == source_date.isoformat()
+                and old_record.get("modified_ns") == stat.st_mtime_ns
+                and old_record.get("size") == stat.st_size
+                and isinstance(old_record.get("PRODUCTS"), dict)
+            )
+            if can_reuse:
+                contribution = {
+                    str(name): int(value)
+                    for name, value in old_record["PRODUCTS"].items()
+                    if name in catalog_set
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                }
+            else:
+                try:
+                    contribution = parser(source_path, config)
+                except Exception as error:
+                    print(
+                        f"XXX Cannot count products in {source_path}: {error}"
+                    )
+                    if (
+                        not catalog_changed
+                        and isinstance(old_record, dict)
+                        and isinstance(old_record.get("PRODUCTS"), dict)
+                    ):
+                        contribution = {
+                            str(name): int(value)
+                            for name, value in old_record["PRODUCTS"].items()
+                            if name in catalog_set
+                            and isinstance(value, int)
+                            and not isinstance(value, bool)
+                            and value >= 0
+                        }
+                    else:
+                        continue
+            contribution = {
+                name: value
+                for name, value in contribution.items()
+                if name in catalog_set and value > 0
+            }
+            processed_files[source_id] = {
+                "date": source_date.isoformat(),
+                "modified_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+                "PRODUCTS": contribution,
+            }
+            for name, value in contribution.items():
+                total[name] += value
+
+        catalog_order = {name: index for index, name in enumerate(catalog)}
+        sorted_catalog = sorted(
+            catalog,
+            key=lambda name: (
+                -total.get(name, 0),
+                catalog_order[name],
+            ),
+        )
+        product_counts = OrderedDict(
+            (name, total.get(name, 0)) for name in sorted_catalog
+        )
+        unchanged = (
+            previous_products == product_counts
+            and previous_files == processed_files
+        )
+        if unchanged:
+            return False
+
+        document = OrderedDict((
+            ("PRODUCTS", product_counts),
+            ("PROCESSED_FILES", processed_files),
+            ("UPDATED_AT", datetime.datetime.now().isoformat(timespec="seconds")),
+        ))
+        file.seek(0)
+        file.truncate()
+        json.dump(document, file, ensure_ascii=False, indent=4)
+        file.write("\n")
+        file.flush()
+    print(
+        f"* {department} Count.json updated | "
+        f"{len(processed_files)} file(s) | {sum(product_counts.values())} position(s)"
+    )
+    return True
+
+
+def refresh_RETAIL_product_count(worker: dict, config: dict) -> bool:
+    return refresh_product_count_file(
+        "RETAIL", RETAIL_product_count_sources(worker), config
+    )
+
+
+def refresh_B2B_product_count(config: dict) -> bool:
+    return refresh_product_count_file(
+        "B2B", B2B_product_count_sources(), config
+    )
+
+
 def RETAIL_statistics_part_names(worker: dict) -> set[str]:
     """Return PDF part names already represented in today's statistics."""
     stat_file = retail_statistics_file(worker)
@@ -6009,6 +6353,10 @@ def process_pending_RETAIL_order_sources(
             f"{len(selected)} order(s)"
         )
 
+    try:
+        refresh_RETAIL_product_count(worker, config)
+    except Exception as error:
+        Printer(f"XXX Cannot update RETAIL Count.json: {error}")
     return imported_orders
 
 
@@ -8018,6 +8366,10 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                 worker, orders[current_order], counts, extras, errors,
                 no_barcode_items,
             )
+            try:
+                refresh_B2B_product_count(config)
+            except Exception as error:
+                Printer(f"XXX Cannot update B2B Count.json: {error}")
         else:
             update_order_in_statistics(worker, current_order, add_name=True)
         show_status(
@@ -8065,7 +8417,14 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
     if item_name is None or item_name not in order_items:
         if performance_stats is not None:
             performance_stats.record_mistake()
-        errors.add(product_name or f"Unknown barcode {code}")
+        error_text = product_name or f"Unknown barcode {code}"
+        errors.add(error_text)
+        if is_B2B:
+            error_names = worker.setdefault("B2B_ERROR_NAMES", {}).setdefault(
+                error_text, []
+            )
+            if worker["NAME"] not in error_names:
+                error_names.append(worker["NAME"])
         photo_pending = False
     else:
         counts[item_name] += 1
@@ -9371,6 +9730,10 @@ def dispatcher() -> None:
     # Add the per-display saved-selection slots after their IDs are known.
     settings = ensure_detected_settings(cameras, display_ports)
     ensure_worker_statistics_files(settings)
+    try:
+        refresh_B2B_product_count(settings)
+    except Exception as error:
+        print(f"XXX Cannot update B2B Count.json: {error}")
 
     launcher_retail_worker = None
     launcher_console_started = False
