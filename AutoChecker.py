@@ -172,7 +172,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.29"
+CURRENT_VERSION = "3.30"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -295,8 +295,8 @@ EXPECTED_CYD_APP_SLOTS = (
     (0x150000, 0x140000, "app1"),
 )
 EXPECTED_BYD_APP_SLOTS = (
-    (0x10000, 0x300000, "app0"),
-    (0x310000, 0x300000, "app1"),
+    (0x10000, 0x140000, "app0"),
+    (0x150000, 0x140000, "app1"),
 )
 DISPLAY_FIRMWARE_CONFIG = {
     "CYD": {
@@ -6236,12 +6236,16 @@ def refresh_product_count_file(
 
 
 def refresh_RETAIL_product_count(worker: dict, config: dict) -> bool:
+    if support_mode_enabled(config):
+        return False
     return refresh_product_count_file(
         "RETAIL", RETAIL_product_count_sources(worker), config
     )
 
 
 def refresh_B2B_product_count(config: dict) -> bool:
+    if support_mode_enabled(config):
+        return False
     return refresh_product_count_file(
         "B2B", B2B_product_count_sources(), config
     )
@@ -7824,7 +7828,6 @@ def parse_orders_B2B(
     lines = [
         line for line in lines
         if not re.fullmatch(r"\d+\s*/\s*\d+", line)
-        and line.casefold() != table_header.casefold()
     ]
 
     # Spain counts only inside the Ship To block ending at Delivery Note.
@@ -7852,6 +7855,21 @@ def parse_orders_B2B(
         None,
     )
     if start_index is None or end_index is None or start_index >= end_index:
+        # Some valid B2B delivery notes put PAYMENT DATE below Company Name.
+        # In that layout the visible table header is the reliable start
+        # boundary, while Company Name still marks the end of the positions.
+        start_index = next(
+            (index + 1 for index, line in enumerate(lines)
+             if line.casefold() == table_header.casefold()),
+            None,
+        )
+        end_index = next(
+            (index for index, line in enumerate(lines)
+             if start_index is not None and index >= start_index
+             and line.casefold().startswith("company name")),
+            None,
+        )
+    if start_index is None or end_index is None or start_index >= end_index:
         message = f"XXX B2B order table not found in {pdf_path.name}"
         Printer(message)
         send(worker["DISPLAY"], message)
@@ -7860,6 +7878,8 @@ def parse_orders_B2B(
     positions = []
     B2B_match_names: dict[str, str] = {}
     for line in lines[start_index:end_index]:
+        if line.casefold() == table_header.casefold():
+            continue
         match = re.fullmatch(r"(.+?)\s+(\d+(?:\+\d+)?)\s+(\d+)", line)
         gift_match = re.fullmatch(r"(.+?)\s+GIFT\s+(\d+)", line, re.IGNORECASE)
         if match:
