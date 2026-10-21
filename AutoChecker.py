@@ -172,7 +172,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.31"
+CURRENT_VERSION = "3.32"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -4187,6 +4187,16 @@ def print_DYMO_order_label(
     return "DYMO"
 
 
+def customer_name_initials(customer_name: object) -> str:
+    """Shorten every Unicode word while preserving digits and separators."""
+    normalized = re.sub(r"\s+", " ", str(customer_name)).strip()
+    return re.sub(
+        r"[^\W\d_]+",
+        lambda match: match.group(0)[0].upper() + ".",
+        normalized,
+    )
+
+
 def print_RETAIL_order_label(worker: dict, order_id: str) -> int | str:
     """Render and submit one normal or STEALTH RETAIL order label."""
     printer_name = str(worker.get("PRINTER", "")).strip()
@@ -4202,7 +4212,7 @@ def print_RETAIL_order_label(worker: dict, order_id: str) -> int | str:
     if not customer_name:
         raise LookupError(f"Customer name not found: {order_id}")
     data = {
-        "NAME": customer_name,
+        "NAME": customer_name_initials(customer_name),
         "OrderNumber": order_id,
         "Delivery": normalize_RETAIL_delivery(metadata.get("delivery", "")),
         "Date": f"{datetime.date.today():%d.%m.%Y}",
