@@ -172,7 +172,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.32"
+CURRENT_VERSION = "3.34"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -210,7 +210,6 @@ SUPPORT_CATALOG_KEYS = (
     "AUTO_COMPLETE_ITEMS",
     "FEM_BONUS",
     "AUTO_BONUS",
-    "OTHER_BONUS",
     "REMOVE_ITEMS",
     "REMOVE_PHRASES",
     "PRODUCT_NAME_EXCEPTIONS",
@@ -233,7 +232,6 @@ SETTINGS_SCHEMA_DEFAULTS = {
     "AUTO_COMPLETE_ITEMS": [],
     "FEM_BONUS": {},
     "AUTO_BONUS": {},
-    "OTHER_BONUS": {},
     "REMOVE_ITEMS": [],
     "REMOVE_PHRASES": [],
     "PRODUCT_NAME_EXCEPTIONS": [],
@@ -883,11 +881,13 @@ def ensure_settings_schema() -> dict:
             raise ValueError("Settings.json must contain a JSON object")
 
         changed = False
-        # Sound files are local replaceable assets. Older releases stored
-        # their paths in Settings.json; remove that obsolete setting once.
-        if "SOUNDS" in settings:
-            del settings["SOUNDS"]
-            changed = True
+        # Remove settings that are no longer part of AutoChecker's logic.
+        # Sound files are local replaceable assets; OTHER_BONUS was replaced
+        # by the common Bonus handling used for every PRODUCTS position.
+        for obsolete_key in ("SOUNDS", "OTHER_BONUS"):
+            if obsolete_key in settings:
+                del settings[obsolete_key]
+                changed = True
         for key, default_value in SETTINGS_SCHEMA_DEFAULTS.items():
             if key not in settings:
                 settings[key] = copy.deepcopy(default_value)
@@ -2262,10 +2262,10 @@ def send(display: serial.Serial, message: str) -> None:
     def colour_tag(line: str) -> str:
         if line.startswith(("XXX", "!")) or "!!!" in line:
             return "#ff0000"
-        if re.search(r"\bBonus\b", line, re.IGNORECASE):
-            return BONUS_COLOUR
         if line.startswith("+") or re.match(r"^\d+\s+\+", line):
             return "#00ff00"
+        if re.search(r"\bBonus\b", line, re.IGNORECASE):
+            return BONUS_COLOUR
         if line.startswith("*"):
             return "#00ffff"
         if line.startswith("Order"):
@@ -4224,7 +4224,12 @@ def print_RETAIL_order_label(worker: dict, order_id: str) -> int | str:
             if is_stealth
             else DYMO_ORDER_LABEL_TEMPLATE
         )
-        return print_DYMO_order_label(printer_name, template_path, data)
+        job_id = print_DYMO_order_label(printer_name, template_path, data)
+        worker["LAST_PRINTED_LABEL"] = {
+            "kind": "RETAIL_ORDER",
+            "order_id": order_id,
+        }
+        return job_id
 
     template_path = (
         STEALTH_ORDER_LABEL_TEMPLATE if is_stealth else ORDER_LABEL_TEMPLATE
@@ -4273,6 +4278,10 @@ def print_RETAIL_order_label(worker: dict, order_id: str) -> int | str:
         dc.EndPage()
         dc.EndDoc()
         document_started = False
+        worker["LAST_PRINTED_LABEL"] = {
+            "kind": "RETAIL_ORDER",
+            "order_id": order_id,
+        }
         return job_id
     except BaseException:
         if document_started:
@@ -4458,6 +4467,13 @@ def submit_RETAIL_UP_label(
     if printer_name and not postal_order and not tracking_missing:
         print_pdf_page(pdf_path, page_number, printer_name, label_type)
         physically_printed = True
+        worker["LAST_PRINTED_LABEL"] = {
+            "kind": "RETAIL_UP",
+            "order_id": order_id,
+            "pdf_path": Path(pdf_path),
+            "page_number": page_number,
+            "label_type": label_type,
+        }
     else:
         physically_printed = False
     recorded_name = worker["NAME"]
@@ -4484,6 +4500,34 @@ def submit_RETAIL_UP_label(
             f"+ Order {order_id.lstrip('#')} recorded without printing"
         )
     return status_message, physically_printed
+
+
+def repeat_last_printed_label(worker: dict) -> str:
+    """Repeat this child process's most recent successful print job."""
+    printer_name = str(worker.get("PRINTER", "")).strip()
+    if not printer_name:
+        raise ValueError("Printer is not selected")
+    last_label = worker.get("LAST_PRINTED_LABEL")
+    if not isinstance(last_label, dict):
+        raise LookupError("No label has been printed in this process")
+
+    label_kind = last_label.get("kind")
+    order_id = str(last_label.get("order_id", "")).strip()
+    if label_kind == "RETAIL_ORDER" and order_id:
+        job_id = print_RETAIL_order_label(worker, order_id)
+        return (
+            f"* Order label repeated {order_id.lstrip('#')} | Job {job_id}"
+        )
+    if label_kind == "RETAIL_UP" and order_id:
+        pdf_path = Path(last_label["pdf_path"])
+        page_number = int(last_label["page_number"])
+        label_type = str(last_label["label_type"])
+        print_pdf_page(pdf_path, page_number, printer_name, label_type)
+        return (
+            f"* Postal label repeated {order_id.lstrip('#')} "
+            f"page {page_number}"
+        )
+    raise LookupError("Last printed label data is invalid")
 
 
 def process_RETAIL_UP_scan(
@@ -5715,6 +5759,18 @@ def RETAIL_order_cache_path(pdf_path: Path) -> Path:
     return pdf_path.with_name(pdf_path.stem + RETAIL_ORDER_CACHE_SUFFIX)
 
 
+def RETAIL_pdf_path_for_cache(cache_path: Path) -> Path:
+    """Return the expected sibling PDF path for one Order JSON cache."""
+    suffix_length = len(RETAIL_ORDER_CACHE_SUFFIX)
+    if not cache_path.name.casefold().endswith(
+        RETAIL_ORDER_CACHE_SUFFIX.casefold()
+    ):
+        raise ValueError(f"Not an Order JSON filename: {cache_path.name}")
+    return cache_path.with_name(
+        cache_path.name[:-suffix_length] + ".pdf"
+    )
+
+
 def parse_RETAIL_pdf_document(
     pdf_path: Path,
     config: dict,
@@ -5910,10 +5966,17 @@ def load_or_create_RETAIL_order_cache(
             raise ValueError(f"No RETAIL orders found in {pdf_path.name}")
         warn_RETAIL_orders_without_tracking(metadata_by_order)
         document = RETAIL_order_cache_document(parsed, metadata_by_order)
+        serialized = json.dumps(
+            document,
+            ensure_ascii=False,
+            indent=4,
+        ) + "\n"
         file.seek(0)
+        # Prepare the complete JSON in memory and write it before truncating
+        # an older tail. This avoids the large empty-file window caused by
+        # truncate-before-json.dump if a process is interrupted.
+        file.write(serialized)
         file.truncate()
-        json.dump(document, file, ensure_ascii=False, indent=4)
-        file.write("\n")
         file.flush()
         Printer(f"* Order JSON created | {cache_path.name}")
         return parsed, metadata_by_order
@@ -5926,7 +5989,10 @@ def load_RETAIL_order_cache_file(
     with portalocker.Lock(
         str(cache_path), mode="r", encoding="utf-8", timeout=120
     ) as file:
-        return decode_RETAIL_order_cache(json.load(file))
+        raw = file.read().strip().lstrip("\ufeff")
+        if not raw:
+            raise ValueError(f"Order JSON is empty: {cache_path.name}")
+        return decode_RETAIL_order_cache(json.loads(raw))
 
 
 def product_count_catalog(config: dict) -> list[str]:
@@ -6017,12 +6083,33 @@ def RETAIL_product_count_contribution(
     cache files can predate fields such as Delivery. Demand statistics only
     need the Order list, so do not reject an otherwise usable historical file.
     """
-    with portalocker.Lock(
-        str(cache_path), mode="r", encoding="utf-8", timeout=120
-    ) as file:
-        document = json.load(file)
-    if not isinstance(document, dict):
-        raise ValueError("Order JSON root must be an object")
+    document = None
+    invalid_cache_error: Exception | None = None
+    try:
+        with portalocker.Lock(
+            str(cache_path), mode="r", encoding="utf-8", timeout=120
+        ) as file:
+            raw = file.read().strip().lstrip("\ufeff")
+        if not raw:
+            raise ValueError(f"Order JSON is empty: {cache_path.name}")
+        document = json.loads(raw)
+        if not isinstance(document, dict):
+            raise ValueError("Order JSON root must be an object")
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        invalid_cache_error = error
+
+    if invalid_cache_error is not None:
+        pdf_path = RETAIL_pdf_path_for_cache(cache_path)
+        if not pdf_path.is_file():
+            # An old interrupted cache cannot be reconstructed after its PDF
+            # has already been removed. Treat it as a zero contribution. Its
+            # file signature is recorded in Count.json, so startup will not
+            # report the same unchanged file again.
+            return {}
+        parsed, metadata = load_or_create_RETAIL_order_cache(pdf_path, config)
+        document = RETAIL_order_cache_document(parsed, metadata)
+
+    assert isinstance(document, dict)
 
     counts: dict[str, int] = defaultdict(int)
     for entry in document.values():
@@ -6243,6 +6330,13 @@ def refresh_product_count_file(
                         }
                     else:
                         continue
+                # RETAIL counting can repair an empty cache from its PDF.
+                # Record the repaired file's signature, not the stale size
+                # and timestamp captured before parsing.
+                try:
+                    stat = source_path.stat()
+                except OSError:
+                    continue
             contribution = {
                 name: value
                 for name, value in contribution.items()
@@ -6361,7 +6455,16 @@ def load_RETAIL_orders_from_statistics(
             continue
         try:
             if cache_path is not None:
-                parsed, metadata = load_RETAIL_order_cache_file(cache_path)
+                try:
+                    parsed, metadata = load_RETAIL_order_cache_file(
+                        cache_path
+                    )
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    if pdf_path is None:
+                        raise
+                    parsed, metadata = load_or_create_RETAIL_order_cache(
+                        pdf_path, config
+                    )
             elif pdf_path is not None:
                 parsed, metadata = load_or_create_RETAIL_order_cache(
                     pdf_path, config
@@ -8127,14 +8230,20 @@ def RETAIL_delivery_from_stat_line(line: str) -> str:
     return RETAIL_delivery_from_tracking_number(tracking_number)
 
 
-def reserve_next_RETAIL_order(worker: dict, orders: dict) -> str | None:
-    """Assign one free order without crossing the active delivery priority."""
+def reserve_next_RETAIL_order(
+    worker: dict,
+    orders: dict,
+    *,
+    ignore_delivery_priority: bool = False,
+) -> str | None:
+    """Assign one free order, optionally continuing past a busy delivery class."""
     available_order_ids = set(orders)
     stat_file = statistics_file(worker)
     with _locked_statistics_file(stat_file) as file:
         file.seek(0)
         lines = file.readlines()
         reserved_order = None
+        unfinished_orders: list[tuple[int, str, str]] = []
         unfinished_by_rank: dict[int, list[tuple[int, str, str]]] = defaultdict(list)
         delivery_rank = {
             delivery: rank
@@ -8149,21 +8258,25 @@ def reserve_next_RETAIL_order(worker: dict, orders: dict) -> str | None:
             if "+" in effective_status:
                 continue
             delivery = RETAIL_delivery_from_stat_line(raw_text)
-            unfinished_by_rank[delivery_rank[delivery]].append(
-                (index, order_id, raw_text)
-            )
+            order_entry = (index, order_id, raw_text)
+            unfinished_orders.append(order_entry)
+            unfinished_by_rank[delivery_rank[delivery]].append(order_entry)
 
-        if not unfinished_by_rank:
+        if not unfinished_orders:
             worker.pop("RETAIL_RESERVATION_WAITING_DELIVERY", None)
             return None
 
-        active_rank = min(unfinished_by_rank)
-        active_delivery = RETAIL_DELIVERY_ORDER[active_rank]
-        active_orders = unfinished_by_rank[active_rank]
-        # Change orders remain first inside their delivery class, but can no
-        # longer make Postal or Packeta jump ahead of unfinished UPS orders.
+        if ignore_delivery_priority:
+            candidate_orders = unfinished_orders
+            waiting_delivery = "ALL"
+        else:
+            active_rank = min(unfinished_by_rank)
+            waiting_delivery = RETAIL_DELIVERY_ORDER[active_rank]
+            candidate_orders = unfinished_by_rank[active_rank]
+        # Reopened Change orders remain first. NextOrder can search every
+        # delivery class; the ordinary automatic chain keeps UPS priority.
         for changed_order_only in (True, False):
-            for index, order_id, raw_text in active_orders:
+            for index, order_id, raw_text in candidate_orders:
                 if order_id not in available_order_ids:
                     continue
                 if retail_stat_has_order_change(raw_text) != changed_order_only:
@@ -8183,10 +8296,7 @@ def reserve_next_RETAIL_order(worker: dict, orders: dict) -> str | None:
             file.flush()
             mirror_statistics_lines(worker, stat_file, lines)
         else:
-            # At least one order of the highest-priority class is still being
-            # assembled (or its new part has not reached this worker yet).
-            # Never advance to the next delivery class in that state.
-            worker["RETAIL_RESERVATION_WAITING_DELIVERY"] = active_delivery
+            worker["RETAIL_RESERVATION_WAITING_DELIVERY"] = waiting_delivery
         return reserved_order
 
 
@@ -8461,6 +8571,7 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                  counts: defaultdict, extras: defaultdict, errors: set,
                  no_barcode_items: list[tuple[str, int]], photo_pending: bool,
                  photo_start: float, automatic_assignment: bool = False,
+                 print_order_label: bool = False,
                  record_performance: bool = True,
                  ) -> tuple[str | None, bool, float]:
     """Apply one scanner barcode/order code using the previous AutoChecker rules."""
@@ -8509,6 +8620,26 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                 Printer(message)
                 send_fn(message)
                 return current_order, photo_pending, photo_start
+            if print_order_label and worker.get("PRINTER"):
+                try:
+                    job_id = print_RETAIL_order_label(worker, matched)
+                except Exception as error:
+                    if status == "claimed":
+                        release_RETAIL_order_reservation(worker, matched)
+                    if performance_stats is not None:
+                        performance_stats.record_mistake()
+                    message = (
+                        f"XXX Cannot print order label {matched}: {error}"
+                    )
+                    Printer(message)
+                    send_fn(message)
+                    return current_order, photo_pending, photo_start
+                message = (
+                    f"* Order label printed {matched.lstrip('#')} | "
+                    f"Job {job_id}"
+                )
+                Printer(message)
+                send_fn(message)
         if performance_stats is not None and record_performance:
             performance_stats.record_scan(matched)
         if worker.get("DEPARTMENT", "").upper() == "RETAIL":
@@ -8570,9 +8701,6 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
         or counts.get(name, 0) >= quantity
         for name, quantity in orders[current_order]
     )
-
-    if (is_B2B or regular_ready) and code in config.get("OTHER_BONUS", {}):
-        product_name = config["OTHER_BONUS"][code]
 
     item_name, quantity = (
         find_original_item(
@@ -8638,21 +8766,28 @@ def automatically_assign_next_RETAIL_order(
     extras: defaultdict,
     errors: set,
     no_barcode_items: list[tuple[str, int]],
+    *,
+    ignore_delivery_priority: bool = False,
 ) -> tuple[str | None, bool, float]:
     """Reserve and activate the next RETAIL order, printing when possible."""
     performance_stats: WorkerPerformanceStats | None = worker.get(
         "PERFORMANCE_STATS"
     )
-    order_id = reserve_next_RETAIL_order(worker, orders)
+    order_id = reserve_next_RETAIL_order(
+        worker,
+        orders,
+        ignore_delivery_priority=ignore_delivery_priority,
+    )
     if order_id is None:
         if performance_stats is not None:
             performance_stats.stop_tracking()
         waiting_delivery = worker.get("RETAIL_RESERVATION_WAITING_DELIVERY")
-        message = (
-            f"* Waiting for unfinished {waiting_delivery} orders"
-            if waiting_delivery
-            else "* All orders compeleted"
-        )
+        if waiting_delivery == "ALL":
+            message = "* Waiting for unfinished orders"
+        elif waiting_delivery:
+            message = f"* Waiting for unfinished {waiting_delivery} orders"
+        else:
+            message = "* All orders compeleted"
         Printer(message)
         send(worker["DISPLAY"], message)
         return None, False, 0.0
@@ -9349,6 +9484,18 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                                 display_number,
                             ))
 
+            if line in {"ReapitLabel", "RepeatLabel"}:
+                try:
+                    message = repeat_last_printed_label(worker)
+                except Exception as error:
+                    message = f"XXX Cannot repeat label: {error}"
+                Printer(message)
+                if identity.department.upper() == RETAIL_UP_DEPARTMENT:
+                    send_RETAIL_UP_display_state(worker, (message,))
+                else:
+                    send(worker["DISPLAY"], message)
+                continue
+
             if line == "NextOrder":
                 if identity.department.upper() != "RETAIL":
                     message = "XXX NextOrder is available only for RETAIL"
@@ -9363,6 +9510,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         extras,
                         errors,
                         no_barcode_items,
+                        ignore_delivery_priority=True,
                     )
                     if next_state[0] is not None:
                         current_order, photo_pending, photo_start = next_state
@@ -9448,6 +9596,10 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         current_order, photo_pending, photo_start = process_scan(
                             worker, config, code, orders, current_order, counts, extras,
                             errors, no_barcode_items, photo_pending, photo_start,
+                            print_order_label=(
+                                identity.department.upper() == "RETAIL"
+                                and code.startswith("#")
+                            ),
                         )
 
             if line == "Photo":
