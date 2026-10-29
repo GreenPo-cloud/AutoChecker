@@ -160,7 +160,7 @@ CHANGE_PDF_SCAN_INTERVAL = 2.0
 CHANGE_PDF_RETRY_INTERVAL = 10.0
 ORDER_SOURCE_SCAN_INTERVAL = 2.0
 ORDER_SOURCE_RETRY_INTERVAL = 10.0
-PRODUCT_COUNT_MAX_AGE_DAYS = 90
+PRODUCT_COUNT_MAX_AGE_DAYS = 60
 PHOTO_DELAY = 2.5
 B2B_INDEX_FILENAME = "B2B_Order_Index.txt"
 RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
@@ -172,7 +172,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.34"
+CURRENT_VERSION = "3.36"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -4211,10 +4211,19 @@ def print_RETAIL_order_label(worker: dict, order_id: str) -> int | str:
     ).strip()
     if not customer_name:
         raise LookupError(f"Customer name not found: {order_id}")
+    delivery = normalize_RETAIL_delivery(metadata.get("delivery", ""))
+    destination = re.sub(
+        r"\s+", " ", str(metadata.get("destination", ""))
+    ).strip()
+    delivery_text = (
+        f"Postal: {destination}"
+        if delivery == "Postal" and destination
+        else delivery
+    )
     data = {
         "NAME": customer_name_initials(customer_name),
         "OrderNumber": order_id,
-        "Delivery": normalize_RETAIL_delivery(metadata.get("delivery", "")),
+        "Delivery": delivery_text,
         "Date": f"{datetime.date.today():%d.%m.%Y}",
     }
 
@@ -5382,6 +5391,10 @@ def save_part_to_statistics(
     parsed_orders: dict,
     config: dict,
 ) -> None:
+    # A completed PDF from an earlier day has no free orders to carry over.
+    # Do not create a header-only section in today's statistics file.
+    if not parsed_orders:
+        return
     stat_file = statistics_file(worker)
     header_prefix = f"----------{pdf_path.name}----------"
     pack, volume = RETAIL_part_totals(parsed_orders, config)
@@ -5721,6 +5734,102 @@ def RETAIL_orders_for_current_day(
     )
 
 
+def RETAIL_pdf_page_destination_data(
+    page,
+) -> tuple[dict[str, str], list[str]]:
+    """Read destinations from the left PDF column and return prefixes to cut.
+
+    Order products start at the checkbox column.  Address text is left of that
+    column, even when a long destination wraps across several visual rows.
+    Keeping the columns separate prevents an address row from being joined to
+    a product-name or quantity continuation in the right column.
+    """
+    words = page.extract_words(
+        use_text_flow=False,
+        keep_blank_chars=False,
+    )
+    checkbox_positions = [
+        float(word["x0"])
+        for word in words
+        if str(word.get("text", "")).strip() == "☐"
+    ]
+    if not checkbox_positions:
+        return {}, []
+    product_column_x = min(checkbox_positions)
+
+    rows: list[list[dict]] = []
+    for word in sorted(
+        words,
+        key=lambda item: (float(item["top"]), float(item["x0"])),
+    ):
+        top = float(word["top"])
+        if not rows or abs(top - float(rows[-1][0]["top"])) > 2.0:
+            rows.append([word])
+        else:
+            rows[-1].append(word)
+
+    destinations: dict[str, str] = {}
+    prefixes_to_remove: list[str] = []
+    current_order: str | None = None
+    destination_fragments: list[str] = []
+    awaiting_destination = False
+    for row in rows:
+        left_text = " ".join(
+            str(word["text"])
+            for word in sorted(row, key=lambda item: float(item["x0"]))
+            if float(word["x0"]) < product_column_x - 0.5
+        ).strip()
+        if not left_text:
+            continue
+
+        order_match = re.match(r"^(#\d+)(?=\s|$)", left_text)
+        if order_match is not None:
+            current_order = order_match.group(1)
+            destination_fragments = []
+            awaiting_destination = False
+            continue
+        if current_order is None:
+            continue
+
+        if re.match(
+            r"^(?:UPS|Zasilkovna|Postal)\b",
+            left_text,
+            re.IGNORECASE,
+        ):
+            destination_fragments = []
+            awaiting_destination = True
+            continue
+        if not awaiting_destination:
+            continue
+
+        prefixes_to_remove.append(left_text)
+        fragment = left_text.split("✈", 1)[0].strip()
+        if fragment:
+            destination_fragments.append(fragment)
+        if "✈" in left_text:
+            destinations[current_order] = re.sub(
+                r"\s+", " ", " ".join(destination_fragments)
+            ).strip()
+            destination_fragments = []
+            awaiting_destination = False
+
+    return destinations, prefixes_to_remove
+
+
+def remove_RETAIL_pdf_line_prefixes(
+    text: str,
+    prefixes: list[str],
+) -> str:
+    """Remove left-column address prefixes while retaining right-column text."""
+    for prefix in prefixes:
+        words = prefix.split()
+        if not words:
+            continue
+        pattern = r"(?m)^" + r"\s+".join(map(re.escape, words)) + r"(?=\s|$)\s*"
+        text = re.sub(pattern, "", text, count=1)
+    return text
+
+
 def restore_RETAIL_wrapped_lines(text: str, tracking_pattern: re.Pattern) -> str:
     """Remove delivery prefixes and reattach their product-name continuations."""
     restored_lines: list[str] = []
@@ -5778,8 +5887,19 @@ def parse_RETAIL_pdf_document(
     """Extract RETAIL orders and metadata from one source PDF."""
     import pdfplumber
 
+    destination_by_order: dict[str, str] = {}
+    page_texts = []
     with pdfplumber.open(pdf_path) as pdf:
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages).replace("\r", "\n")
+        for page in pdf.pages:
+            page_text = (page.extract_text() or "").replace("\r", "\n")
+            page_destinations, prefixes = RETAIL_pdf_page_destination_data(
+                page
+            )
+            destination_by_order.update(page_destinations)
+            page_texts.append(
+                remove_RETAIL_pdf_line_prefixes(page_text, prefixes)
+            )
+    text = "\n".join(page_texts)
 
     tracking_pattern = re.compile(
         r"(?<!\S)(?:1ZR[^\u2610\s-]*|Z\d{3,})(?=[\u2610\s-]|$)",
@@ -5808,6 +5928,7 @@ def parse_RETAIL_pdf_document(
             "customer_name": re.sub(r"\s+", " ", match.group(3)).strip(),
             "stealth": "YES" if match.group(2) else "NO",
             "delivery": normalize_RETAIL_delivery(match.group(4)),
+            "destination": destination_by_order.get(order_id, ""),
         }
 
     text = restore_RETAIL_wrapped_lines(text, tracking_pattern)
@@ -5838,6 +5959,7 @@ def parse_RETAIL_pdf_document(
                 "customer_name": "",
                 "stealth": "NO",
                 "delivery": "",
+                "destination": destination_by_order.get(order_id, ""),
             },
         )
     return parsed, metadata_by_order
@@ -5859,6 +5981,9 @@ def RETAIL_order_cache_document(
             "Delivery": normalize_RETAIL_delivery(
                 metadata.get("delivery", "")
             ),
+            "Destination": re.sub(
+                r"\s+", " ", str(metadata.get("destination", ""))
+            ).strip(),
             "Order": [
                 {"Name": name, "Quantity": quantity}
                 for name, quantity in items
@@ -5911,8 +6036,22 @@ def decode_RETAIL_order_cache(
             "customer_name": str(entry["CustomerName"]).strip(),
             "stealth": stealth,
             "delivery": normalize_RETAIL_delivery(entry["Delivery"]),
+            "destination": re.sub(
+                r"\s+", " ", str(entry.get("Destination", ""))
+            ).strip(),
         }
     return parsed, metadata_by_order
+
+
+def RETAIL_order_cache_needs_destination(document: object) -> bool:
+    """Return whether an older valid cache lacks the Destination field."""
+    return bool(
+        isinstance(document, dict)
+        and any(
+            isinstance(entry, dict) and "Destination" not in entry
+            for entry in document.values()
+        )
+    )
 
 
 def warn_RETAIL_orders_without_tracking(
@@ -5955,7 +6094,10 @@ def load_or_create_RETAIL_order_cache(
         raw = file.read().strip()
         if raw:
             try:
-                result = decode_RETAIL_order_cache(json.loads(raw))
+                document = json.loads(raw)
+                if RETAIL_order_cache_needs_destination(document):
+                    raise ValueError("Order JSON has no Destination field")
+                result = decode_RETAIL_order_cache(document)
                 Printer(f"* Order JSON loaded | {cache_path.name}")
                 return result
             except (ValueError, TypeError, json.JSONDecodeError) as error:
@@ -5992,7 +6134,13 @@ def load_RETAIL_order_cache_file(
         raw = file.read().strip().lstrip("\ufeff")
         if not raw:
             raise ValueError(f"Order JSON is empty: {cache_path.name}")
-        return decode_RETAIL_order_cache(json.loads(raw))
+        document = json.loads(raw)
+        if (
+            RETAIL_order_cache_needs_destination(document)
+            and RETAIL_pdf_path_for_cache(cache_path).is_file()
+        ):
+            raise ValueError("Order JSON has no Destination field")
+        return decode_RETAIL_order_cache(document)
 
 
 def product_count_catalog(config: dict) -> list[str]:
@@ -6083,8 +6231,6 @@ def RETAIL_product_count_contribution(
     cache files can predate fields such as Delivery. Demand statistics only
     need the Order list, so do not reject an otherwise usable historical file.
     """
-    document = None
-    invalid_cache_error: Exception | None = None
     try:
         with portalocker.Lock(
             str(cache_path), mode="r", encoding="utf-8", timeout=120
@@ -6095,19 +6241,11 @@ def RETAIL_product_count_contribution(
         document = json.loads(raw)
         if not isinstance(document, dict):
             raise ValueError("Order JSON root must be an object")
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        invalid_cache_error = error
-
-    if invalid_cache_error is not None:
-        pdf_path = RETAIL_pdf_path_for_cache(cache_path)
-        if not pdf_path.is_file():
-            # An old interrupted cache cannot be reconstructed after its PDF
-            # has already been removed. Treat it as a zero contribution. Its
-            # file signature is recorded in Count.json, so startup will not
-            # report the same unchanged file again.
-            return {}
-        parsed, metadata = load_or_create_RETAIL_order_cache(pdf_path, config)
-        document = RETAIL_order_cache_document(parsed, metadata)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        # Count.json is a derived report. It must never create or repair an
+        # Order JSON from a PDF. Missing, empty, or invalid caches contribute
+        # zero and can be processed operationally elsewhere if still needed.
+        return {}
 
     assert isinstance(document, dict)
 
@@ -6237,7 +6375,11 @@ def refresh_product_count_file(
     sources: list[tuple[str, datetime.date, Path]],
     config: dict,
 ) -> bool:
-    """Incrementally rebuild a 90-day PRODUCTS frequency snapshot."""
+    """Incrementally rebuild a 60-day PRODUCTS frequency snapshot."""
+    # Support workstations use the main computer's catalogues and must not
+    # create Count.json or inspect historical Order JSON/progress files.
+    if support_mode_enabled(config):
+        return False
     department = department.upper()
     count_path = DESKTOP_DIR / department / "Count.json"
     count_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6330,9 +6472,8 @@ def refresh_product_count_file(
                         }
                     else:
                         continue
-                # RETAIL counting can repair an empty cache from its PDF.
-                # Record the repaired file's signature, not the stale size
-                # and timestamp captured before parsing.
+                # Refresh the signature after parsing in case another process
+                # replaced the source while this process was reading it.
                 try:
                     stat = source_path.stat()
                 except OSError:
@@ -6596,10 +6737,11 @@ def process_pending_RETAIL_order_sources(
             f"{len(selected)} order(s)"
         )
 
-    try:
-        refresh_RETAIL_product_count(worker, config)
-    except Exception as error:
-        Printer(f"XXX Cannot update RETAIL Count.json: {error}")
+    if not support_mode_enabled(config):
+        try:
+            refresh_RETAIL_product_count(worker, config)
+        except Exception as error:
+            Printer(f"XXX Cannot update RETAIL Count.json: {error}")
     return imported_orders
 
 
@@ -8235,8 +8377,9 @@ def reserve_next_RETAIL_order(
     orders: dict,
     *,
     ignore_delivery_priority: bool = False,
+    prefer_available_ups: bool = False,
 ) -> str | None:
-    """Assign one free order, optionally continuing past a busy delivery class."""
+    """Assign one free order using the requested shipping-class policy."""
     available_order_ids = set(orders)
     stat_file = statistics_file(worker)
     with _locked_statistics_file(stat_file) as file:
@@ -8266,7 +8409,28 @@ def reserve_next_RETAIL_order(
             worker.pop("RETAIL_RESERVATION_WAITING_DELIVERY", None)
             return None
 
-        if ignore_delivery_priority:
+        if prefer_available_ups:
+            free_orders = [
+                entry
+                for entry in unfinished_orders
+                if entry[1] in available_order_ids
+                and not retail_stat_effective_suffix(entry[2]).strip()
+            ]
+            free_ups = [
+                entry
+                for entry in free_orders
+                if RETAIL_delivery_from_stat_line(entry[2]) == "UPS"
+            ]
+            # NextOrder first searches every Part for a free UPS order. Busy
+            # UPS orders do not block work: if no free UPS remains, continue
+            # with free Packeta/Postal lines in their statistics-file order.
+            candidate_orders = free_ups or [
+                entry
+                for entry in free_orders
+                if RETAIL_delivery_from_stat_line(entry[2]) != "UPS"
+            ]
+            waiting_delivery = "ALL"
+        elif ignore_delivery_priority:
             candidate_orders = unfinished_orders
             waiting_delivery = "ALL"
         else:
@@ -8571,7 +8735,6 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                  counts: defaultdict, extras: defaultdict, errors: set,
                  no_barcode_items: list[tuple[str, int]], photo_pending: bool,
                  photo_start: float, automatic_assignment: bool = False,
-                 print_order_label: bool = False,
                  record_performance: bool = True,
                  ) -> tuple[str | None, bool, float]:
     """Apply one scanner barcode/order code using the previous AutoChecker rules."""
@@ -8620,26 +8783,6 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                 Printer(message)
                 send_fn(message)
                 return current_order, photo_pending, photo_start
-            if print_order_label and worker.get("PRINTER"):
-                try:
-                    job_id = print_RETAIL_order_label(worker, matched)
-                except Exception as error:
-                    if status == "claimed":
-                        release_RETAIL_order_reservation(worker, matched)
-                    if performance_stats is not None:
-                        performance_stats.record_mistake()
-                    message = (
-                        f"XXX Cannot print order label {matched}: {error}"
-                    )
-                    Printer(message)
-                    send_fn(message)
-                    return current_order, photo_pending, photo_start
-                message = (
-                    f"* Order label printed {matched.lstrip('#')} | "
-                    f"Job {job_id}"
-                )
-                Printer(message)
-                send_fn(message)
         if performance_stats is not None and record_performance:
             performance_stats.record_scan(matched)
         if worker.get("DEPARTMENT", "").upper() == "RETAIL":
@@ -8670,10 +8813,11 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                 worker, orders[current_order], counts, extras, errors,
                 no_barcode_items,
             )
-            try:
-                refresh_B2B_product_count(config)
-            except Exception as error:
-                Printer(f"XXX Cannot update B2B Count.json: {error}")
+            if not support_mode_enabled(config):
+                try:
+                    refresh_B2B_product_count(config)
+                except Exception as error:
+                    Printer(f"XXX Cannot update B2B Count.json: {error}")
         else:
             update_order_in_statistics(worker, current_order, add_name=True)
         show_status(
@@ -8768,6 +8912,7 @@ def automatically_assign_next_RETAIL_order(
     no_barcode_items: list[tuple[str, int]],
     *,
     ignore_delivery_priority: bool = False,
+    prefer_available_ups: bool = False,
 ) -> tuple[str | None, bool, float]:
     """Reserve and activate the next RETAIL order, printing when possible."""
     performance_stats: WorkerPerformanceStats | None = worker.get(
@@ -8777,6 +8922,7 @@ def automatically_assign_next_RETAIL_order(
         worker,
         orders,
         ignore_delivery_priority=ignore_delivery_priority,
+        prefer_available_ups=prefer_available_ups,
     )
     if order_id is None:
         if performance_stats is not None:
@@ -9510,7 +9656,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         extras,
                         errors,
                         no_barcode_items,
-                        ignore_delivery_priority=True,
+                        prefer_available_ups=True,
                     )
                     if next_state[0] is not None:
                         current_order, photo_pending, photo_start = next_state
@@ -9596,10 +9742,6 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         current_order, photo_pending, photo_start = process_scan(
                             worker, config, code, orders, current_order, counts, extras,
                             errors, no_barcode_items, photo_pending, photo_start,
-                            print_order_label=(
-                                identity.department.upper() == "RETAIL"
-                                and code.startswith("#")
-                            ),
                         )
 
             if line == "Photo":
@@ -10055,10 +10197,11 @@ def dispatcher() -> None:
     # Add the per-display saved-selection slots after their IDs are known.
     settings = ensure_detected_settings(cameras, display_ports)
     ensure_worker_statistics_files(settings)
-    try:
-        refresh_B2B_product_count(settings)
-    except Exception as error:
-        print(f"XXX Cannot update B2B Count.json: {error}")
+    if not support_mode_enabled(settings):
+        try:
+            refresh_B2B_product_count(settings)
+        except Exception as error:
+            print(f"XXX Cannot update B2B Count.json: {error}")
 
     launcher_retail_worker = None
     launcher_console_started = False

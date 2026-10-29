@@ -2,15 +2,15 @@
 <g id="Etiketka">
 <rect width="198" height="100" rx="5.67" fill="white"/>
 <text id="NAME" fill="black" style="white-space: pre" xml:space="preserve" font-family="Anek Devanagari" font-size="12" font-weight="600" letter-spacing="0em"><tspan x="10" y="21.923">Egor Stolyga Uchman - Petrov - </tspan></text>
-<line id="Line 1" x1="10" y1="33.5" x2="188" y2="33.5" stroke="black"/>
+<path id="Line 1" d="M10 33.5H188" stroke="black"/>
 <g id="Obsah">
 <g id="Logo">
 <rect width="48" height="30" transform="matrix(0 1 -1 0 40 42.5)" fill="url(#pattern0_10_12)"/>
 </g>
 <g id="Data">
-<text id="OrderNumber" fill="black" style="white-space: pre" xml:space="preserve" font-family="Arial" font-size="10" font-weight="bold" letter-spacing="0em"><tspan x="62.5" y="53.4668">#1234567</tspan></text>
-<text id="Delivery" fill="black" style="white-space: pre" xml:space="preserve" font-family="Arial" font-size="10" font-weight="bold" letter-spacing="0em"><tspan x="62.5" y="69.9668">Zasilkovna</tspan></text>
-<text id="Date" fill="black" style="white-space: pre" xml:space="preserve" font-family="Arial" font-size="10" font-weight="bold" letter-spacing="0em"><tspan x="62.5" y="86.4668">26.06.2026</tspan></text>
+<text id="OrderNumber" fill="black" style="white-space: pre" xml:space="preserve" font-family="Arial" font-size="10" font-weight="bold" letter-spacing="0em"><tspan x="66.2344" y="56.9668">#1234567</tspan></text>
+<text id="Delivery" fill="black" style="white-space: pre" xml:space="preserve" font-family="Arial" font-size="10" font-weight="bold" letter-spacing="0em"><tspan x="42.3525" y="72.4668">Postal: United Kin</tspan></text>
+<text id="Date" fill="black" style="white-space: pre" xml:space="preserve" font-family="Arial" font-size="10" font-weight="bold" letter-spacing="0em"><tspan x="63.4512" y="87.9668">26.06.2026</tspan></text>
 </g>
 <g id="QR-code">
 <rect width="51" height="51" transform="translate(137 41)" fill="url(#pattern1_10_12)"/>
