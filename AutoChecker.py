@@ -161,6 +161,9 @@ CHANGE_PDF_RETRY_INTERVAL = 10.0
 ORDER_SOURCE_SCAN_INTERVAL = 2.0
 ORDER_SOURCE_RETRY_INTERVAL = 10.0
 PRODUCT_COUNT_MAX_AGE_DAYS = 60
+# Temporarily disabled because rebuilding Count.json can block the launcher.
+# Keep the implementation below so it can be re-enabled after optimization.
+PRODUCT_COUNT_ENABLED = False
 PHOTO_DELAY = 2.5
 B2B_INDEX_FILENAME = "B2B_Order_Index.txt"
 RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
@@ -172,7 +175,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.36"
+CURRENT_VERSION = "3.37"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -6737,7 +6740,7 @@ def process_pending_RETAIL_order_sources(
             f"{len(selected)} order(s)"
         )
 
-    if not support_mode_enabled(config):
+    if PRODUCT_COUNT_ENABLED and not support_mode_enabled(config):
         try:
             refresh_RETAIL_product_count(worker, config)
         except Exception as error:
@@ -8813,7 +8816,7 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                 worker, orders[current_order], counts, extras, errors,
                 no_barcode_items,
             )
-            if not support_mode_enabled(config):
+            if PRODUCT_COUNT_ENABLED and not support_mode_enabled(config):
                 try:
                     refresh_B2B_product_count(config)
                 except Exception as error:
@@ -10197,7 +10200,7 @@ def dispatcher() -> None:
     # Add the per-display saved-selection slots after their IDs are known.
     settings = ensure_detected_settings(cameras, display_ports)
     ensure_worker_statistics_files(settings)
-    if not support_mode_enabled(settings):
+    if PRODUCT_COUNT_ENABLED and not support_mode_enabled(settings):
         try:
             refresh_B2B_product_count(settings)
         except Exception as error:
