@@ -174,12 +174,7 @@ def extract_pdf_labels(
     ocr = RapidOCR()
     pages: list[dict[str, Any]] = []
     try:
-        for position, page_number in enumerate(selected, start=1):
-            print(
-                f"OCR: страница {page_number}/{len(document)} "
-                f"({position} из {len(selected)})...",
-                file=sys.stderr,
-            )
+        for page_number in selected:
             page = document[page_number - 1]
             pixmap = page.get_pixmap(
                 matrix=pymupdf.Matrix(render_scale, render_scale), alpha=False
@@ -470,6 +465,19 @@ def process_label_pdf(
         saved = _save_label_page(destination, page)
         if saved and page_saved_callback is not None:
             page_saved_callback(destination, int(page["page"]))
+        page_number = int(page["page"])
+        if saved:
+            print(
+                f"* Label OCR page ready: {source.name} | "
+                f"{page_number}/{page_count}",
+                flush=True,
+            )
+        else:
+            print(
+                f"XXX Label OCR page has no tracking number: "
+                f"{source.name} | {page_number}/{page_count}",
+                flush=True,
+            )
 
     extract_pdf_labels(
         source,

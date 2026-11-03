@@ -158,8 +158,10 @@ SCANNER_IDENTITY_RETRY_INTERVAL = 10.0
 SCAN_INTERVAL = 0.2
 CHANGE_PDF_SCAN_INTERVAL = 2.0
 CHANGE_PDF_RETRY_INTERVAL = 10.0
+CHANGE_CACHE_LOCK_TIMEOUT = 5.0
 ORDER_SOURCE_SCAN_INTERVAL = 2.0
 ORDER_SOURCE_RETRY_INTERVAL = 10.0
+LABEL_OCR_RETRY_INTERVAL = 30.0
 PRODUCT_COUNT_MAX_AGE_DAYS = 60
 # Temporarily disabled because rebuilding Count.json can block the launcher.
 # Keep the implementation below so it can be re-enabled after optimization.
@@ -175,7 +177,8 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.37"
+CURRENT_VERSION = "3.41"
+LABEL_OCR_STATE_FILE = BASE_DIR / ".pdf_label_ocr_state.json"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -704,43 +707,40 @@ def start_label_ocr_process(
     ready_event=None,
     downloads_dirs=None,
     label_date: datetime.date | None = None,
+    pdf_path: Path | None = None,
 ) -> subprocess.Popen:
-    """Start OCR independently so its checker process may safely exit."""
+    """Start OCR for one PDF, or retain the legacy directory-scan mode."""
     command = [
         sys.executable,
+        "-u",
         str(BASE_DIR / "pdf_label_ocr.py"),
-        "--department",
-        department,
     ]
-    for downloads_dir in downloads_dirs or []:
-        command.extend(("--downloads-dir", str(downloads_dir)))
-    if label_date is not None:
-        command.extend(("--label-date", label_date.isoformat()))
+    if pdf_path is not None:
+        command.append(str(pdf_path))
+    command.extend(("--department", department))
+    if pdf_path is None:
+        for downloads_dir in downloads_dirs or []:
+            command.extend(("--downloads-dir", str(downloads_dir)))
+        if label_date is not None:
+            command.extend(("--label-date", label_date.isoformat()))
 
     creationflags = 0
     start_new_session = False
     if os.name == "nt":
-        creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.CREATE_NO_WINDOW
-        )
+        # Inherit the launcher's console so per-page OCR progress is visible.
+        # CREATE_NEW_PROCESS_GROUP does not create another console window.
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         start_new_session = True
-    log_path = Path(tempfile.gettempdir()) / "AutoChecker_pdf_label_ocr.log"
-    log_file = log_path.open("a", encoding="utf-8")
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-            creationflags=creationflags,
-            start_new_session=start_new_session,
-        )
-    finally:
-        log_file.close()
-    print(f"* Label OCR process {process.pid} started; log: {log_path}")
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creationflags,
+        start_new_session=start_new_session,
+    )
+    target = Path(pdf_path).name if pdf_path is not None else department
+    print(f"* Label OCR process {process.pid} started: {target}")
     return process
 
 
@@ -755,6 +755,230 @@ def join_finished_label_ocr_process(process) -> None:
         return
     if process.poll() is not None:
         process.wait()
+
+
+def available_label_ocr_pdfs(
+    download_directories: list[Path] | None,
+) -> list[Path]:
+    """List Label PDFs by filename only; never inspect PDF/JSON contents."""
+    pattern = re.compile(
+        r"^(\d{2}\.\d{2}\.\d{4}) Part (\d+) \(Label\)\.pdf$",
+        re.IGNORECASE,
+    )
+    result = []
+    seen = set()
+    for directory in download_directories or B2B_download_directories():
+        directory = Path(directory)
+        if not directory.is_dir():
+            continue
+        for pdf_path in directory.iterdir():
+            if not pdf_path.is_file():
+                continue
+            match = pattern.fullmatch(pdf_path.name)
+            if match is None:
+                continue
+            try:
+                datetime.datetime.strptime(match.group(1), "%d.%m.%Y")
+            except ValueError:
+                continue
+            key = str(pdf_path).casefold()
+            if key not in seen:
+                seen.add(key)
+                result.append(pdf_path)
+    return sorted(result, key=lambda path: path.name.casefold())
+
+
+def load_label_ocr_state() -> dict:
+    """Load the local OCR job ledger without opening any Label JSON."""
+    if not LABEL_OCR_STATE_FILE.is_file():
+        return {"version": 1, "initialized": False, "jobs": {}}
+    try:
+        with portalocker.Lock(
+            str(LABEL_OCR_STATE_FILE),
+            mode="r",
+            encoding="utf-8",
+            timeout=5,
+        ) as file:
+            state = json.load(file)
+    except (OSError, ValueError, portalocker.exceptions.LockException) as error:
+        print(f"XXX Cannot read Label OCR state: {error}")
+        return {"version": 1, "initialized": False, "jobs": {}}
+    if not isinstance(state, dict) or not isinstance(state.get("jobs"), dict):
+        return {"version": 1, "initialized": False, "jobs": {}}
+    state.setdefault("version", 1)
+    state.setdefault("initialized", True)
+    return state
+
+
+def save_label_ocr_state(state: dict) -> None:
+    """Persist the OCR ledger atomically under a short local file lock."""
+    LABEL_OCR_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with portalocker.Lock(
+        str(LABEL_OCR_STATE_FILE),
+        mode="a+",
+        encoding="utf-8",
+        timeout=5,
+    ) as file:
+        file.seek(0)
+        file.truncate()
+        json.dump(state, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+
+
+def label_ocr_pdf_signature(pdf_path: Path) -> list[int]:
+    stat = pdf_path.stat()
+    return [int(stat.st_mtime_ns), int(stat.st_size)]
+
+
+def maintain_launcher_label_ocr(
+    worker: dict,
+    process,
+    running_event,
+):
+    """Queue only new/changed Label PDFs and process one exact file at a time."""
+    if label_ocr_process_is_alive(process):
+        running_event.set()
+        return process
+
+    if process is not None:
+        return_code = process.poll()
+        join_finished_label_ocr_process(process)
+        active_job = worker.pop("LABEL_OCR_ACTIVE_JOB", None)
+        if active_job is not None:
+            state = worker.get("LABEL_OCR_STATE")
+            if not isinstance(state, dict):
+                state = load_label_ocr_state()
+                worker["LABEL_OCR_STATE"] = state
+            jobs = state.setdefault("jobs", {})
+            job_key = active_job["key"]
+            record = jobs.get(job_key, {})
+            if return_code == 0:
+                record.update({
+                    "path": active_job["path"],
+                    "signature": active_job["signature"],
+                    "status": "complete",
+                })
+                worker.setdefault("LABEL_OCR_FAILURES", {}).pop(job_key, None)
+                print(f"* Label OCR completed: {Path(active_job['path']).name}")
+            else:
+                record.update({
+                    "path": active_job["path"],
+                    "signature": active_job["signature"],
+                    "status": "pending",
+                })
+                worker.setdefault("LABEL_OCR_FAILURES", {})[job_key] = (
+                    time.monotonic()
+                )
+                print(
+                    f"XXX Label OCR failed with code {return_code}: "
+                    f"{Path(active_job['path']).name}"
+                )
+            jobs[job_key] = record
+            save_label_ocr_state(state)
+    running_event.clear()
+
+    state = worker.get("LABEL_OCR_STATE")
+    if not isinstance(state, dict):
+        state = load_label_ocr_state()
+        worker["LABEL_OCR_STATE"] = state
+    jobs = state.setdefault("jobs", {})
+    initialized = bool(state.get("initialized"))
+    state_changed = False
+    snapshots = worker.setdefault("LABEL_OCR_FILE_SNAPSHOTS", {})
+    now = time.time()
+    stable_keys = set()
+    candidates = available_label_ocr_pdfs(worker.get("DOWNLOAD_DIRECTORIES"))
+    for pdf_path in candidates:
+        try:
+            signature = label_ocr_pdf_signature(pdf_path)
+            modified = pdf_path.stat().st_mtime
+        except OSError:
+            continue
+        key = str(pdf_path).casefold()
+        previous_snapshot = snapshots.get(key)
+        snapshots[key] = signature
+        if (
+            previous_snapshot == signature
+            or now - modified >= ORDER_SOURCE_SCAN_INTERVAL
+        ):
+            stable_keys.add(key)
+        record = jobs.get(key)
+        if record is not None and record.get("signature") == signature:
+            continue
+
+        if record is None and not initialized:
+            # Migration rule: trust existing JSON files without opening them.
+            # A today's PDF with no JSON is the only pre-ledger file queued.
+            try:
+                file_day = datetime.datetime.strptime(
+                    pdf_path.name[:10], "%d.%m.%Y"
+                ).date()
+            except ValueError:
+                file_day = None
+            status = (
+                "pending"
+                if not pdf_path.with_suffix(".json").exists()
+                and file_day == datetime.date.today()
+                else "complete"
+            )
+        else:
+            status = "pending"
+        jobs[key] = {
+            "path": str(pdf_path),
+            "signature": signature,
+            "status": status,
+        }
+        state_changed = True
+
+    if not initialized:
+        state["initialized"] = True
+        state_changed = True
+    if state_changed:
+        save_label_ocr_state(state)
+
+    failures = worker.setdefault("LABEL_OCR_FAILURES", {})
+    pending_records = []
+    for key, record in jobs.items():
+        if record.get("status") != "pending":
+            continue
+        if key not in stable_keys:
+            continue
+        pdf_path = Path(str(record.get("path", "")))
+        if not pdf_path.is_file():
+            continue
+        failed_at = failures.get(key)
+        if (
+            failed_at is not None
+            and time.monotonic() - failed_at < LABEL_OCR_RETRY_INTERVAL
+        ):
+            continue
+        try:
+            current_signature = label_ocr_pdf_signature(pdf_path)
+        except OSError:
+            continue
+        if snapshots.get(key) != current_signature:
+            snapshots[key] = current_signature
+            continue
+        pending_records.append((pdf_path.name.casefold(), key, record))
+
+    if not pending_records:
+        return None
+
+    _sort_name, job_key, job = min(pending_records)
+    pdf_path = Path(job["path"])
+    process = start_label_ocr_process(
+        RETAIL_UP_DEPARTMENT,
+        pdf_path=pdf_path,
+    )
+    worker["LABEL_OCR_ACTIVE_JOB"] = {
+        "key": job_key,
+        "path": str(pdf_path),
+        "signature": list(job["signature"]),
+    }
+    running_event.set()
+    return process
 
 
 @dataclass(frozen=True)
@@ -2316,8 +2540,11 @@ def send(display: serial.Serial, message: str) -> None:
 
 
 def Printer(message: str) -> None:
-    """Keep a console log; messages for the display are sent separately."""
-    print(message)
+    """Keep only display error lines in the console; omit normal duplicates."""
+    for line in str(message).splitlines():
+        text = line.strip()
+        if text.startswith(("XXX", "!")) or "!!!" in text:
+            print(text)
 
 
 def print_console_red(message: str) -> None:
@@ -3406,6 +3633,23 @@ def RETAIL_UP_tracking_from_statistics(
     return RETAIL_UP_tracking_from_order_line(normalized_order, matching_line)
 
 
+def RETAIL_UP_label_unavailable_message(
+    worker: dict,
+    order_id: str,
+    *,
+    wait_for_ocr: bool = True,
+) -> str:
+    """Explain whether a missing label is still being produced by OCR."""
+    running_event = worker.get("LABEL_OCR_RUNNING_EVENT")
+    if (
+        wait_for_ocr
+        and running_event is not None
+        and running_event.is_set()
+    ):
+        return "Label OCR is still running; please wait"
+    return f"Label for order {order_id.strip()} is not available yet"
+
+
 def RETAIL_UP_today_orders(worker: dict) -> dict[str, str]:
     """Return today's RETAIL statistics lines indexed by order number."""
     stat_file = retail_statistics_file(worker)
@@ -4439,7 +4683,12 @@ def submit_RETAIL_UP_label(
     """Validate one order, print non-Postal labels, and record the worker."""
     printer_name = str(worker.get("PRINTER", "")).strip()
     ready_line = RETAIL_UP_ready_statistics_line(worker, order_id)
-    changed_label = find_RETAIL_UP_change_label_page(worker, order_id)
+    has_changed_label = retail_stat_has_label_change(ready_line)
+    changed_label = (
+        find_RETAIL_UP_change_label_page(worker, order_id)
+        if has_changed_label
+        else None
+    )
 
     postal_order = False
     tracking_missing = False
@@ -4457,26 +4706,31 @@ def submit_RETAIL_UP_label(
         postal_order = True
 
     if (
-        not tracking_missing
-        and changed_label is None
+        changed_label is None
         and retail_stat_latest_change_kind(ready_line) == "Label"
     ):
         raise FileNotFoundError(
             f"Change Label PDF not found for {order_id.strip()}"
         )
 
-    if tracking_missing:
-        # The explicit UPS/Zasilkovna field is authoritative. Record the
-        # packer, but never pretend that a missing label is a Postal order.
-        changed_label = None
-    elif changed_label is not None:
+    if changed_label is not None:
+        # A replacement label is addressed by the order number and therefore
+        # remains printable even when the original tracking number is empty.
         pdf_path, page_number, label_type = changed_label
-    elif printer_name and not postal_order:
-        pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
-            worker, tracking_number
-        )
+    elif printer_name and not postal_order and not tracking_missing:
+        try:
+            pdf_path, page_number, label_type = find_RETAIL_UP_label_page(
+                worker, tracking_number
+            )
+        except LookupError as error:
+            if "Tracking number not found in Label JSON" not in str(error):
+                raise
+            raise LookupError(
+                RETAIL_UP_label_unavailable_message(worker, order_id)
+            ) from error
 
-    if printer_name and not postal_order and not tracking_missing:
+    printable_label = changed_label is not None or not tracking_missing
+    if printer_name and not postal_order and printable_label:
         print_pdf_page(pdf_path, page_number, printer_name, label_type)
         physically_printed = True
         worker["LAST_PRINTED_LABEL"] = {
@@ -4494,8 +4748,15 @@ def submit_RETAIL_UP_label(
     duplicate_print = append_RETAIL_UP_print_name(
         worker, order_id, recorded_name
     )
-    if tracking_missing:
-        status_message = "XXX tracking number is empty"
+    if tracking_missing and changed_label is None:
+        status_message = (
+            "XXX "
+            + RETAIL_UP_label_unavailable_message(
+                worker,
+                order_id,
+                wait_for_ocr=False,
+            )
+        )
     elif physically_printed:
         status_message = (
             f"? Dublicate print label {order_id.lstrip('#')} "
@@ -6865,33 +7126,26 @@ def available_RETAIL_change_label_pdfs(
 
 def merge_RETAIL_change_cache(
     cache_path: Path,
-    source_pdf: Path | None,
     replacements: dict[str, list[tuple[str, int]]],
     replacement_metadata: dict[str, dict],
-    config: dict,
 ) -> set[str]:
     """Replace matching order entries in one locked normal Order cache."""
     with portalocker.Lock(
-        str(cache_path), mode="a+", encoding="utf-8", timeout=120
+        str(cache_path),
+        mode="r+",
+        encoding="utf-8",
+        timeout=CHANGE_CACHE_LOCK_TIMEOUT,
     ) as file:
         file.seek(0)
         raw = file.read().strip()
-        parsed = None
-        metadata_by_order = None
-        if raw:
-            try:
-                parsed, metadata_by_order = decode_RETAIL_order_cache(
-                    json.loads(raw)
-                )
-            except (ValueError, TypeError, json.JSONDecodeError):
-                parsed = None
-                metadata_by_order = None
-        if parsed is None:
-            if source_pdf is None or not source_pdf.is_file():
-                return set()
-            parsed, metadata_by_order = parse_RETAIL_pdf_document(
-                source_pdf, config
+        if not raw:
+            return set()
+        try:
+            parsed, metadata_by_order = decode_RETAIL_order_cache(
+                json.loads(raw)
             )
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return set()
 
         matched = set(parsed).intersection(replacements)
         if not matched:
@@ -7775,16 +8029,9 @@ def update_RETAIL_change_caches(
     worker: dict,
     replacements: dict[str, list[tuple[str, int]]],
     replacement_metadata: dict[str, dict],
-    config: dict,
 ) -> set[str]:
-    """Update every normal cache containing one of the changed orders."""
-    cache_sources: OrderedDict[str, tuple[Path, Path | None]] = OrderedDict()
-    for _pdf_date, _part, pdf_path in _available_order_pdfs(
-        worker.get("DOWNLOAD_DIRECTORIES")
-    ):
-        cache_path = RETAIL_order_cache_path(pdf_path)
-        cache_sources[str(cache_path).casefold()] = (cache_path, pdf_path)
-
+    """Update existing normal caches containing one of the changed orders."""
+    cache_paths: OrderedDict[str, Path] = OrderedDict()
     for directory in worker.get("DOWNLOAD_DIRECTORIES") or []:
         if not Path(directory).is_dir():
             continue
@@ -7800,19 +8047,27 @@ def update_RETAIL_change_caches(
                     RETAIL_ORDER_CACHE_SUFFIX.casefold()
                 )
             ):
-                cache_sources.setdefault(
-                    str(cache_path).casefold(), (cache_path, None)
-                )
+                cache_paths.setdefault(str(cache_path).casefold(), cache_path)
 
     matched: set[str] = set()
-    for cache_path, source_pdf in cache_sources.values():
+    order_tokens = tuple(
+        json.dumps(order_id, ensure_ascii=False)
+        for order_id in replacements
+    )
+    for cache_path in cache_paths.values():
+        # Read without waiting for a lock only to discard unrelated caches.
+        # The matching cache is read again under the short exclusive lock.
+        try:
+            raw = cache_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            continue
+        if not any(token in raw for token in order_tokens):
+            continue
         matched.update(
             merge_RETAIL_change_cache(
                 cache_path,
-                source_pdf,
                 replacements,
                 replacement_metadata,
-                config,
             )
         )
     return matched
@@ -7897,7 +8152,6 @@ def process_RETAIL_change_pdf(
             worker,
             replacements,
             replacement_metadata,
-            config,
         )
         missing_caches = set(expected_ids) - cached_ids
         if missing_caches:
@@ -7906,7 +8160,7 @@ def process_RETAIL_change_pdf(
                 + ", ".join(sorted(missing_caches))
             )
 
-        _found_ids, added_ids = append_RETAIL_change_markers(
+        found_ids, added_ids = append_RETAIL_change_markers(
             worker, expected_ids, "Order"
         )
         missing_statistics = set(expected_ids) - found_ids
@@ -7966,10 +8220,22 @@ def process_pending_RETAIL_change_pdfs(
                 process_RETAIL_change_pdf(worker, config, change_pdf)
             )
         except Exception as error:
-            failures[path_key] = (signature, time.monotonic())
-            message = f"XXX Cannot apply {change_pdf.name}: {error}"
-            Printer(message)
-            send(worker["DISPLAY"], message)
+            error_text = str(error)
+            repeated_failure = bool(
+                failed is not None
+                and failed[0] == signature
+                and len(failed) >= 3
+                and failed[2] == error_text
+            )
+            failures[path_key] = (
+                signature,
+                time.monotonic(),
+                error_text,
+            )
+            if not repeated_failure:
+                message = f"XXX Cannot apply {change_pdf.name}: {error}"
+                Printer(message)
+                send(worker["DISPLAY"], message)
             continue
 
         processed[path_key] = signature
@@ -8315,6 +8581,77 @@ def claim_RETAIL_order(worker: dict, order_id: str) -> str:
     return "not_found"
 
 
+def RETAIL_live_completion_marker_span(line: str) -> tuple[int, int] | None:
+    """Return the live assembly +/(+) span, ignoring pre-Change history."""
+    order_match = re.search(r"(?<!\S)#\d+(?=\s|$)", line)
+    if order_match is None:
+        return None
+    suffix = line[order_match.end():]
+    change_match = retail_stat_order_change_match(line)
+    live_start = change_match.end() if change_match is not None else 0
+    completion = re.search(
+        r"(?<!\S)(?:\(\+\)|\+)(?=\s|$)",
+        suffix[live_start:],
+    )
+    if completion is None:
+        return None
+    start = order_match.end() + live_start + completion.start()
+    end = order_match.end() + live_start + completion.end()
+    return start, end
+
+
+def align_RETAIL_completion_markers(
+    lines: list[str],
+    order_id: str,
+) -> list[str]:
+    """Align live +/(+) markers inside only the target order's Part section."""
+    normalized_order = f"#{order_id.strip().lstrip('#')}"
+    target_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if retail_order_id_from_stat_line(line) == normalized_order
+        ),
+        None,
+    )
+    if target_index is None:
+        return lines
+
+    section_start = 0
+    for index in range(target_index, -1, -1):
+        if lines[index].strip().startswith("----------"):
+            section_start = index + 1
+            break
+    section_end = len(lines)
+    for index in range(target_index + 1, len(lines)):
+        if lines[index].strip().startswith("----------"):
+            section_end = index
+            break
+
+    rows = []
+    for index in range(section_start, section_end):
+        raw_text = lines[index].rstrip("\r\n")
+        marker_span = RETAIL_live_completion_marker_span(raw_text)
+        if marker_span is None:
+            continue
+        marker_start, _marker_end = marker_span
+        prefix = raw_text[:marker_start].rstrip()
+        rows.append((index, raw_text, marker_start, prefix))
+    if not rows:
+        return lines
+
+    marker_column = max(len(prefix) for _, _, _, prefix in rows) + 1
+    aligned = list(lines)
+    for index, raw_text, marker_start, prefix in rows:
+        newline = "\n" if lines[index].endswith("\n") else ""
+        aligned[index] = (
+            prefix.ljust(marker_column)
+            + raw_text[marker_start:]
+            + newline
+        )
+    return aligned
+
+
 def update_order_in_statistics(worker: dict, order_id: str, *, add_name: bool = False,
                                add_plus: bool = False, manual_plus: bool = False) -> bool:
     stat_file = statistics_file(worker)
@@ -8322,11 +8659,12 @@ def update_order_in_statistics(worker: dict, order_id: str, *, add_name: bool = 
         file.seek(0)
         lines = file.readlines()
         updated = False
+        completion_added = False
         result = []
+        department = worker.get("DEPARTMENT", "").upper()
         for line in lines:
             raw_text = line.rstrip("\r\n")
             text = raw_text.strip()
-            department = worker.get("DEPARTMENT", "").upper()
             if department == "RETAIL":
                 stored_order_id = retail_order_id_from_stat_line(text)
                 matches_order = bool(
@@ -8349,16 +8687,20 @@ def update_order_in_statistics(worker: dict, order_id: str, *, add_name: bool = 
                     status_suffix += f" {worker['NAME']}"
                 if manual_plus and "(+)" not in status_suffix:
                     raw_text += " (+)"
+                    completion_added = True
                 elif (
                     add_plus
                     and " +" not in status_suffix
                     and "(+)" not in status_suffix
                 ):
                     raw_text += " +"
+                    completion_added = True
                 line = raw_text + "\n"
                 updated = True
             result.append(line)
         if updated:
+            if completion_added and department == "RETAIL":
+                result = align_RETAIL_completion_markers(result, order_id)
             file.seek(0)
             file.truncate()
             file.writelines(result)
@@ -9089,14 +9431,13 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
          settings_update_requests: multiprocessing.Queue,
          display_update_queue: multiprocessing.Queue,
          display_reset_event: multiprocessing.Event,
-         display_disconnect_event: multiprocessing.Event) -> None:
+         display_disconnect_event: multiprocessing.Event,
+         label_ocr_running_event: multiprocessing.Event) -> None:
     """Run one checker and own its COM port until its matching Stop command."""
     cap = None
     display = None
     external_scanner = None
     performance_stats = None
-    label_ocr_process = None
-    label_ocr_rerun_requested = False
 
     try:
         config = load_settings()
@@ -9153,6 +9494,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "HAS_CAMERA": cap is not None,
             "PRINTER": identity.printer_name or "",
             "PERFORMANCE_STATS": performance_stats,
+            "LABEL_OCR_RUNNING_EVENT": label_ocr_running_event,
         }
         try:
             configure_worker_storage(worker, config)
@@ -9179,35 +9521,12 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             label_files = current_RETAIL_UP_label_files(
                 label_date, downloads_dirs
             )
-            pending_label_pdfs = pending_RETAIL_UP_label_pdfs(
-                label_date, downloads_dirs
-            )
-            if pending_label_pdfs:
-                label_ocr_ready_event = None
-                label_ocr_process = start_label_ocr_process(
-                    identity.department,
-                    label_ocr_ready_event,
-                    downloads_dirs,
-                    label_date,
-                )
-                message = "* Label OCR started"
-                Printer(message)
-                send(display, message)
-            try:
-                if not label_files and label_ocr_process is not None:
-                    label_files = wait_for_RETAIL_UP_label_data(
-                        label_ocr_process,
-                        label_ocr_ready_event,
-                        label_date,
-                        downloads_dirs,
-                    )
-                if not label_files:
-                    raise FileNotFoundError(
-                        "Today's Label PDF/JSON was not found in Downloads"
-                    )
+            if label_files:
                 message = f"* Label data ready: {len(label_files)} file(s)"
-            except Exception as error:
-                message = f"XXX {error}"
+            elif label_ocr_running_event.is_set():
+                message = "* Label OCR is running"
+            else:
+                message = "? Today's Label data is not available yet"
             Printer(message)
             send(display, message)
 
@@ -9266,20 +9585,6 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
 
         window_name = f"AutoChecker - {identity.name} - {identity.department} - {identity.camera_number}"
         while True:
-            if (
-                label_ocr_process is not None
-                and not label_ocr_process_is_alive(label_ocr_process)
-            ):
-                join_finished_label_ocr_process(label_ocr_process)
-                label_ocr_process = None
-                if label_ocr_rerun_requested:
-                    label_ocr_rerun_requested = False
-                    label_ocr_process = start_label_ocr_process(
-                        identity.department,
-                        downloads_dirs=worker.get("DOWNLOAD_DIRECTORIES"),
-                        label_date=datetime.date.today(),
-                    )
-
             display_update_requested = False
             updated_cameras = None
             updated_printers = None
@@ -9561,24 +9866,6 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     Printer(message)
                     send(worker["DISPLAY"], message)
                 else:
-                    if line == "NextPDF":
-                        if (
-                            label_ocr_process is not None
-                            and label_ocr_process_is_alive(label_ocr_process)
-                        ):
-                            # Coalesce repeated requests into one follow-up run.
-                            label_ocr_rerun_requested = True
-                        else:
-                            if label_ocr_process is not None:
-                                join_finished_label_ocr_process(
-                                    label_ocr_process
-                                )
-                            label_ocr_process = start_label_ocr_process(
-                                identity.department,
-                                downloads_dirs=worker.get(
-                                    "DOWNLOAD_DIRECTORIES"
-                                ),
-                            )
                     loaded_orders = parse_orders_RETAIL(
                         worker, config, previous=(line == "LastPDF")
                     )
@@ -9817,7 +10104,6 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             cv2.destroyAllWindows()
         close_serial_safely(display)
         close_serial_safely(external_scanner)
-        join_finished_label_ocr_process(label_ocr_process)
 
 
 
@@ -10210,6 +10496,8 @@ def dispatcher() -> None:
     launcher_console_started = False
     retail_monitor_last_error: str | None = None
     retail_monitor_auth_blocked = False
+    launcher_label_ocr_process = None
+    label_ocr_running_event: multiprocessing.Event = multiprocessing.Event()
     if SUPPORT_NETWORK_AUTH_BLOCKED:
         print(
             "? Main-computer credentials are unavailable; RETAIL order "
@@ -10218,6 +10506,11 @@ def dispatcher() -> None:
     try:
         launcher_retail_worker = create_launcher_RETAIL_worker(settings)
         process_pending_admin_download_files(launcher_retail_worker)
+        launcher_label_ocr_process = maintain_launcher_label_ocr(
+            launcher_retail_worker,
+            launcher_label_ocr_process,
+            label_ocr_running_event,
+        )
         process_pending_RETAIL_order_sources(
             launcher_retail_worker, settings
         )
@@ -10390,6 +10683,11 @@ def dispatcher() -> None:
                         launcher_console_started = True
                     process_pending_admin_download_files(
                         launcher_retail_worker
+                    )
+                    launcher_label_ocr_process = maintain_launcher_label_ocr(
+                        launcher_retail_worker,
+                        launcher_label_ocr_process,
+                        label_ocr_running_event,
                     )
                     imported_order_ids = process_pending_RETAIL_order_sources(
                         launcher_retail_worker, settings
@@ -11068,6 +11366,7 @@ def dispatcher() -> None:
                         display_update_queue,
                         display_reset_event,
                         display_disconnect_event,
+                        label_ocr_running_event,
                     ),
                     name=(
                         f"AutoChecker-{identity.camera_number}"
