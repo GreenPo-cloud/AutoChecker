@@ -1,9 +1,9 @@
 """AutoChecker v2: dynamic discovery of displays, cameras, printers and scanners.
 
 Protocol received from a display (one command per line):
-    Start:<name>;<department>;<camera>;<printer>;<scanner>\n
-    Stop:<name>;<department>;<camera>;<printer>;<scanner>\n
-The printer and scanner fields are optional for compatibility with old displays.
+    Start:<name>;<department>;<camera>;<printer>;<scanner>;<sort>\n
+    Stop:<name>;<department>;<camera>;<printer>;<scanner>;<sort>\n
+The device and sort fields are optional for compatibility with old displays.
 """
 
 from __future__ import annotations
@@ -163,9 +163,9 @@ ORDER_SOURCE_SCAN_INTERVAL = 2.0
 ORDER_SOURCE_RETRY_INTERVAL = 10.0
 LABEL_OCR_RETRY_INTERVAL = 30.0
 PRODUCT_COUNT_MAX_AGE_DAYS = 60
-# Temporarily disabled because rebuilding Count.json can block the launcher.
-# Keep the implementation below so it can be re-enabled after optimization.
-PRODUCT_COUNT_ENABLED = False
+# Count only a newly imported Order JSON.  Per-file contributions are kept in
+# a small ledger, so launcher startup never rescans every historical order.
+PRODUCT_COUNT_ENABLED = True
 PHOTO_DELAY = 2.5
 B2B_INDEX_FILENAME = "B2B_Order_Index.txt"
 RETAIL_ORDER_CACHE_SUFFIX = " (Order).json"
@@ -177,8 +177,11 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.41"
+CURRENT_VERSION = "3.44"
 LABEL_OCR_STATE_FILE = BASE_DIR / ".pdf_label_ocr_state.json"
+RETAIL_SORT_MODES = ("Standard", "Merch", "Seeds", "Small")
+INVENT_DEPARTMENT = "INVENT"
+PRODUCT_COUNT_LEDGER_FILENAME = "Count_Processed.json"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
 SUPPORT_SHARE_NAMES = {
@@ -219,7 +222,7 @@ SUPPORT_CATALOG_KEYS = (
     "REMOVE_ITEMS",
     "REMOVE_PHRASES",
     "PRODUCT_NAME_EXCEPTIONS",
-    "CHECK",
+    "UNCHECK",
 )
 DEFAULT_ORDER_LABEL_SETTINGS = {
     "width_mm": 70.0,
@@ -243,7 +246,11 @@ SETTINGS_SCHEMA_DEFAULTS = {
     "PRODUCT_NAME_EXCEPTIONS": [],
     "PRODUCTS": {},
     "Merch": {},
-    "CHECK": {},
+    "UNCHECK": {
+        "1": "Sticker",
+        "2": "Pin",
+        "3": "Tag",
+    },
     "ORDER_LABEL": DEFAULT_ORDER_LABEL_SETTINGS,
     "support": False,
     "support_username": "",
@@ -988,6 +995,7 @@ class CheckerIdentity:
     camera_number: int | None
     printer_name: str | None = None
     scanner_name: str | None = None
+    sort_mode: str = "Standard"
 
 
 def load_settings() -> dict:
@@ -1016,7 +1024,7 @@ def close_serial_safely(display) -> None:
 
 
 def update_display_last_identity(display_mac: str, identity: CheckerIdentity) -> None:
-    """Persist the last name, department, camera, printer and scanner."""
+    """Persist the last worker devices and RETAIL order-sort selection."""
     with portalocker.Lock(str(SETTINGS_FILE), mode="r+", encoding="utf-8", timeout=30) as file:
         file.seek(0)
         settings = json.load(file)
@@ -1026,6 +1034,7 @@ def update_display_last_identity(display_mac: str, identity: CheckerIdentity) ->
             identity.camera_number if identity.camera_number is not None else "",
             identity.printer_name or "",
             identity.scanner_name or "",
+            identity.sort_mode,
         ]
         file.seek(0)
         file.truncate()
@@ -1115,6 +1124,18 @@ def ensure_settings_schema() -> dict:
             if obsolete_key in settings:
                 del settings[obsolete_key]
                 changed = True
+        # CHECK used to mean an additional position to show in RETAIL_UP.
+        # UNCHECK has the inverse and simpler meaning: matching positions are
+        # hidden from the packer's warning list.  Preserve configured values.
+        if "CHECK" in settings:
+            if "UNCHECK" not in settings:
+                settings["UNCHECK"] = (
+                    settings["CHECK"]
+                    if settings["CHECK"]
+                    else copy.deepcopy(SETTINGS_SCHEMA_DEFAULTS["UNCHECK"])
+                )
+            del settings["CHECK"]
+            changed = True
         for key, default_value in SETTINGS_SCHEMA_DEFAULTS.items():
             if key not in settings:
                 settings[key] = copy.deepcopy(default_value)
@@ -1156,9 +1177,11 @@ def ensure_settings_schema() -> dict:
         changed = changed or trial_pack_changed
 
         departments = settings.get("DEPARTMENT")
-        if isinstance(departments, list) and RETAIL_UP_DEPARTMENT not in departments:
-            departments.append(RETAIL_UP_DEPARTMENT)
-            changed = True
+        if isinstance(departments, list):
+            for department in (RETAIL_UP_DEPARTMENT, INVENT_DEPARTMENT):
+                if department not in departments:
+                    departments.append(department)
+                    changed = True
 
         if changed:
             file.seek(0)
@@ -1331,15 +1354,14 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
         changed = True
 
     departments = settings.setdefault("DEPARTMENT", [])
-    if (
-        isinstance(departments, list)
-        and RETAIL_UP_DEPARTMENT not in departments
-    ):
-        departments.append(RETAIL_UP_DEPARTMENT)
-        changed = True
+    if isinstance(departments, list):
+        for department in (RETAIL_UP_DEPARTMENT, INVENT_DEPARTMENT):
+            if department not in departments:
+                departments.append(department)
+                changed = True
 
-    if settings.get("CHECK") is None:
-        settings["CHECK"] = {}
+    if settings.get("UNCHECK") is None:
+        settings["UNCHECK"] = {}
         changed = True
 
     for camera_number in cameras:
@@ -1349,9 +1371,11 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
 
     for display_mac, values in list(display_settings.items()):
         if not isinstance(values, list):
-            values = ["", "", "", "", ""]
+            values = ["", "", "", "", "", "Standard"]
         else:
-            values = (values + ["", "", "", "", ""])[:5]
+            values = (values + ["", "", "", "", "", "Standard"])[:6]
+            if values[5] not in RETAIL_SORT_MODES:
+                values[5] = "Standard"
         if (
             not values[3]
             and str(values[1]).upper() == RETAIL_UP_DEPARTMENT
@@ -1364,7 +1388,9 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
 
     for display_mac in displays:
         if display_mac not in display_settings:
-            display_settings[display_mac] = ["", "", "", "", ""]
+            display_settings[display_mac] = [
+                "", "", "", "", "", "Standard",
+            ]
             changed = True
 
     if changed:
@@ -1819,20 +1845,24 @@ def upload_display_data(
     """Upload menu options, placing the display's last selection first."""
     last_values = settings.get("DISPLAY", {}).get(
         display_mac,
-        ["", "", "", "", ""],
+        ["", "", "", "", "", "Standard"],
     )
-    last_values = (list(last_values) + ["", "", "", "", ""])[:5]
+    last_values = (
+        list(last_values) + ["", "", "", "", "", "Standard"]
+    )[:6]
     names = _prioritise(list(settings.get("NAME", [])), last_values[0])
     departments = _prioritise(list(settings.get("DEPARTMENT", [])), last_values[1])
     camera_numbers = _prioritise(sorted(cameras), last_values[2])
     printer_names = _prioritise(list(printers), last_values[3])
     scanner_names = _prioritise(list(scanners), last_values[4])
+    sort_modes = _prioritise(list(RETAIL_SORT_MODES), last_values[5])
 
     fields = [
         ",".join(map(str, names)),
         ",".join(map(str, departments)),
         ",".join(map(str, camera_numbers)),
         ",".join(printer_names),
+        ",".join(sort_modes),
         ",".join(scanner_names),
         "*ORDER*",
     ]
@@ -2026,6 +2056,7 @@ def parse_command(line: str) -> tuple[str, CheckerIdentity] | None:
     match = re.fullmatch(
         r"(Start|Stop):([^;\r\n]+);([^;\r\n]+);(\d*)"
         r"(?:;([^;\r\n]*))?"
+        r"(?:;([^;\r\n]*))?"
         r"(?:;([^;\r\n]*))?",
         line.strip(),
     )
@@ -2039,13 +2070,23 @@ def parse_command(line: str) -> tuple[str, CheckerIdentity] | None:
         camera_number,
         printer_name,
         scanner_name,
+        sort_mode,
     ) = match.groups()
+    selected_sort = next(
+        (
+            candidate
+            for candidate in RETAIL_SORT_MODES
+            if candidate.casefold() == str(sort_mode or "").strip().casefold()
+        ),
+        "Standard",
+    )
     identity = CheckerIdentity(
         name.strip(),
         department.strip(),
         int(camera_number) if camera_number else None,
         printer_name.strip() if printer_name and printer_name.strip() else None,
         scanner_name.strip() if scanner_name and scanner_name.strip() else None,
+        selected_sort,
     )
 
     if not identity.name or not identity.department:
@@ -2647,6 +2688,20 @@ def product_base_name(name: str, config: dict | None = None) -> str:
         r"\s*-\s*\d+(?:\+\d+)?\s*fem\s*$",
         "",
         normalized_name,
+        flags=re.IGNORECASE,
+    )
+
+
+def display_unknown_item_name(name: str) -> str:
+    """Remove a misleading ` - 1` fragment only from unknown Tag rows."""
+    text = str(name)
+    if "tag" not in text.casefold():
+        return text
+    return re.sub(
+        r"\s+-\s+1(?=\s|$)",
+        "",
+        text,
+        count=1,
         flags=re.IGNORECASE,
     )
 
@@ -3881,9 +3936,9 @@ def send_RETAIL_UP_display_state(
     return message
 
 
-def RETAIL_check_fragments(settings: dict) -> list[str]:
-    """Read CHECK fragments from either a dictionary, list or single string."""
-    configured = settings.get("CHECK", {})
+def RETAIL_uncheck_fragments(settings: dict) -> list[str]:
+    """Read RETAIL_UP hidden-position fragments from UNCHECK."""
+    configured = settings.get("UNCHECK", {})
     if isinstance(configured, dict):
         values = [
             value.strip()
@@ -3926,8 +3981,8 @@ def RETAIL_UP_check_lines(
     order_id: str,
     settings: dict,
 ) -> list[str]:
-    """Return packing warnings, excluding every Bonus position."""
-    fragments = RETAIL_check_fragments(settings)
+    """Return non-PRODUCTS warnings except Bonus and UNCHECK matches."""
+    fragments = RETAIL_uncheck_fragments(settings)
     fragment_keys = [fragment.casefold() for fragment in fragments]
     today = datetime.date.today()
     for pdf_date, _part, pdf_path in reversed(
@@ -3940,7 +3995,7 @@ def RETAIL_UP_check_lines(
                 pdf_path, settings
             )
         except Exception as error:
-            Printer(f"XXX Cannot load {pdf_path.name} for CHECK: {error}")
+            Printer(f"XXX Cannot load {pdf_path.name} for UNCHECK: {error}")
             continue
         matched_order = next(
             (
@@ -3956,17 +4011,21 @@ def RETAIL_UP_check_lines(
         for name, quantity in matched_order:
             if is_bonus_item(name):
                 continue
-            is_product = RETAIL_UP_is_product_item(name, settings)
-            matches_check = any(
-                fragment in name.casefold() for fragment in fragment_keys
-            )
-            if is_product and not matches_check:
+            if any(fragment in name.casefold() for fragment in fragment_keys):
                 continue
-            line = f"{quantity} {name}"
+            is_product = RETAIL_UP_is_product_item(name, settings)
+            if is_product:
+                continue
+            display_name = (
+                name
+                if has_barcode_for_item(name, settings)
+                else display_unknown_item_name(name)
+            )
+            line = f"{quantity} {display_name}"
             # Every position outside PRODUCTS is a packing warning, including
             # Merch and completely unknown items. An explicit tag keeps it
             # yellow even if OTHER colour rules contain a matching fragment.
-            result.append(f"#ffff00 {line}" if not is_product else line)
+            result.append(f"#ffff00 {line}")
         return result
     Printer(f"? Order data for packing checks not found: {order_id}")
     return []
@@ -4810,7 +4869,7 @@ def process_RETAIL_UP_scan(
     *,
     parenthesize_print_name: bool = False,
 ) -> bool:
-    """Validate an order, print its label and show configured CHECK items."""
+    """Validate an order, print its label and show non-PRODUCTS warnings."""
     check_lines = []
     try:
         status_message, _physically_printed = submit_RETAIL_UP_label(
@@ -6811,6 +6870,180 @@ def refresh_B2B_product_count(config: dict) -> bool:
     )
 
 
+def update_product_count_from_new_source(
+    department: str,
+    source_path: Path,
+    source_date: datetime.date,
+    config: dict,
+    *,
+    B2B: bool = False,
+) -> bool:
+    """Add one source once and expire saved contributions older than 60 days."""
+    if not PRODUCT_COUNT_ENABLED or support_mode_enabled(config):
+        return False
+
+    department = department.upper()
+    department_dir = DESKTOP_DIR / department
+    department_dir.mkdir(parents=True, exist_ok=True)
+    count_path = department_dir / "Count.json"
+    ledger_path = department_dir / PRODUCT_COUNT_LEDGER_FILENAME
+    catalog = product_count_catalog(config)
+
+    with portalocker.Lock(
+        str(ledger_path), mode="a+", encoding="utf-8", timeout=120
+    ) as ledger_file:
+        ledger_file.seek(0)
+        ledger_raw = ledger_file.read().strip().lstrip("\ufeff")
+        try:
+            ledger_document = json.loads(ledger_raw) if ledger_raw else {}
+        except (TypeError, json.JSONDecodeError):
+            ledger_document = {}
+        if not isinstance(ledger_document, dict):
+            ledger_document = {}
+        processed = ledger_document.get("PROCESSED_FILES", {})
+        if not isinstance(processed, dict):
+            processed = {}
+
+        with portalocker.Lock(
+            str(count_path), mode="a+", encoding="utf-8", timeout=120
+        ) as count_file:
+            count_file.seek(0)
+            count_raw = count_file.read().strip().lstrip("\ufeff")
+            try:
+                count_document = json.loads(count_raw) if count_raw else {}
+            except (TypeError, json.JSONDecodeError):
+                count_document = {}
+            if not isinstance(count_document, dict):
+                count_document = {}
+
+            # Migrate the previous embedded ledger without rereading sources.
+            legacy_processed = count_document.get("PROCESSED_FILES", {})
+            if not processed and isinstance(legacy_processed, dict):
+                processed = copy.deepcopy(legacy_processed)
+
+            exclusions = count_document.get("EXCEPTIONS", {})
+            if not isinstance(exclusions, dict):
+                exclusions = {}
+            exclusion_keys = product_count_exclusion_keys(exclusions)
+
+            existing_key = next(
+                (
+                    key for key in processed
+                    if str(key).casefold() == source_path.name.casefold()
+                ),
+                None,
+            )
+            source_added = existing_key is None
+            if source_added:
+                parser = (
+                    B2B_product_count_contribution
+                    if B2B else RETAIL_product_count_contribution
+                )
+                contribution = parser(source_path, config, exclusion_keys)
+                processed[source_path.name] = {
+                    "date": source_date.isoformat(),
+                    "PRODUCTS": contribution,
+                }
+
+            cutoff = datetime.date.today() - datetime.timedelta(
+                days=PRODUCT_COUNT_MAX_AGE_DAYS
+            )
+            expired = []
+            for source_id, record in processed.items():
+                if not isinstance(record, dict):
+                    expired.append(source_id)
+                    continue
+                try:
+                    record_date = datetime.date.fromisoformat(
+                        str(record.get("date", ""))
+                    )
+                except ValueError:
+                    expired.append(source_id)
+                    continue
+                if record_date < cutoff:
+                    expired.append(source_id)
+            for source_id in expired:
+                processed.pop(source_id, None)
+
+            total: dict[str, int] = defaultdict(int)
+            catalog_set = set(catalog)
+            for record in processed.values():
+                contribution = (
+                    record.get("PRODUCTS", {})
+                    if isinstance(record, dict) else {}
+                )
+                if not isinstance(contribution, dict):
+                    continue
+                for product_name, value in contribution.items():
+                    if (
+                        product_name in catalog_set
+                        and isinstance(value, int)
+                        and not isinstance(value, bool)
+                        and value > 0
+                    ):
+                        total[product_name] += value
+
+            catalog_order = {
+                product_name: index
+                for index, product_name in enumerate(catalog)
+            }
+            sorted_catalog = sorted(
+                catalog,
+                key=lambda product_name: (
+                    -total.get(product_name, 0),
+                    catalog_order[product_name],
+                ),
+            )
+            product_counts = OrderedDict(
+                (product_name, total.get(product_name, 0))
+                for product_name in sorted_catalog
+            )
+            new_count_document = OrderedDict((
+                ("EXCEPTIONS", exclusions),
+                ("PRODUCTS", product_counts),
+                (
+                    "UPDATED_AT",
+                    datetime.datetime.now().isoformat(timespec="seconds"),
+                ),
+            ))
+            new_ledger_document = OrderedDict((
+                ("PROCESSED_FILES", processed),
+                (
+                    "UPDATED_AT",
+                    datetime.datetime.now().isoformat(timespec="seconds"),
+                ),
+            ))
+
+            count_file.seek(0)
+            count_file.truncate()
+            json.dump(
+                new_count_document,
+                count_file,
+                ensure_ascii=False,
+                indent=4,
+            )
+            count_file.write("\n")
+            count_file.flush()
+
+        ledger_file.seek(0)
+        ledger_file.truncate()
+        json.dump(
+            new_ledger_document,
+            ledger_file,
+            ensure_ascii=False,
+            indent=4,
+        )
+        ledger_file.write("\n")
+        ledger_file.flush()
+
+    if source_added or expired:
+        print(
+            f"* {department} Count.json updated | "
+            f"{len(processed)} file(s) | {sum(product_counts.values())} position(s)"
+        )
+    return source_added or bool(expired)
+
+
 def RETAIL_statistics_part_names(worker: dict) -> set[str]:
     """Return PDF part names already represented in today's statistics."""
     stat_file = retail_statistics_file(worker)
@@ -6980,6 +7213,11 @@ def process_pending_RETAIL_order_sources(
                     )
                 else:
                     continue
+                count_source_path = (
+                    cache_path
+                    if cache_path is not None
+                    else RETAIL_order_cache_path(pdf_path)
+                )
                 selected = RETAIL_orders_for_current_day(
                     worker, canonical_pdf, parsed
                 )
@@ -7000,12 +7238,16 @@ def process_pending_RETAIL_order_sources(
             f"* RETAIL part imported | {canonical_pdf.name} | "
             f"{len(selected)} order(s)"
         )
-
-    if PRODUCT_COUNT_ENABLED and not support_mode_enabled(config):
-        try:
-            refresh_RETAIL_product_count(worker, config)
-        except Exception as error:
-            Printer(f"XXX Cannot update RETAIL Count.json: {error}")
+        if PRODUCT_COUNT_ENABLED and count_source_path.is_file():
+            try:
+                update_product_count_from_new_source(
+                    "RETAIL",
+                    count_source_path,
+                    source_date,
+                    config,
+                )
+            except Exception as error:
+                Printer(f"XXX Cannot update RETAIL Count.json: {error}")
     return imported_orders
 
 
@@ -8367,6 +8609,27 @@ def parse_orders_RETAIL(worker: dict, config: dict, previous: bool = False) -> d
     worker["RETAIL_ORDER_META"] = metadata_by_order
     parsed = RETAIL_orders_for_current_day(worker, pdf_path, parsed)
     save_part_to_statistics(worker, pdf_path, parsed, config)
+    if PRODUCT_COUNT_ENABLED and not support_mode_enabled(config):
+        cache_path = RETAIL_order_cache_path(pdf_path)
+        if cache_path.is_file():
+            try:
+                source_match = re.fullmatch(
+                    r"(\d{2}\.\d{2}\.\d{4}) Part \d+\.pdf",
+                    pdf_path.name,
+                    re.IGNORECASE,
+                )
+                source_date = (
+                    datetime.datetime.strptime(
+                        source_match.group(1), "%d.%m.%Y"
+                    ).date()
+                    if source_match is not None
+                    else datetime.date.today()
+                )
+                update_product_count_from_new_source(
+                    "RETAIL", cache_path, source_date, config
+                )
+            except Exception as error:
+                Printer(f"XXX Cannot update RETAIL Count.json: {error}")
     return parsed
 
 
@@ -8636,16 +8899,28 @@ def align_RETAIL_completion_markers(
             continue
         marker_start, _marker_end = marker_span
         prefix = raw_text[:marker_start].rstrip()
-        rows.append((index, raw_text, marker_start, prefix))
+        plus_offset = raw_text[marker_start:].find("+")
+        rows.append((
+            index,
+            raw_text,
+            marker_start,
+            prefix,
+            plus_offset,
+        ))
     if not rows:
         return lines
 
-    marker_column = max(len(prefix) for _, _, _, prefix in rows) + 1
+    plus_column = max(
+        len(prefix) + 1 + plus_offset
+        for _, _, _, prefix, plus_offset in rows
+    )
     aligned = list(lines)
-    for index, raw_text, marker_start, prefix in rows:
+    for index, raw_text, marker_start, prefix, plus_offset in rows:
         newline = "\n" if lines[index].endswith("\n") else ""
+        spacing = plus_column - len(prefix) - plus_offset
         aligned[index] = (
-            prefix.ljust(marker_column)
+            prefix
+            + (" " * spacing)
             + raw_text[marker_start:]
             + newline
         )
@@ -8715,6 +8990,147 @@ def RETAIL_delivery_from_stat_line(line: str) -> str:
     if explicit_delivery:
         return explicit_delivery
     return RETAIL_delivery_from_tracking_number(tracking_number)
+
+
+def RETAIL_order_catalog_counts(
+    items: list[tuple[str, int]],
+    config: dict,
+) -> tuple[int, int]:
+    """Return (Merch rows, PRODUCTS rows); order quantities do not add rows."""
+    product_names = {
+        normalize(str(value)).casefold()
+        for value in config.get("PRODUCTS", {}).values()
+    }
+    merch_names = {
+        normalize(str(value)).casefold()
+        for value in config.get("Merch", {}).values()
+    }
+    merch_count = 0
+    product_count = 0
+    for name, _quantity in items:
+        base_name = product_base_name(name, config).casefold()
+        if base_name in product_names:
+            product_count += 1
+        elif base_name in merch_names:
+            merch_count += 1
+    return merch_count, product_count
+
+
+def sorted_RETAIL_order_batch(
+    order_ids: list[str],
+    orders: dict,
+    config: dict,
+    mode: str,
+) -> list[str]:
+    """Sort one newly discovered batch without disturbing older queue items."""
+    if mode == "Standard":
+        return list(order_ids)
+    source_index = {order_id: index for index, order_id in enumerate(order_ids)}
+
+    def score(order_id: str) -> tuple[int, int]:
+        items = orders.get(order_id, [])
+        merch_count, product_count = RETAIL_order_catalog_counts(items, config)
+        if mode == "Merch":
+            return -merch_count, source_index[order_id]
+        if mode == "Seeds":
+            return -product_count, source_index[order_id]
+        # Small means the number of PDF rows, not the sum of their quantities.
+        return len(items), source_index[order_id]
+
+    return sorted(order_ids, key=score)
+
+
+def sync_RETAIL_sort_queues(
+    worker: dict,
+    orders: dict,
+    config: dict,
+    *,
+    reset: bool = False,
+) -> dict[str, list[str]]:
+    """Append newly imported orders to all stable per-process sort queues."""
+    queues = worker.get("RETAIL_SORT_QUEUES")
+    known = worker.get("RETAIL_SORT_KNOWN_IDS")
+    if (
+        reset
+        or not isinstance(queues, dict)
+        or not isinstance(known, set)
+        or any(not isinstance(queues.get(mode), list) for mode in RETAIL_SORT_MODES)
+    ):
+        queues = {mode: [] for mode in RETAIL_SORT_MODES}
+        known = set()
+
+    new_order_ids = [order_id for order_id in orders if order_id not in known]
+    if new_order_ids:
+        for mode in RETAIL_SORT_MODES:
+            queues[mode].extend(
+                sorted_RETAIL_order_batch(new_order_ids, orders, config, mode)
+            )
+        known.update(new_order_ids)
+
+    worker["RETAIL_SORT_QUEUES"] = queues
+    worker["RETAIL_SORT_KNOWN_IDS"] = known
+    return queues
+
+
+def reserve_specific_RETAIL_order(
+    worker: dict,
+    orders: dict,
+    order_id: str,
+) -> bool:
+    """Atomically reserve one queued order only when it is fully unclaimed."""
+    if order_id not in orders:
+        return False
+    stat_file = statistics_file(worker)
+    with _locked_statistics_file(stat_file) as file:
+        file.seek(0)
+        lines = file.readlines()
+        for index, line in enumerate(lines):
+            raw_text = line.rstrip("\r\n")
+            if retail_order_id_from_stat_line(raw_text) != order_id:
+                continue
+            if retail_stat_is_cancelled(raw_text):
+                return False
+            if retail_stat_effective_suffix(raw_text).strip():
+                return False
+            lines[index] = f"{raw_text} {worker['NAME']}\n"
+            file.seek(0)
+            file.truncate()
+            file.writelines(lines)
+            file.flush()
+            mirror_statistics_lines(worker, stat_file, lines)
+            return True
+    return False
+
+
+def reserve_RETAIL_order_for_selected_sort(
+    worker: dict,
+    orders: dict,
+    config: dict,
+    *,
+    ignore_delivery_priority: bool = False,
+    prefer_available_ups: bool = False,
+) -> str | None:
+    """Reserve from the selected queue, then fall back to Standard policy."""
+    queues = sync_RETAIL_sort_queues(worker, orders, config)
+    mode = str(worker.get("SORT", "Standard"))
+    if mode not in RETAIL_SORT_MODES:
+        mode = "Standard"
+    if mode != "Standard":
+        selected_queue = queues[mode]
+        while selected_queue:
+            order_id = selected_queue.pop(0)
+            if reserve_specific_RETAIL_order(worker, orders, order_id):
+                worker.pop("RETAIL_RESERVATION_WAITING_DELIVERY", None)
+                return order_id
+
+    # An exhausted custom queue must never hide still-free orders.  Standard
+    # mode also uses this existing policy directly.
+    return reserve_next_RETAIL_order(
+        worker,
+        orders,
+        ignore_delivery_priority=ignore_delivery_priority,
+        prefer_available_ups=prefer_available_ups,
+    )
 
 
 def reserve_next_RETAIL_order(
@@ -8967,8 +9383,14 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
 def show_status(order_id: str, items: list[tuple[str, int]], counts: defaultdict, extras: defaultdict,
                 errors: set, no_barcode_items: list[tuple[str, int]], send_fn,
                 show_completed_quantity: bool = False,
-                highlighted_item: str | None = None) -> None:
-    message = [f"Order status {order_id.lstrip('#')}"]
+                highlighted_item: str | None = None,
+                worker: dict | None = None) -> None:
+    header = f"Order status {order_id.lstrip('#')}"
+    if worker is not None and worker.get("DEPARTMENT", "").upper() == "RETAIL":
+        completed, total, cancelled = RETAIL_daily_order_counts(worker)
+        left = max(0, total - completed - cancelled)
+        header += f", Left: {left}/{total}"
+    message = [header]
     for name, quantity in items:
         if (name, quantity) in no_barcode_items:
             continue
@@ -8988,7 +9410,7 @@ def show_status(order_id: str, items: list[tuple[str, int]], counts: defaultdict
                 f"{extras.get(name, 0)} !!! EXTRA",
             ))
     message.extend(
-        f"{quantity} ? {name}"
+        f"{quantity} ? {display_unknown_item_name(name)}"
         for name, quantity in no_barcode_items
     )
     message.extend(f"XXX {error}" for error in errors)
@@ -9076,6 +9498,40 @@ def save_photo(
     return saved, saved and number == 1
 
 
+def process_INVENT_scan(worker: dict, config: dict, code: str) -> bool:
+    """Count one catalogue scan and redraw the in-memory inventory list."""
+    counts: OrderedDict[str, int] = worker.setdefault(
+        "INVENT_COUNTS", OrderedDict()
+    )
+    unknown_counts: OrderedDict[str, int] = worker.setdefault(
+        "INVENT_UNKNOWN_COUNTS", OrderedDict()
+    )
+    product_name = resolve_scanned_product(code, config)
+    performance_stats: WorkerPerformanceStats | None = worker.get(
+        "PERFORMANCE_STATS"
+    )
+    if performance_stats is not None:
+        performance_stats.record_scan()
+
+    if product_name is None:
+        unknown_counts[code] = unknown_counts.get(code, 0) + 1
+        if performance_stats is not None:
+            performance_stats.record_mistake()
+    else:
+        counts[product_name] = counts.get(product_name, 0) + 1
+
+    lines = ["Inventory status"]
+    lines.extend(f"{quantity} {name}" for name, quantity in counts.items())
+    lines.extend(
+        f"XXX {quantity} Unknown barcode {barcode}"
+        for barcode, quantity in unknown_counts.items()
+    )
+    message = "\n".join(lines)
+    Printer(message)
+    send(worker["DISPLAY"], message)
+    return product_name is not None
+
+
 def process_scan(worker: dict, config: dict, code: str, orders: dict, current_order: str | None,
                  counts: defaultdict, extras: defaultdict, errors: set,
                  no_barcode_items: list[tuple[str, int]], photo_pending: bool,
@@ -9160,7 +9616,16 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
             )
             if PRODUCT_COUNT_ENABLED and not support_mode_enabled(config):
                 try:
-                    refresh_B2B_product_count(config)
+                    progress_path = Path(worker["ACTIVE_STAT_FILE"])
+                    update_product_count_from_new_source(
+                        "B2B",
+                        progress_path,
+                        datetime.date.fromtimestamp(
+                            progress_path.stat().st_mtime
+                        ),
+                        config,
+                        B2B=True,
+                    )
                 except Exception as error:
                     Printer(f"XXX Cannot update B2B Count.json: {error}")
         else:
@@ -9168,6 +9633,7 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
         show_status(
             current_order, orders[current_order], counts, extras, errors,
             no_barcode_items, send_fn, show_completed_quantity,
+            worker=worker,
         )
         return current_order, False, 0.0
 
@@ -9234,6 +9700,7 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
     show_status(
         current_order, orders[current_order], counts, extras, errors,
         no_barcode_items, send_fn, show_completed_quantity, changed_item,
+        worker,
     )
     if order_ready(orders[current_order], counts, extras, errors, no_barcode_items):
         message = "+ Order complete"
@@ -9263,9 +9730,10 @@ def automatically_assign_next_RETAIL_order(
     performance_stats: WorkerPerformanceStats | None = worker.get(
         "PERFORMANCE_STATS"
     )
-    order_id = reserve_next_RETAIL_order(
+    order_id = reserve_RETAIL_order_for_selected_sort(
         worker,
         orders,
+        config,
         ignore_delivery_priority=ignore_delivery_priority,
         prefer_available_ups=prefer_available_ups,
     )
@@ -9493,6 +9961,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "STATISTICS": statistics_dir,
             "HAS_CAMERA": cap is not None,
             "PRINTER": identity.printer_name or "",
+            "SORT": identity.sort_mode,
             "PERFORMANCE_STATS": performance_stats,
             "LABEL_OCR_RUNNING_EVENT": label_ocr_running_event,
         }
@@ -9548,6 +10017,8 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                 orders = initial_orders
         else:
             orders = {}
+        if department == "RETAIL":
+            sync_RETAIL_sort_queues(worker, orders, config, reset=True)
         current_order = None
         counts = defaultdict(int)
         extras = defaultdict(int)
@@ -9669,6 +10140,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     )
                     if refreshed_orders:
                         orders = refreshed_orders
+                        sync_RETAIL_sort_queues(worker, orders, config)
                     if (
                         current_order is not None
                         and current_order in retail_changed_order_ids
@@ -9794,6 +10266,7 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                         identity.camera_number,
                         identity.printer_name,
                         identity.scanner_name,
+                        identity.sort_mode,
                     )
                     worker["NAME"] = new_name
                     update_display_last_identity(display_number, identity)
@@ -9872,6 +10345,9 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     # Keep the currently loaded list if no previous PDF exists.
                     if loaded_orders:
                         orders = loaded_orders
+                        sync_RETAIL_sort_queues(
+                            worker, orders, config, reset=True
+                        )
                         current_order = None
                         worker.pop("RETAIL_AUTOMATIC_ORDER", None)
                         counts.clear()
@@ -9962,7 +10438,9 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     else line.strip()
                 )
                 if code:
-                    if identity.department.upper() == RETAIL_UP_DEPARTMENT:
+                    if identity.department.upper() == INVENT_DEPARTMENT:
+                        process_INVENT_scan(worker, config, code)
+                    elif identity.department.upper() == RETAIL_UP_DEPARTMENT:
                         performance_stats.record_scan()
                         label_processed = process_RETAIL_UP_scan(
                             worker, config, code
@@ -10486,11 +10964,6 @@ def dispatcher() -> None:
     # Add the per-display saved-selection slots after their IDs are known.
     settings = ensure_detected_settings(cameras, display_ports)
     ensure_worker_statistics_files(settings)
-    if PRODUCT_COUNT_ENABLED and not support_mode_enabled(settings):
-        try:
-            refresh_B2B_product_count(settings)
-        except Exception as error:
-            print(f"XXX Cannot update B2B Count.json: {error}")
 
     launcher_retail_worker = None
     launcher_console_started = False
@@ -11294,6 +11767,7 @@ def dispatcher() -> None:
                         identity.camera_number,
                         actual_printer,
                         identity.scanner_name,
+                        identity.sort_mode,
                     )
 
                 scanner_port = None
@@ -11340,6 +11814,7 @@ def dispatcher() -> None:
                         identity.camera_number,
                         identity.printer_name,
                         actual_scanner,
+                        identity.sort_mode,
                     )
 
                 # Windows locks COM ports exclusively. Close it before the child opens it.
