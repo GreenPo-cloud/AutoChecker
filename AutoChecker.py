@@ -105,6 +105,7 @@ import time
 import datetime
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import cv2
@@ -179,7 +180,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.47"
+CURRENT_VERSION = "3.48"
 LABEL_OCR_STATE_FILE = BASE_DIR / ".pdf_label_ocr_state.json"
 RETAIL_SORT_MODES = ("Standard", "Merch", "Seeds", "Small")
 INVENT_DEPARTMENT = "INVENT"
@@ -370,6 +371,17 @@ def _version_key(version: str) -> tuple[int, ...] | None:
     return tuple(parts)
 
 
+def _display_version_key(version: str) -> Decimal | None:
+    """Compare display versions as decimal numbers (for example 1.12 < 1.2)."""
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)?)", version.strip(), re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return Decimal(match.group(1))
+    except InvalidOperation:
+        return None
+
+
 def check_for_updates() -> None:
     """Download and install a newer AutoChecker version when available."""
     try:
@@ -536,7 +548,7 @@ def get_latest_display_versions() -> dict[str, str]:
             response = requests.get(str(config["version_url"]), timeout=5)
             response.raise_for_status()
             version = response.text.strip()
-            if _version_key(version) is None:
+            if _display_version_key(version) is None:
                 print(
                     f"XXX Invalid {display_type} display update version: "
                     f"{version!r}"
@@ -1438,7 +1450,7 @@ def _probe_autochecker_display(port: str) -> tuple[str, str, str] | None:
                 if display_mac is None:
                     break
                 version = match.group(2).strip()
-                if _version_key(version) is None:
+                if _display_version_key(version) is None:
                     print(f"XXX {port} returned invalid firmware version: {version!r}")
                     return None
                 display_type = (match.group(3) or "CYD").upper()
@@ -1483,8 +1495,12 @@ def identify_autochecker_display(
 
     display_mac, installed_version, display_type = identity
     latest_version = latest_versions.get(display_type)
-    installed_key = _version_key(installed_version)
-    latest_key = _version_key(latest_version) if latest_version is not None else None
+    installed_key = _display_version_key(installed_version)
+    latest_key = (
+        _display_version_key(latest_version)
+        if latest_version is not None
+        else None
+    )
     if (
         installed_key is not None
         and latest_key is not None
@@ -1525,7 +1541,7 @@ def identify_autochecker_display(
                     f"{display_type} -> {updated_type}"
                 )
                 return None
-            if _version_key(updated_version) < latest_key:
+            if _display_version_key(updated_version) < latest_key:
                 print(
                     f"XXX Display {display_mac} still reports firmware "
                     f"{updated_version}; expected {latest_version}"
