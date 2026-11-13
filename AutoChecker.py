@@ -180,7 +180,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.48"
+CURRENT_VERSION = "3.49"
 LABEL_OCR_STATE_FILE = BASE_DIR / ".pdf_label_ocr_state.json"
 RETAIL_SORT_MODES = ("Standard", "Merch", "Seeds", "Small")
 INVENT_DEPARTMENT = "INVENT"
@@ -10090,15 +10090,9 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
     performance_stats = None
 
     try:
+        display = open_display(display_port)
         config = load_settings()
         photo_dir, statistics_dir = department_paths(identity.department)
-
-        display = serial.Serial(
-            display_port,
-            baudrate=DISPLAY_BAUDRATE,
-            timeout=DISPLAY_TIMEOUT,
-            write_timeout=DISPLAY_WRITE_TIMEOUT,
-        )
 
         if scanner_port is not None:
             try:
@@ -10237,18 +10231,9 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             print(f"* Started {identity} without camera")
         display.write(b"<Ready>\n")
         display.flush()
-        next_display_heartbeat = (
-            time.monotonic() + DISPLAY_HEARTBEAT_INTERVAL
-        )
 
         window_name = f"AutoChecker - {identity.name} - {identity.department} - {identity.camera_number}"
         while True:
-            heartbeat_now = time.monotonic()
-            if heartbeat_now >= next_display_heartbeat:
-                send_display_heartbeat(display)
-                next_display_heartbeat = (
-                    heartbeat_now + DISPLAY_HEARTBEAT_INTERVAL
-                )
             display_update_requested = False
             updated_cameras = None
             updated_printers = None
@@ -10818,8 +10803,66 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
 
 
 
-def open_display(port: str) -> serial.Serial:
-    return serial.Serial(port, baudrate=DISPLAY_BAUDRATE, timeout=DISPLAY_TIMEOUT)
+class DisplaySerialConnection:
+    """Serialize display writes and maintain heartbeat in a daemon thread."""
+
+    def __init__(
+        self,
+        connection: serial.Serial,
+        heartbeat_interval: float = DISPLAY_HEARTBEAT_INTERVAL,
+    ) -> None:
+        self._connection = connection
+        self._heartbeat_interval = heartbeat_interval
+        self._write_lock = threading.Lock()
+        self._stop_heartbeat = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"AutoChecker heartbeat {connection.port}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_heartbeat.wait(self._heartbeat_interval):
+            try:
+                with self._write_lock:
+                    if not self._connection.is_open:
+                        return
+                    self._connection.write(DISPLAY_HEARTBEAT_PACKET)
+                    self._connection.flush()
+            except (serial.SerialException, OSError):
+                # A display reset can cause one temporary write failure. Keep
+                # retrying while the owner still holds the open connection.
+                if self._stop_heartbeat.is_set() or not self._connection.is_open:
+                    return
+
+    def write(self, data: bytes) -> int:
+        with self._write_lock:
+            return self._connection.write(data)
+
+    def flush(self) -> None:
+        with self._write_lock:
+            self._connection.flush()
+
+    def close(self) -> None:
+        self._stop_heartbeat.set()
+        if threading.current_thread() is not self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=1.0)
+        with self._write_lock:
+            self._connection.close()
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+
+def open_display(port: str) -> DisplaySerialConnection:
+    connection = serial.Serial(
+        port,
+        baudrate=DISPLAY_BAUDRATE,
+        timeout=DISPLAY_TIMEOUT,
+        write_timeout=DISPLAY_WRITE_TIMEOUT,
+    )
+    return DisplaySerialConnection(connection)
 
 
 def notify_launcher_ready(display: serial.Serial) -> None:
@@ -11224,7 +11267,6 @@ def dispatcher() -> None:
     worker_reset_events: dict[str, multiprocessing.Event] = {}
     worker_disconnect_events: dict[str, multiprocessing.Event] = {}
     reset_recovery_deadlines: dict[str, float] = {}
-    next_idle_heartbeat_deadlines: dict[str, float] = {}
     settings_update_requests: multiprocessing.Queue = multiprocessing.Queue()
     observed_ports = {port_info.device for port_info in list_ports.comports()}
     disconnected_ports_waiting_removal: set[str] = set()
@@ -11788,9 +11830,6 @@ def dispatcher() -> None:
                         notify_launcher_ready(display)
                         print(f"* AutoChecker {display_number} recovered after reset")
                         reset_recovery_deadlines.pop(display_number, None)
-                        next_idle_heartbeat_deadlines[display_number] = (
-                            time.monotonic() + DISPLAY_HEARTBEAT_INTERVAL
-                        )
                     except (serial.SerialException, OSError) as error:
                         print(f"XXX Reset recovery failed on {port}: {error}")
                         reset_recovery_deadlines[display_number] = (
@@ -11798,19 +11837,6 @@ def dispatcher() -> None:
                         )
 
                 try:
-                    heartbeat_now = time.monotonic()
-                    next_heartbeat = next_idle_heartbeat_deadlines.setdefault(
-                        display_number,
-                        heartbeat_now + DISPLAY_HEARTBEAT_INTERVAL,
-                    )
-                    if (
-                        display_number not in reset_recovery_deadlines
-                        and heartbeat_now >= next_heartbeat
-                    ):
-                        send_display_heartbeat(display)
-                        next_idle_heartbeat_deadlines[display_number] = (
-                            heartbeat_now + DISPLAY_HEARTBEAT_INTERVAL
-                        )
                     line = display.readline().decode("utf-8", errors="ignore").strip()
                     if line:
                         print(line)
@@ -11821,7 +11847,6 @@ def dispatcher() -> None:
                     display_ports.pop(display_number, None)
                     disconnected_ports_waiting_removal.add(port)
                     reset_recovery_deadlines.pop(display_number, None)
-                    next_idle_heartbeat_deadlines.pop(display_number, None)
                     print(
                         f"? AutoChecker {display_number} disconnected; "
                         "monitoring COM ports"
@@ -12057,9 +12082,9 @@ def dispatcher() -> None:
                     )
 
                 # Windows locks COM ports exclusively. Close it before the child opens it.
+                send_display_heartbeat(display)
                 display.close()
                 del idle_displays[display_number]
-                next_idle_heartbeat_deadlines.pop(display_number, None)
                 update_display_last_identity(display_number, identity)
 
                 display_update_queue: multiprocessing.Queue = multiprocessing.Queue()
