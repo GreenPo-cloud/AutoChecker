@@ -144,6 +144,8 @@ DISPLAY_BAUDRATE = 115200
 SCANNER_BAUDRATE = 115200
 DISPLAY_TIMEOUT = 0.1
 DISPLAY_WRITE_TIMEOUT = 5.0
+DISPLAY_HEARTBEAT_INTERVAL = 3.0
+DISPLAY_HEARTBEAT_PACKET = b"<PING>\n"
 HANDSHAKE_TIMEOUT = 1.0
 DISPLAY_BOOT_DELAY = 1.5
 ESP_ROM_PREFIX = "ESP-ROM:"
@@ -177,10 +179,11 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.44"
+CURRENT_VERSION = "3.47"
 LABEL_OCR_STATE_FILE = BASE_DIR / ".pdf_label_ocr_state.json"
 RETAIL_SORT_MODES = ("Standard", "Merch", "Seeds", "Small")
 INVENT_DEPARTMENT = "INVENT"
+DEPARTMENTS = ("B2B", "RETAIL", "RETAIL_UP", INVENT_DEPARTMENT)
 PRODUCT_COUNT_LEDGER_FILENAME = "Count_Processed.json"
 
 DEFAULT_MAIN_COMPUTER_NAME = "GREENPO"
@@ -232,7 +235,6 @@ DEFAULT_ORDER_LABEL_SETTINGS = {
 }
 SETTINGS_SCHEMA_DEFAULTS = {
     "NAME": [],
-    "DEPARTMENT": [],
     "FOCUS": {},
     "DISPLAY": {},
     "SCANNER": {},
@@ -1120,7 +1122,7 @@ def ensure_settings_schema() -> dict:
         # Remove settings that are no longer part of AutoChecker's logic.
         # Sound files are local replaceable assets; OTHER_BONUS was replaced
         # by the common Bonus handling used for every PRODUCTS position.
-        for obsolete_key in ("SOUNDS", "OTHER_BONUS"):
+        for obsolete_key in ("SOUNDS", "OTHER_BONUS", "DEPARTMENT"):
             if obsolete_key in settings:
                 del settings[obsolete_key]
                 changed = True
@@ -1175,13 +1177,6 @@ def ensure_settings_schema() -> dict:
 
         trial_pack_changed = migrate_trial_packs_to_standard_products(settings)
         changed = changed or trial_pack_changed
-
-        departments = settings.get("DEPARTMENT")
-        if isinstance(departments, list):
-            for department in (RETAIL_UP_DEPARTMENT, INVENT_DEPARTMENT):
-                if department not in departments:
-                    departments.append(department)
-                    changed = True
 
         if changed:
             file.seek(0)
@@ -1352,13 +1347,6 @@ def ensure_detected_settings(cameras: dict[int, int], displays: dict[str, str]) 
                 "",
             )
         changed = True
-
-    departments = settings.setdefault("DEPARTMENT", [])
-    if isinstance(departments, list):
-        for department in (RETAIL_UP_DEPARTMENT, INVENT_DEPARTMENT):
-            if department not in departments:
-                departments.append(department)
-                changed = True
 
     if settings.get("UNCHECK") is None:
         settings["UNCHECK"] = {}
@@ -1851,7 +1839,7 @@ def upload_display_data(
         list(last_values) + ["", "", "", "", "", "Standard"]
     )[:6]
     names = _prioritise(list(settings.get("NAME", [])), last_values[0])
-    departments = _prioritise(list(settings.get("DEPARTMENT", [])), last_values[1])
+    departments = _prioritise(list(DEPARTMENTS), last_values[1])
     camera_numbers = _prioritise(sorted(cameras), last_values[2])
     printer_names = _prioritise(list(printers), last_values[3])
     scanner_names = _prioritise(list(scanners), last_values[4])
@@ -2029,6 +2017,28 @@ def broadcast_RETAIL_orders_updated(
         except (OSError, ValueError, queue.Full) as error:
             print(
                 f"XXX Cannot refresh RETAIL state on AutoChecker "
+                f"{display_number}: {error}"
+            )
+
+
+def broadcast_RETAIL_order_claimed(
+    worker_update_queues: dict[str, multiprocessing.Queue],
+    worker_identities: dict[str, CheckerIdentity],
+    order_ids: set[str] | list[str] | tuple[str, ...],
+) -> None:
+    """Remove newly claimed orders from every live RETAIL sort cache."""
+    payload = tuple(sorted(set(order_ids)))
+    if not payload:
+        return
+    for display_number, update_queue in worker_update_queues.items():
+        identity = worker_identities.get(display_number)
+        if identity is None or identity.department.upper() != "RETAIL":
+            continue
+        try:
+            update_queue.put_nowait(("retail_order_claimed", payload))
+        except (OSError, ValueError, queue.Full) as error:
+            print(
+                f"XXX Cannot update RETAIL sort cache on AutoChecker "
                 f"{display_number}: {error}"
             )
 
@@ -2505,12 +2515,11 @@ class WorkerPerformanceStats:
 
 
 def ensure_worker_statistics_files(settings: dict) -> None:
-    """Create an empty JSON file for every configured NAME/DEPARTMENT pair."""
+    """Create an empty JSON file for every configured name and code department."""
     names = settings.get("NAME", [])
-    departments = settings.get("DEPARTMENT", [])
-    if not isinstance(names, list) or not isinstance(departments, list):
+    if not isinstance(names, list):
         return
-    for department in departments:
+    for department in DEPARTMENTS:
         department = str(department).strip()
         if (
             not department
@@ -4856,10 +4865,31 @@ def repeat_last_printed_label(worker: dict) -> str:
         label_type = str(last_label["label_type"])
         print_pdf_page(pdf_path, page_number, printer_name, label_type)
         return (
-            f"* Postal label repeated {order_id.lstrip('#')} "
+            f"+ Label printed again {order_id.lstrip('#')} "
             f"page {page_number}"
         )
     raise LookupError("Last printed label data is invalid")
+
+
+def RETAIL_UP_repeat_display_lines(
+    worker: dict,
+    settings: dict,
+    status_message: str,
+) -> tuple[str, ...]:
+    """Build the same RETAIL_UP detail block used after an order scan."""
+    if status_message.startswith("XXX"):
+        return (status_message,)
+
+    last_label = worker.get("LAST_PRINTED_LABEL")
+    if not isinstance(last_label, dict) or last_label.get("kind") != "RETAIL_UP":
+        return (status_message,)
+    order_id = str(last_label.get("order_id", "")).strip()
+    if not order_id:
+        return (status_message,)
+    return (
+        status_message,
+        *RETAIL_UP_check_lines(worker, order_id, settings),
+    )
 
 
 def process_RETAIL_UP_scan(
@@ -8996,24 +9026,22 @@ def RETAIL_order_catalog_counts(
     items: list[tuple[str, int]],
     config: dict,
 ) -> tuple[int, int]:
-    """Return (Merch rows, PRODUCTS rows); order quantities do not add rows."""
+    """Return (non-PRODUCTS rows, PRODUCTS rows), ignoring quantities."""
     product_names = {
         normalize(str(value)).casefold()
         for value in config.get("PRODUCTS", {}).values()
     }
-    merch_names = {
-        normalize(str(value)).casefold()
-        for value in config.get("Merch", {}).values()
-    }
-    merch_count = 0
+    non_product_count = 0
     product_count = 0
     for name, _quantity in items:
         base_name = product_base_name(name, config).casefold()
         if base_name in product_names:
             product_count += 1
-        elif base_name in merch_names:
-            merch_count += 1
-    return merch_count, product_count
+        else:
+            # Merch mode deliberately combines configured merchandise and
+            # completely unknown rows: both require extra packing attention.
+            non_product_count += 1
+    return non_product_count, product_count
 
 
 def sorted_RETAIL_order_batch(
@@ -9029,15 +9057,99 @@ def sorted_RETAIL_order_batch(
 
     def score(order_id: str) -> tuple[int, int]:
         items = orders.get(order_id, [])
-        merch_count, product_count = RETAIL_order_catalog_counts(items, config)
+        non_product_count, product_count = RETAIL_order_catalog_counts(
+            items, config
+        )
         if mode == "Merch":
-            return -merch_count, source_index[order_id]
+            return -non_product_count, source_index[order_id]
         if mode == "Seeds":
             return -product_count, source_index[order_id]
         # Small means the number of PDF rows, not the sum of their quantities.
         return len(items), source_index[order_id]
 
     return sorted(order_ids, key=score)
+
+
+def RETAIL_sort_delivery_map(worker: dict) -> dict[str, str]:
+    """Return explicit delivery classes for orders in today's statistics."""
+    result: dict[str, str] = {}
+    try:
+        lines = read_stat_lines(statistics_file(worker))
+    except (OSError, ValueError, KeyError, TypeError):
+        lines = []
+    for line in lines:
+        order_id = retail_order_id_from_stat_line(line)
+        if order_id is not None:
+            result[order_id] = RETAIL_delivery_from_stat_line(line)
+    return result
+
+
+def remove_RETAIL_order_from_sort_queues(worker: dict, order_id: str) -> bool:
+    """Remove one claimed order from every cached sorting in this process."""
+    queues = worker.get("RETAIL_SORT_QUEUES")
+    if not isinstance(queues, dict):
+        return False
+    removed = False
+    for queue_values in queues.values():
+        if not isinstance(queue_values, list):
+            continue
+        original_length = len(queue_values)
+        queue_values[:] = [
+            queued_order
+            for queued_order in queue_values
+            if queued_order != order_id
+        ]
+        removed = removed or len(queue_values) != original_length
+    return removed
+
+
+def notify_RETAIL_order_claimed(worker: dict, order_id: str) -> None:
+    """Update local queues and ask the launcher to update other workers."""
+    remove_RETAIL_order_from_sort_queues(worker, order_id)
+    request_queue = worker.get("LAUNCHER_REQUEST_QUEUE")
+    if request_queue is None:
+        return
+    try:
+        request_queue.put_nowait((
+            "retail_order_claimed",
+            worker.get("DISPLAY_NUMBER", ""),
+            order_id,
+        ))
+    except (OSError, ValueError, queue.Full) as error:
+        print(f"XXX Cannot broadcast claimed order {order_id}: {error}")
+
+
+def free_RETAIL_order_ids_for_sort(
+    worker: dict,
+    orders: dict,
+) -> set[str]:
+    """Return orders that have no worker, completion marker or cancellation."""
+    try:
+        stat_file = statistics_file(worker)
+    except (KeyError, TypeError, ValueError):
+        # Lightweight callers/tests without a storage context can still build
+        # a deterministic queue. Real RETAIL workers always have this file.
+        return set(orders)
+    if not stat_file.is_file():
+        return set(orders)
+    try:
+        lines = read_stat_lines(stat_file)
+    except (OSError, ValueError, portalocker.exceptions.LockException):
+        # Do not cache possibly occupied orders when authoritative state could
+        # not be read. The next synchronization can retry safely.
+        return set()
+
+    free_order_ids = set()
+    for line in lines:
+        order_id = retail_order_id_from_stat_line(line)
+        if order_id not in orders:
+            continue
+        if retail_stat_is_cancelled(line):
+            continue
+        if retail_stat_effective_suffix(line).strip():
+            continue
+        free_order_ids.add(order_id)
+    return free_order_ids
 
 
 def sync_RETAIL_sort_queues(
@@ -9059,13 +9171,67 @@ def sync_RETAIL_sort_queues(
         queues = {mode: [] for mode in RETAIL_SORT_MODES}
         known = set()
 
-    new_order_ids = [order_id for order_id in orders if order_id not in known]
+    free_order_ids = free_RETAIL_order_ids_for_sort(worker, orders)
+    new_order_ids = [
+        order_id
+        for order_id in orders
+        if order_id not in known and order_id in free_order_ids
+    ]
     if new_order_ids:
-        for mode in RETAIL_SORT_MODES:
-            queues[mode].extend(
-                sorted_RETAIL_order_batch(new_order_ids, orders, config, mode)
+        delivery_by_order = worker.setdefault("RETAIL_SORT_DELIVERIES", {})
+        if not isinstance(delivery_by_order, dict):
+            delivery_by_order = {}
+            worker["RETAIL_SORT_DELIVERIES"] = delivery_by_order
+        statistics_deliveries = RETAIL_sort_delivery_map(worker)
+        metadata_by_order = worker.get("RETAIL_ORDER_META", {})
+        for order_id in new_order_ids:
+            metadata = (
+                metadata_by_order.get(order_id, {})
+                if isinstance(metadata_by_order, dict) else {}
             )
-        known.update(new_order_ids)
+            delivery = normalize_RETAIL_delivery(
+                metadata.get("delivery", "")
+                if isinstance(metadata, dict) else ""
+            )
+            if not delivery:
+                delivery = statistics_deliveries.get(order_id, "")
+            if not delivery and isinstance(metadata, dict):
+                delivery = RETAIL_delivery_from_tracking_number(
+                    metadata.get("tracking_number", "")
+                )
+            delivery_by_order[order_id] = delivery or "Postal"
+
+        for mode in RETAIL_SORT_MODES:
+            mode_queue = queues[mode]
+            for delivery in RETAIL_DELIVERY_ORDER:
+                delivery_batch = [
+                    order_id
+                    for order_id in new_order_ids
+                    if delivery_by_order.get(order_id) == delivery
+                ]
+                if not delivery_batch:
+                    continue
+                sorted_batch = sorted_RETAIL_order_batch(
+                    delivery_batch, orders, config, mode
+                )
+                delivery_rank = RETAIL_DELIVERY_ORDER.index(delivery)
+                insertion_index = len(mode_queue)
+                for index, queued_order in enumerate(mode_queue):
+                    queued_delivery = delivery_by_order.get(
+                        queued_order, "Postal"
+                    )
+                    queued_rank = RETAIL_DELIVERY_ORDER.index(
+                        queued_delivery
+                        if queued_delivery in RETAIL_DELIVERY_ORDER
+                        else "Postal"
+                    )
+                    if queued_rank > delivery_rank:
+                        insertion_index = index
+                        break
+                mode_queue[insertion_index:insertion_index] = sorted_batch
+    # Occupied/completed orders are intentionally remembered too, otherwise
+    # each routine refresh would try to append them again to every queue.
+    known.update(orders)
 
     worker["RETAIL_SORT_QUEUES"] = queues
     worker["RETAIL_SORT_KNOWN_IDS"] = known
@@ -9331,9 +9497,7 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
         preferred_department = "RETAIL"
     candidates = [
         preferred_department,
-        *(str(value).upper() for value in settings.get("DEPARTMENT", [])),
-        "B2B",
-        "RETAIL",
+        *DEPARTMENTS,
     ]
 
     checked = set()
@@ -9630,6 +9794,8 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
                     Printer(f"XXX Cannot update B2B Count.json: {error}")
         else:
             update_order_in_statistics(worker, current_order, add_name=True)
+            if worker.get("DEPARTMENT", "").upper() == "RETAIL":
+                notify_RETAIL_order_claimed(worker, current_order)
         show_status(
             current_order, orders[current_order], counts, extras, errors,
             no_barcode_items, send_fn, show_completed_quantity,
@@ -9962,6 +10128,8 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "HAS_CAMERA": cap is not None,
             "PRINTER": identity.printer_name or "",
             "SORT": identity.sort_mode,
+            "DISPLAY_NUMBER": display_number,
+            "LAUNCHER_REQUEST_QUEUE": settings_update_requests,
             "PERFORMANCE_STATS": performance_stats,
             "LABEL_OCR_RUNNING_EVENT": label_ocr_running_event,
         }
@@ -10053,9 +10221,18 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             print(f"* Started {identity} without camera")
         display.write(b"<Ready>\n")
         display.flush()
+        next_display_heartbeat = (
+            time.monotonic() + DISPLAY_HEARTBEAT_INTERVAL
+        )
 
         window_name = f"AutoChecker - {identity.name} - {identity.department} - {identity.camera_number}"
         while True:
+            heartbeat_now = time.monotonic()
+            if heartbeat_now >= next_display_heartbeat:
+                send_display_heartbeat(display)
+                next_display_heartbeat = (
+                    heartbeat_now + DISPLAY_HEARTBEAT_INTERVAL
+                )
             display_update_requested = False
             updated_cameras = None
             updated_printers = None
@@ -10094,6 +10271,12 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                                     str(order_id)
                                     for order_id in update_message[1]
                                 )
+                        elif update_message[0] == "retail_order_claimed":
+                            if len(update_message) >= 2:
+                                for claimed_order_id in update_message[1]:
+                                    remove_RETAIL_order_from_sort_queues(
+                                        worker, str(claimed_order_id)
+                                    )
                         elif update_message[0] == "retail_up_header":
                             retail_up_header_requested = True
                 except queue.Empty:
@@ -10403,7 +10586,10 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     message = f"XXX Cannot repeat label: {error}"
                 Printer(message)
                 if identity.department.upper() == RETAIL_UP_DEPARTMENT:
-                    send_RETAIL_UP_display_state(worker, (message,))
+                    send_RETAIL_UP_display_state(
+                        worker,
+                        RETAIL_UP_repeat_display_lines(worker, config, message),
+                    )
                 else:
                     send(worker["DISPLAY"], message)
                 continue
@@ -10623,6 +10809,12 @@ def open_display(port: str) -> serial.Serial:
 def notify_launcher_ready(display: serial.Serial) -> None:
     """Tell the display that the launcher is ready to accept commands."""
     display.write(b"</Ready>\n")
+    display.flush()
+
+
+def send_display_heartbeat(display: serial.Serial) -> None:
+    """Keep one launcher- or worker-owned display connection alive."""
+    display.write(DISPLAY_HEARTBEAT_PACKET)
     display.flush()
 
 
@@ -11016,6 +11208,7 @@ def dispatcher() -> None:
     worker_reset_events: dict[str, multiprocessing.Event] = {}
     worker_disconnect_events: dict[str, multiprocessing.Event] = {}
     reset_recovery_deadlines: dict[str, float] = {}
+    next_idle_heartbeat_deadlines: dict[str, float] = {}
     settings_update_requests: multiprocessing.Queue = multiprocessing.Queue()
     observed_ports = {port_info.device for port_info in list_ports.comports()}
     disconnected_ports_waiting_removal: set[str] = set()
@@ -11506,6 +11699,7 @@ def dispatcher() -> None:
 
             settings_changed = False
             retail_up_progress_changed = False
+            claimed_RETAIL_orders: set[str] = set()
             while True:
                 try:
                     update_request = settings_update_requests.get_nowait()
@@ -11515,6 +11709,12 @@ def dispatcher() -> None:
                         and update_request[0] == "retail_up_progress"
                     ):
                         retail_up_progress_changed = True
+                    elif (
+                        isinstance(update_request, tuple)
+                        and len(update_request) >= 3
+                        and update_request[0] == "retail_order_claimed"
+                    ):
+                        claimed_RETAIL_orders.add(str(update_request[2]))
                     else:
                         # Backward compatible with display-number messages
                         # sent by ADD/APPLY in older child processes.
@@ -11525,6 +11725,12 @@ def dispatcher() -> None:
                 broadcast_RETAIL_UP_header(
                     worker_update_queues,
                     worker_identities,
+                )
+            if claimed_RETAIL_orders:
+                broadcast_RETAIL_order_claimed(
+                    worker_update_queues,
+                    worker_identities,
+                    claimed_RETAIL_orders,
                 )
             if settings_changed:
                 settings = load_settings()
@@ -11566,6 +11772,9 @@ def dispatcher() -> None:
                         notify_launcher_ready(display)
                         print(f"* AutoChecker {display_number} recovered after reset")
                         reset_recovery_deadlines.pop(display_number, None)
+                        next_idle_heartbeat_deadlines[display_number] = (
+                            time.monotonic() + DISPLAY_HEARTBEAT_INTERVAL
+                        )
                     except (serial.SerialException, OSError) as error:
                         print(f"XXX Reset recovery failed on {port}: {error}")
                         reset_recovery_deadlines[display_number] = (
@@ -11573,6 +11782,19 @@ def dispatcher() -> None:
                         )
 
                 try:
+                    heartbeat_now = time.monotonic()
+                    next_heartbeat = next_idle_heartbeat_deadlines.setdefault(
+                        display_number,
+                        heartbeat_now + DISPLAY_HEARTBEAT_INTERVAL,
+                    )
+                    if (
+                        display_number not in reset_recovery_deadlines
+                        and heartbeat_now >= next_heartbeat
+                    ):
+                        send_display_heartbeat(display)
+                        next_idle_heartbeat_deadlines[display_number] = (
+                            heartbeat_now + DISPLAY_HEARTBEAT_INTERVAL
+                        )
                     line = display.readline().decode("utf-8", errors="ignore").strip()
                     if line:
                         print(line)
@@ -11583,6 +11805,7 @@ def dispatcher() -> None:
                     display_ports.pop(display_number, None)
                     disconnected_ports_waiting_removal.add(port)
                     reset_recovery_deadlines.pop(display_number, None)
+                    next_idle_heartbeat_deadlines.pop(display_number, None)
                     print(
                         f"? AutoChecker {display_number} disconnected; "
                         "monitoring COM ports"
@@ -11820,6 +12043,7 @@ def dispatcher() -> None:
                 # Windows locks COM ports exclusively. Close it before the child opens it.
                 display.close()
                 del idle_displays[display_number]
+                next_idle_heartbeat_deadlines.pop(display_number, None)
                 update_display_last_identity(display_number, identity)
 
                 display_update_queue: multiprocessing.Queue = multiprocessing.Queue()
