@@ -14,13 +14,16 @@ import base64
 import copy
 import ctypes
 import getpass
+import hashlib
 import io
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 import winsound
 import xml.etree.ElementTree as ET
 
@@ -77,6 +80,7 @@ REQUIRED_PACKAGES = [
     ("pygame", "pygame>=2.6,<3"),
     ("rapidfuzz", "rapidfuzz>=3,<4"),
     ("win32print", "pywin32>=306"),
+    ("zeroconf", "zeroconf>=0.147,<1"),
 ]
 
 for required_module, required_pip_name in REQUIRED_PACKAGES:
@@ -130,6 +134,44 @@ from rapidfuzz import fuzz
 from send2trash import send2trash
 from serial.tools import list_ports
 
+AUTOCHECKER_NETWORK_URL = (
+    "https://raw.githubusercontent.com/GreenPo-cloud/AutoChecker/"
+    "main/autochecker_network.py"
+)
+
+
+def _import_autochecker_network():
+    """Bootstrap the network module before the normal updater can run."""
+    try:
+        return importlib.import_module("autochecker_network")
+    except ModuleNotFoundError as error:
+        if error.name != "autochecker_network":
+            raise
+
+    target = Path(__file__).resolve().with_name("autochecker_network.py")
+    print("* Downloading AutoChecker network module")
+    response = requests.get(AUTOCHECKER_NETWORK_URL, timeout=20)
+    response.raise_for_status()
+    source = response.content.decode("utf-8-sig")
+    compile(source, AUTOCHECKER_NETWORK_URL, "exec")
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.new")
+    try:
+        temporary.write_text(source, encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    importlib.invalidate_caches()
+    return importlib.import_module("autochecker_network")
+
+
+_autochecker_network = _import_autochecker_network()
+AUTOCHECKER_NETWORK_DEFAULT_PORT = _autochecker_network.DEFAULT_PORT
+AutoCheckerNetworkClient = _autochecker_network.AutoCheckerNetworkClient
+AutoCheckerNetworkServer = _autochecker_network.AutoCheckerNetworkServer
+NetworkAPIError = _autochecker_network.NetworkAPIError
+NetworkUnavailableError = _autochecker_network.NetworkUnavailableError
+copy_catalog_values = _autochecker_network.copy_catalog_values
+
 # pygrabber otherwise asks comtypes to generate DirectShow wrappers inside
 # site-packages. That directory can be read-only on a newly installed PC.
 # In-memory generation is sufficient and avoids a startup PermissionError.
@@ -180,7 +222,7 @@ RAW_CHANGE_LABEL_PATTERN = re.compile(
 OTHER_SLOT_COUNT = 4
 DEFAULT_OTHER_COLOUR = "#ffffff"
 BONUS_COLOUR = "#ff8000"
-CURRENT_VERSION = "3.49"
+CURRENT_VERSION = "3.50"
 LABEL_OCR_STATE_FILE = BASE_DIR / ".pdf_label_ocr_state.json"
 RETAIL_SORT_MODES = ("Standard", "Merch", "Seeds", "Small")
 INVENT_DEPARTMENT = "INVENT"
@@ -234,6 +276,23 @@ DEFAULT_ORDER_LABEL_SETTINGS = {
     "offset_x_mm": 0.0,
     "offset_y_mm": 0.0,
 }
+DEFAULT_NETWORK_SETTINGS = {
+    "port": AUTOCHECKER_NETWORK_DEFAULT_PORT,
+    "token": "",
+    "client_id": "",
+    "server_id": "",
+}
+NETWORK_LOCAL_SETTINGS = {
+    "support",
+    "FOCUS",
+    "DISPLAY",
+    "SCANNER",
+    "NETWORK",
+    "support_username",
+    "support_paths",
+    "main_computer_name",
+}
+MAIN_NETWORK_EVENTS: queue.Queue = queue.Queue()
 SETTINGS_SCHEMA_DEFAULTS = {
     "NAME": [],
     "FOCUS": {},
@@ -255,6 +314,7 @@ SETTINGS_SCHEMA_DEFAULTS = {
         "3": "Tag",
     },
     "ORDER_LABEL": DEFAULT_ORDER_LABEL_SETTINGS,
+    "NETWORK": DEFAULT_NETWORK_SETTINGS,
     "support": False,
     "support_username": "",
     "main_computer_name": DEFAULT_MAIN_COMPUTER_NAME,
@@ -411,6 +471,11 @@ def update_program() -> None:
         current_file = Path(__file__).resolve()
         update_files = (
             (current_file, PYTHON_URL, True),
+            (
+                BASE_DIR / "autochecker_network.py",
+                AUTOCHECKER_NETWORK_URL,
+                True,
+            ),
             (BASE_DIR / "pdf_label_ocr.py", PDF_LABEL_OCR_URL, True),
             (ORDER_LABEL_TEMPLATE, ORDER_LABEL_SVG_URL, False),
             (
@@ -1184,6 +1249,33 @@ def ensure_settings_schema() -> dict:
                     order_label[key] = default_value
                     changed = True
 
+        network = settings.get("NETWORK")
+        if not isinstance(network, dict):
+            network = copy.deepcopy(DEFAULT_NETWORK_SETTINGS)
+            settings["NETWORK"] = network
+            changed = True
+        for key, default_value in DEFAULT_NETWORK_SETTINGS.items():
+            if key not in network:
+                network[key] = default_value
+                changed = True
+        try:
+            network_port = int(network.get("port", AUTOCHECKER_NETWORK_DEFAULT_PORT))
+        except (TypeError, ValueError):
+            network_port = AUTOCHECKER_NETWORK_DEFAULT_PORT
+        if not 1 <= network_port <= 65535:
+            network_port = AUTOCHECKER_NETWORK_DEFAULT_PORT
+        if network.get("port") != network_port:
+            network["port"] = network_port
+            changed = True
+        client_id = str(network.get("client_id", "")).strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{32}", client_id):
+            network["client_id"] = uuid.uuid4().hex
+            changed = True
+        token = str(network.get("token", "")).strip()
+        if settings.get("support") is not True and len(token) < 32:
+            network["token"] = secrets.token_urlsafe(32)
+            changed = True
+
         _slots, other_changed = ensure_other_slots(settings)
         changed = changed or other_changed
 
@@ -1874,7 +1966,7 @@ def upload_display_data(
         if setting_name in {
             "DEPARTMENT", "DISPLAY", "OTHER", "PRINTER", "SCANNER",
             "FEM_BONUS", "AUTO_BONUS", "support", "support_paths",
-            "support_username", "main_computer_name",
+            "support_username", "main_computer_name", "NETWORK",
         }:
             continue
         if setting_name == "FOCUS":
@@ -2236,15 +2328,15 @@ def configured_support_paths(settings: dict) -> dict[str, Path]:
 
 
 def configure_worker_storage(worker: dict, settings: dict) -> None:
-    """Use shared storage when reachable, otherwise keep the worker local."""
+    """Keep local storage; support RETAIL data is mirrored through HTTP."""
     department = str(worker.get("DEPARTMENT", "")).upper()
     local_photo_dir, local_statistics_dir = department_paths(department)
     local_retail_statistics = DESKTOP_DIR / "RETAIL" / "Statistik"
     local_retail_statistics.mkdir(parents=True, exist_ok=True)
     local_B2B_downloads = B2B_download_directories()
 
-    # This function can be called again after a network disconnect. Always
-    # restore a complete local baseline before attempting UNC paths.
+    # Start from local storage. RETAIL/RETAIL_UP stay local and synchronize
+    # through HTTP; B2B keeps its earlier UNC lookup until a later migration.
     for key in (
         "SUPPORT",
         "SUPPORT_FOTO",
@@ -2264,51 +2356,40 @@ def configure_worker_storage(worker: dict, settings: dict) -> None:
 
     worker["DOWNLOAD_DIRECTORIES"] = (
         [Path.home() / "Downloads"]
-        if department == "RETAIL"
+        if department in {"RETAIL", RETAIL_UP_DEPARTMENT}
         else local_B2B_downloads
     )
     worker["RETAIL_STATISTICS"] = local_retail_statistics
     worker["RETAIL_LOCAL_STATISTICS"] = local_retail_statistics
-    if not support_mode_enabled(settings):
-        return
-
-    if support_network_is_known_offline():
-        worker["SUPPORT_OFFLINE"] = True
-        return
-
-    try:
-        shared = configured_support_paths(settings)
-    except (OSError, ValueError) as error:
-        set_support_network_state(False)
-        worker["SUPPORT_OFFLINE"] = True
-        if not worker.get("_SUPPORT_FALLBACK_ANNOUNCED"):
-            print(
-                "? Main AutoChecker computer is unavailable; using local "
-                f"folders: {error}"
-            )
-            worker["_SUPPORT_FALLBACK_ANNOUNCED"] = True
-        return
-
-    set_support_network_state(True)
-    worker["SUPPORT"] = True
-    worker["DOWNLOAD_DIRECTORIES"] = [shared["downloads"]]
-    if department == "B2B":
+    # The new HTTP protocol is intentionally limited to RETAIL/RETAIL_UP.
+    # Preserve the existing B2B shared-PDF lookup until that department is
+    # migrated in a later version.
+    if support_mode_enabled(settings) and department == "B2B":
+        try:
+            shared = configured_support_paths(settings)
+        except (OSError, ValueError) as error:
+            worker["SUPPORT_OFFLINE"] = True
+            if not worker.get("_SUPPORT_FALLBACK_ANNOUNCED"):
+                print(
+                    "? Main AutoChecker B2B folders are unavailable; "
+                    f"using local folders: {error}"
+                )
+                worker["_SUPPORT_FALLBACK_ANNOUNCED"] = True
+            return
+        worker["SUPPORT"] = True
         worker["B2B_NETWORK_HISTORY"] = shared["b2b"] / "History"
         worker["B2B_NETWORK_DOWNLOAD_DIRECTORIES"] = [shared["downloads"]]
-        # Retain the combined list for older helpers. prepare_B2B_order_history
-        # uses the explicit four-stage order stored above.
         worker["DOWNLOAD_DIRECTORIES"] = [
             *local_B2B_downloads,
             shared["downloads"],
         ]
         return
-    if department not in {"RETAIL", RETAIL_UP_DEPARTMENT}:
-        return
-    worker["SUPPORT_FOTO"] = shared["photos"]
-    worker["RETAIL_STATISTICS"] = shared["statistics"]
-    worker["STATISTICS_MIRROR_DIR"] = local_retail_statistics
-    if department == "RETAIL":
-        worker["STATISTICS"] = shared["statistics"]
+    if (
+        support_mode_enabled(settings)
+        and department in {"RETAIL", RETAIL_UP_DEPARTMENT}
+    ):
+        worker["SUPPORT"] = True
+        worker["SUPPORT_OFFLINE"] = support_network_is_known_offline()
 
 
 def retail_statistics_file(worker: dict) -> Path:
@@ -3768,6 +3849,20 @@ def parse_RETAIL_UP_print_label_command(
 
 def append_RETAIL_UP_print_name(worker: dict, order_id: str, name: str) -> bool:
     """Append a packing name and return whether one was already recorded."""
+    network_client = worker.get("NETWORK_CLIENT")
+    if worker.get("SUPPORT") and network_client is None:
+        raise NetworkUnavailableError("Main AutoChecker is unavailable")
+    if network_client is not None:
+        parenthesized = name.startswith("(") and name.endswith(")")
+        plain_name = name[1:-1] if parenthesized else name
+        result = network_client.pack_order(
+            order_id,
+            plain_name,
+            parenthesized=parenthesized,
+        )
+        synchronize_network_worker_statistics(worker)
+        return bool(result.get("duplicate"))
+
     normalized_order = order_id.strip()
     stat_file = retail_statistics_file(worker)
     with _locked_statistics_file(stat_file) as file:
@@ -4009,12 +4104,9 @@ def RETAIL_UP_check_lines(
     """Return non-PRODUCTS warnings except Bonus and UNCHECK matches."""
     fragments = RETAIL_uncheck_fragments(settings)
     fragment_keys = [fragment.casefold() for fragment in fragments]
-    today = datetime.date.today()
     for pdf_date, _part, pdf_path in reversed(
         _available_order_pdfs(worker.get("DOWNLOAD_DIRECTORIES"))
     ):
-        if pdf_date != today:
-            continue
         try:
             orders, _metadata = load_or_create_RETAIL_order_cache(
                 pdf_path, settings
@@ -4114,10 +4206,42 @@ def find_RETAIL_UP_label_page(
     worker: dict,
     tracking_number: str,
 ) -> tuple[Path, int, str]:
-    """Find a tracking number and its label type in today's Label JSON."""
+    """Find a tracking number in current or unfinished prior Label JSON."""
     expected = normalize_RETAIL_UP_tracking_number(tracking_number)
-    for json_path, pdf_path, _part_number in current_RETAIL_UP_label_files(
-        download_directories=worker.get("DOWNLOAD_DIRECTORIES")
+    label_files: list[tuple[datetime.date, int, Path, Path]] = []
+    pattern = re.compile(
+        r"^(\d{2}\.\d{2}\.\d{4}) Part (\d+) \(Label\)\.json$",
+        re.IGNORECASE,
+    )
+    for directory in worker.get("DOWNLOAD_DIRECTORIES") or B2B_download_directories():
+        if not directory.is_dir():
+            continue
+        for json_path in directory.iterdir():
+            match = pattern.fullmatch(json_path.name)
+            if match is None or not json_path.is_file():
+                continue
+            try:
+                file_date = datetime.datetime.strptime(
+                    match.group(1), "%d.%m.%Y"
+                ).date()
+            except ValueError:
+                continue
+            pdf_path = _case_insensitive_file(
+                directory,
+                json_path.with_suffix(".pdf").name,
+            )
+            if pdf_path is not None:
+                label_files.append((
+                    file_date,
+                    int(match.group(2)),
+                    json_path,
+                    pdf_path,
+                ))
+
+    for _file_date, _part, json_path, pdf_path in sorted(
+        label_files,
+        key=lambda item: (item[0], item[1]),
+        reverse=True,
     ):
         document = read_RETAIL_UP_label_document(json_path)
         actual_key = next(
@@ -4918,6 +5042,12 @@ def process_RETAIL_UP_scan(
     """Validate an order, print its label and show non-PRODUCTS warnings."""
     check_lines = []
     try:
+        if worker.get("SUPPORT"):
+            network_client = worker.get("NETWORK_CLIENT")
+            if network_client is None:
+                raise NetworkUnavailableError("Main AutoChecker is unavailable")
+            synchronize_support_http_data(network_client, sync_catalogs=False)
+            worker["SUPPORT_OFFLINE"] = False
         status_message, _physically_printed = submit_RETAIL_UP_label(
             worker,
             settings,
@@ -8168,6 +8298,74 @@ def ensure_windows_network_discovery_enabled() -> None:
         )
 
 
+def ensure_autochecker_http_firewall(port: int) -> None:
+    """Allow the main AutoChecker HTTP and mDNS listeners on private LANs."""
+    if sys.platform != "win32":
+        return
+    port = int(port)
+    check_script = "\n".join((
+        "$http = Get-NetFirewallRule -Name 'AutoChecker-HTTP-In' "
+        "-ErrorAction SilentlyContinue",
+        "$mdns = Get-NetFirewallRule -Name 'AutoChecker-mDNS-In' "
+        "-ErrorAction SilentlyContinue",
+        "$httpPort = if ($null -ne $http) { "
+        "Get-NetFirewallPortFilter -AssociatedNetFirewallRule $http }",
+        "$mdnsPort = if ($null -ne $mdns) { "
+        "Get-NetFirewallPortFilter -AssociatedNetFirewallRule $mdns }",
+        "if ($null -ne $http -and $null -ne $mdns -and "
+        "$http.Enabled -eq 'True' -and $mdns.Enabled -eq 'True' -and "
+        f"[string]$httpPort.LocalPort -eq '{port}' -and "
+        "[string]$mdnsPort.LocalPort -eq '5353') "
+        "{ 'ready' } else { 'missing' }",
+    ))
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                check_script,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0 and "ready" in result.stdout.casefold():
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    print("? Configuring AutoChecker HTTP/mDNS firewall rules")
+    setup_script = "\n".join((
+        "$ErrorActionPreference = 'Stop'",
+        "Remove-NetFirewallRule -Name 'AutoChecker-HTTP-In' "
+        "-ErrorAction SilentlyContinue",
+        "Remove-NetFirewallRule -Name 'AutoChecker-mDNS-In' "
+        "-ErrorAction SilentlyContinue",
+        "New-NetFirewallRule -Name 'AutoChecker-HTTP-In' "
+        "-DisplayName 'AutoChecker HTTP' -Direction Inbound "
+        "-Action Allow -Profile Private -Protocol TCP "
+        f"-LocalPort {port} | Out-Null",
+        "New-NetFirewallRule -Name 'AutoChecker-mDNS-In' "
+        "-DisplayName 'AutoChecker mDNS' -Direction Inbound "
+        "-Action Allow -Profile Private -Protocol UDP "
+        "-LocalPort 5353 | Out-Null",
+    ))
+    try:
+        run_elevated_powershell(setup_script)
+    except Exception as error:
+        print(f"XXX Cannot configure AutoChecker firewall: {error}")
+        return
+    print("* AutoChecker HTTP/mDNS firewall rules are enabled")
+
+
 WINDOWS_PROTECTED_PRINT_REGISTRY = (
     r"SOFTWARE\Policies\Microsoft\Windows NT\Printers\WPP"
 )
@@ -9504,6 +9702,11 @@ def cancel_order(worker: dict, order_id: str) -> bool:
 def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) -> bool:
     """Cancel an order while its display is idle, preferring its last department."""
     last_values = settings.get("DISPLAY", {}).get(display_mac, ["", "", ""])
+    last_name = (
+        str(last_values[0]).strip()
+        if isinstance(last_values, (list, tuple)) and last_values
+        else ""
+    ) or "Launcher"
     preferred_department = (
         str(last_values[1]).upper()
         if isinstance(last_values, (list, tuple)) and len(last_values) > 1
@@ -9511,6 +9714,19 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
     )
     if preferred_department == RETAIL_UP_DEPARTMENT:
         preferred_department = "RETAIL"
+
+    if support_mode_enabled(settings) and preferred_department != "B2B":
+        try:
+            client = create_support_network_client(settings)
+            client.cancel_order(order_id, last_name)
+            client.sync_statistics(DESKTOP_DIR / "RETAIL" / "Statistik")
+            set_support_network_state(True)
+            return True
+        except (NetworkUnavailableError, NetworkAPIError, ValueError) as error:
+            set_support_network_state(False)
+            print(f"XXX Cannot cancel order on main AutoChecker: {error}")
+            return False
+
     candidates = [
         preferred_department,
         *DEPARTMENTS,
@@ -9523,23 +9739,6 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
         checked.add(department)
 
         statistics_dir = DESKTOP_DIR / department / "Statistik"
-        mirror_dir = None
-        if (
-            support_mode_enabled(settings)
-            and not support_network_is_known_offline()
-        ):
-            try:
-                shared_paths = configured_support_paths(settings)
-            except (OSError, ValueError) as error:
-                set_support_network_state(False)
-                print(
-                    "? Main AutoChecker computer became unavailable; "
-                    f"cancelling against local statistics: {error}"
-                )
-            else:
-                if department == "RETAIL":
-                    statistics_dir = shared_paths["statistics"]
-                    mirror_dir = DESKTOP_DIR / "RETAIL" / "Statistik"
         target = (
             statistics_dir / B2B_INDEX_FILENAME
             if department == "B2B"
@@ -9552,9 +9751,6 @@ def cancel_order_from_launcher(display_mac: str, order_id: str, settings: dict) 
             "DEPARTMENT": department,
             "STATISTICS": statistics_dir,
         }
-        if mirror_dir is not None:
-            worker["STATISTICS_MIRROR_DIR"] = mirror_dir
-            worker["RETAIL_STATISTICS"] = statistics_dir
         if cancel_order(worker, order_id):
             return True
     return False
@@ -9630,11 +9826,6 @@ def save_photo(
         send(worker["DISPLAY"], message)
         return False, False
     photo_directories = [Path(worker["FOTO"])]
-    support_photo_dir = worker.get("SUPPORT_FOTO")
-    if support_photo_dir is not None:
-        support_photo_dir = Path(support_photo_dir)
-        if str(support_photo_dir).casefold() != str(photo_directories[0]).casefold():
-            photo_directories.append(support_photo_dir)
 
     number = 1
     while True:
@@ -9661,18 +9852,55 @@ def save_photo(
             saved = False
         else:
             display_filename = path.name.lstrip("#")
-            message = (
-                f"* {display_filename} Photo taken manually"
-                if manually
-                else f"* {display_filename} Photo saved"
-            )
-            update_order_in_statistics(
-                worker,
-                order_id,
-                add_plus=not manually,
-                manual_plus=manually,
-            )
-            saved = True
+            network_client = worker.get("NETWORK_CLIENT")
+            if worker.get("SUPPORT") and network_client is None:
+                message = "XXX Cannot upload photo: main AutoChecker is unavailable"
+                saved = False
+            elif network_client is not None:
+                try:
+                    upload_result = network_client.upload_photo(
+                        path,
+                        order_id,
+                        worker["NAME"],
+                        manually,
+                    )
+                    if upload_result.get("queued"):
+                        update_order_in_statistics(
+                            worker,
+                            order_id,
+                            add_plus=not manually,
+                            manual_plus=manually,
+                        )
+                        message = f"? {display_filename} Photo queued for upload"
+                    else:
+                        synchronize_network_worker_statistics(worker)
+                        server_filename = str(
+                            upload_result.get("filename", path.name)
+                        )
+                        display_filename = server_filename.lstrip("#")
+                        number = 1 if upload_result.get("first_photo") else 2
+                        message = (
+                            f"* {display_filename} Photo taken manually"
+                            if manually
+                            else f"* {display_filename} Photo saved"
+                        )
+                    saved = True
+                except (NetworkUnavailableError, NetworkAPIError) as error:
+                    message = f"XXX Cannot upload photo: {error}"
+                    saved = False
+            else:
+                message = (
+                    f"* {display_filename} Photo taken manually"
+                    if manually
+                    else f"* {display_filename} Photo saved"
+                )
+                update_order_in_statistics(
+                    worker,
+                    order_id,
+                    add_plus=not manually,
+                    manual_plus=manually,
+                )
+                saved = True
     Printer(message)
     send(worker["DISPLAY"], message)
     return saved, saved and number == 1
@@ -9746,11 +9974,45 @@ def process_scan(worker: dict, config: dict, code: str, orders: dict, current_or
             send_fn(message)
             return current_order, photo_pending, photo_start
         if worker.get("DEPARTMENT", "").upper() != "B2B":
-            status = (
-                claim_RETAIL_order(worker, matched)
-                if worker.get("SUPPORT")
-                else get_order_status(worker, matched)
-            )
+            network_client = worker.get("NETWORK_CLIENT")
+            preclaimed_order = worker.pop("NETWORK_PRECLAIMED_ORDER", None)
+            if network_client is not None:
+                try:
+                    if preclaimed_order == matched:
+                        status = "claimed"
+                    else:
+                        response = network_client.claim_order(
+                            matched, worker["NAME"]
+                        )
+                        status = str(response.get("status", "claimed"))
+                    synchronize_network_worker_statistics(worker)
+                    worker["SUPPORT_OFFLINE"] = False
+                except (NetworkUnavailableError, NetworkAPIError) as error:
+                    set_support_network_state(False)
+                    worker["SUPPORT_OFFLINE"] = True
+                    if performance_stats is not None:
+                        performance_stats.record_scan()
+                        performance_stats.record_mistake()
+                    message = f"XXX Order claim blocked: {error}"
+                    Printer(message)
+                    send_fn(message)
+                    return current_order, photo_pending, photo_start
+            else:
+                if worker.get("SUPPORT"):
+                    if performance_stats is not None:
+                        performance_stats.record_scan()
+                        performance_stats.record_mistake()
+                    message = (
+                        "XXX Order claim blocked: main AutoChecker is unavailable"
+                    )
+                    Printer(message)
+                    send_fn(message)
+                    return current_order, photo_pending, photo_start
+                status = (
+                    claim_RETAIL_order(worker, matched)
+                    if worker.get("SUPPORT")
+                    else get_order_status(worker, matched)
+                )
             available_statuses = (
                 {"claimed", "active"}
                 if worker.get("SUPPORT")
@@ -9912,13 +10174,41 @@ def automatically_assign_next_RETAIL_order(
     performance_stats: WorkerPerformanceStats | None = worker.get(
         "PERFORMANCE_STATS"
     )
-    order_id = reserve_RETAIL_order_for_selected_sort(
-        worker,
-        orders,
-        config,
-        ignore_delivery_priority=ignore_delivery_priority,
-        prefer_available_ups=prefer_available_ups,
-    )
+    network_client = worker.get("NETWORK_CLIENT")
+    if worker.get("SUPPORT") and network_client is None:
+        message = "XXX NextOrder blocked: main AutoChecker is unavailable"
+        Printer(message)
+        send(worker["DISPLAY"], message)
+        return None, False, 0.0
+    if network_client is not None:
+        try:
+            response = network_client.next_order(
+                worker["NAME"],
+                str(worker.get("SORT", "Standard")),
+            )
+            order_id = str(response.get("order_id", "")).strip() or None
+            synchronize_support_http_data(network_client, sync_catalogs=False)
+            refreshed_orders = load_RETAIL_orders_from_statistics(worker, config)
+            orders.clear()
+            orders.update(refreshed_orders)
+            if order_id is not None:
+                worker["NETWORK_PRECLAIMED_ORDER"] = order_id
+                worker["SUPPORT_OFFLINE"] = False
+        except (NetworkUnavailableError, NetworkAPIError) as error:
+            set_support_network_state(False)
+            worker["SUPPORT_OFFLINE"] = True
+            message = f"XXX NextOrder blocked: {error}"
+            Printer(message)
+            send(worker["DISPLAY"], message)
+            return None, False, 0.0
+    else:
+        order_id = reserve_RETAIL_order_for_selected_sort(
+            worker,
+            orders,
+            config,
+            ignore_delivery_priority=ignore_delivery_priority,
+            prefer_available_ups=prefer_available_ups,
+        )
     if order_id is None:
         if performance_stats is not None:
             performance_stats.stop_tracking()
@@ -9938,7 +10228,17 @@ def automatically_assign_next_RETAIL_order(
         try:
             job_id = print_RETAIL_order_label(worker, order_id)
         except Exception as error:
-            release_RETAIL_order_reservation(worker, order_id)
+            if network_client is not None:
+                try:
+                    network_client.release_order(order_id, worker["NAME"])
+                    synchronize_network_worker_statistics(worker)
+                except (NetworkUnavailableError, NetworkAPIError) as release_error:
+                    print(
+                        f"XXX Cannot release network order {order_id}: "
+                        f"{release_error}"
+                    )
+            else:
+                release_RETAIL_order_reservation(worker, order_id)
             if performance_stats is not None:
                 performance_stats.stop_tracking()
             message = f"XXX Cannot print order label {order_id}: {error}"
@@ -10143,23 +10443,42 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
             "PERFORMANCE_STATS": performance_stats,
             "LABEL_OCR_RUNNING_EVENT": label_ocr_running_event,
         }
-        try:
-            configure_worker_storage(worker, config)
-            synchronize_support_statistics(worker)
-        except (OSError, ValueError) as error:
-            message = f"XXX Support storage unavailable: {error}"
-            Printer(message)
-            send(display, message)
-            raise RuntimeError(message) from error
+        configure_worker_storage(worker, config)
+        if (
+            support_mode_enabled(config)
+            and identity.department.upper() in {"RETAIL", RETAIL_UP_DEPARTMENT}
+        ):
+            network_client = None
+            try:
+                network_client = create_support_network_client(config)
+                worker["NETWORK_CLIENT"] = network_client
+                config, _network_changed = synchronize_support_http_data(
+                    network_client,
+                    sync_catalogs=True,
+                )
+                network_client.open_session(
+                    identity.name,
+                    identity.department,
+                    display_number,
+                    identity.sort_mode,
+                )
+                worker["SUPPORT_OFFLINE"] = False
+                print(
+                    f"* Connected to main AutoChecker at "
+                    f"{network_client.endpoint.base_url}"
+                )
+            except (NetworkUnavailableError, NetworkAPIError, ValueError) as error:
+                set_support_network_state(False)
+                worker["SUPPORT_OFFLINE"] = True
+                message = f"XXX Main AutoChecker unavailable: {error}"
+                Printer(message)
+                send(display, message)
 
         print(f"* Photo folder: {photo_dir}")
         print(f"* Statistics folder: {worker['STATISTICS']}")
         if worker.get("SUPPORT"):
-            support_photo_dir = worker.get("SUPPORT_FOTO")
-            if support_photo_dir is not None:
-                print(f"* Support photo folder: {support_photo_dir}")
             print(
-                "* Support downloads folder: "
+                "* HTTP-synchronized downloads folder: "
                 f"{worker['DOWNLOAD_DIRECTORIES'][0]}"
             )
         if identity.department.upper() == RETAIL_UP_DEPARTMENT:
@@ -10454,12 +10773,39 @@ def main(identity: CheckerIdentity, camera_id: int | None, focus: int | float | 
                     )
                     worker["NAME"] = new_name
                     update_display_last_identity(display_number, identity)
+                    network_client = worker.get("NETWORK_CLIENT")
+                    if network_client is not None:
+                        try:
+                            network_client.update_session_name(new_name)
+                        except (NetworkUnavailableError, NetworkAPIError) as error:
+                            set_support_network_state(False)
+                            worker["SUPPORT_OFFLINE"] = True
+                            print(f"XXX Cannot update network worker name: {error}")
                     display.write(b"<ok>\n")
                     display.flush()
 
             if line.startswith("CancelOrder:"):
                 cancelled_order = line[len("CancelOrder:"):].strip()
-                if cancelled_order and cancel_order(worker, cancelled_order):
+                cancelled = False
+                network_client = worker.get("NETWORK_CLIENT")
+                if cancelled_order and network_client is not None:
+                    try:
+                        network_client.cancel_order(
+                            cancelled_order,
+                            worker["NAME"],
+                        )
+                        synchronize_network_worker_statistics(worker)
+                        cancelled = True
+                    except (NetworkUnavailableError, NetworkAPIError) as error:
+                        set_support_network_state(False)
+                        worker["SUPPORT_OFFLINE"] = True
+                        message = f"XXX Cannot cancel order: {error}"
+                        Printer(message)
+                        send(worker["DISPLAY"], message)
+                elif cancelled_order and not worker.get("SUPPORT"):
+                    cancelled = cancel_order(worker, cancelled_order)
+
+                if cancelled:
                     display.write(b"<ok>\n")
                     display.flush()
                     if current_order and current_order.lstrip("#") == cancelled_order.lstrip("#"):
@@ -11116,7 +11462,7 @@ def toggle_launcher_order_cancelled(worker: dict, order_id: str) -> bool:
 
 
 def send_launcher_label_part(worker: dict, part_number: int) -> bool:
-    """Implement `send part N`; it is meaningful only on a support PC."""
+    """Implement `send part N` through the authenticated HTTP transport."""
     if not worker.get("SUPPORT"):
         print(
             "XXX send part is unavailable when support is false: "
@@ -11130,13 +11476,16 @@ def send_launcher_label_part(worker: dict, part_number: int) -> bool:
     if not source.is_file():
         print(f"XXX Today's Label PDF was not found: {source.name}")
         return False
-    destination = Path(worker["DOWNLOAD_DIRECTORIES"][0]) / filename
+    network_client = worker.get("NETWORK_CLIENT")
+    if network_client is None:
+        print("XXX Main AutoChecker is unavailable; Label PDF was not sent")
+        return False
     try:
-        copy_file_atomically(source, destination)
-    except Exception as error:
+        network_client.upload_file(source, worker.get("NAME", "Launcher"))
+    except (NetworkUnavailableError, NetworkAPIError, OSError) as error:
         print(f"XXX Cannot send {filename}: {error}")
         return False
-    print(f"* Label PDF sent to main computer: {destination}")
+    print(f"* Label PDF sent to main AutoChecker: {filename}")
     return True
 
 
@@ -11183,6 +11532,468 @@ def launcher_console_loop(worker: dict) -> None:
             print(f"XXX Console command failed: {error}")
 
 
+def create_support_network_client(settings: dict) -> AutoCheckerNetworkClient:
+    """Build an HTTP client from settings that always remain local."""
+    network = settings.get("NETWORK", {})
+    if not isinstance(network, dict):
+        raise ValueError("Settings NETWORK must be an object")
+    return AutoCheckerNetworkClient(
+        str(network.get("token", "")).strip(),
+        str(network.get("client_id", "")).strip(),
+        preferred_server_id=str(network.get("server_id", "")).strip(),
+        outbox_dir=DESKTOP_DIR / "RETAIL" / "Network_Outbox",
+    )
+
+
+def merge_support_network_catalogs(
+    catalogs: dict,
+    server_id: str = "",
+) -> tuple[dict, bool]:
+    """Merge server settings under one local Settings.json lock."""
+    with portalocker.Lock(
+        str(SETTINGS_FILE), mode="r+", encoding="utf-8", timeout=30
+    ) as file:
+        file.seek(0)
+        settings = json.load(file)
+        if not isinstance(settings, dict):
+            raise ValueError("Settings.json must contain a JSON object")
+        changed = copy_catalog_values(
+            settings,
+            catalogs,
+            NETWORK_LOCAL_SETTINGS,
+        )
+        network = settings.setdefault("NETWORK", {})
+        if isinstance(network, dict) and server_id:
+            if network.get("server_id") != server_id:
+                network["server_id"] = server_id
+                changed = True
+        if changed:
+            file.seek(0)
+            file.truncate()
+            json.dump(settings, file, ensure_ascii=False, indent=4)
+            file.write("\n")
+            file.flush()
+        return settings, changed
+
+
+def synchronize_support_http_data(
+    client: AutoCheckerNetworkClient,
+    *,
+    sync_catalogs: bool = True,
+) -> tuple[dict, bool]:
+    """Synchronize support catalogs, active files and today's statistics."""
+    health = client.health()
+    changed = False
+    if sync_catalogs:
+        settings, catalogs_changed = merge_support_network_catalogs(
+            client.get_catalogs(),
+            str(health.get("server_id", "")),
+        )
+    else:
+        settings = load_settings()
+        catalogs_changed = False
+    files_changed, _manifest_revision = client.sync_files(
+        Path.home() / "Downloads"
+    )
+    statistics_changed, _statistics_revision = client.sync_statistics(
+        DESKTOP_DIR / "RETAIL" / "Statistik"
+    )
+    uploaded = client.flush_photo_outbox()
+    if uploaded:
+        print(f"* Uploaded {uploaded} queued support photo(s)")
+    changed = catalogs_changed or files_changed or statistics_changed
+    set_support_network_state(True)
+    return settings, changed
+
+
+def synchronize_network_worker_statistics(worker: dict) -> None:
+    """Refresh a support child's local authoritative-statistics mirror."""
+    client = worker.get("NETWORK_CLIENT")
+    if client is None:
+        return
+    client.sync_statistics(DESKTOP_DIR / "RETAIL" / "Statistik")
+
+
+class AutoCheckerNetworkBackend:
+    """Bridge HTTP operations to the existing locked RETAIL functions."""
+
+    def __init__(self) -> None:
+        self.downloads = Path.home() / "Downloads"
+        self._files_lock = threading.Lock()
+        self._file_paths: dict[str, Path] = {}
+        self._hash_cache: dict[str, tuple[int, int, str]] = {}
+        self._sessions_lock = threading.Lock()
+        self._sessions: dict[str, dict] = {}
+        self._request_ledger = (
+            DESKTOP_DIR / "RETAIL" / "Network_Requests.json"
+        )
+
+    @staticmethod
+    def _payload_text(payload: dict, key: str, *, required: bool = True) -> str:
+        value = str(payload.get(key, "")).strip()
+        if required and not value:
+            raise NetworkAPIError(400, f"Missing {key}")
+        return value
+
+    def _idempotent(self, payload: dict, callback) -> dict:
+        request_id = self._payload_text(payload, "request_id")
+        if not re.fullmatch(r"[0-9A-Za-z_-]{16,128}", request_id):
+            raise NetworkAPIError(400, "Invalid request_id")
+        self._request_ledger.parent.mkdir(parents=True, exist_ok=True)
+        with portalocker.Lock(
+            str(self._request_ledger),
+            mode="a+",
+            encoding="utf-8",
+            timeout=30,
+        ) as file:
+            file.seek(0)
+            raw = file.read().strip()
+            try:
+                ledger = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                ledger = {}
+            if not isinstance(ledger, dict):
+                ledger = {}
+            cached = ledger.get(request_id)
+            if isinstance(cached, dict):
+                return cached
+            result = callback()
+            ledger[request_id] = result
+            if len(ledger) > 2000:
+                ledger = dict(list(ledger.items())[-1500:])
+            file.seek(0)
+            file.truncate()
+            json.dump(ledger, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+            file.flush()
+            return result
+
+    def _worker(self, payload: dict, department: str = "RETAIL") -> dict:
+        settings = load_settings()
+        worker = create_launcher_RETAIL_worker(settings)
+        worker["NAME"] = self._payload_text(payload, "name")
+        worker["DEPARTMENT"] = department
+        worker["SORT"] = str(payload.get("sort", "Standard")).strip() or "Standard"
+        return worker
+
+    @staticmethod
+    def _statistics_revision(content: str) -> str:
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def get_catalogs(self) -> dict:
+        settings = load_settings()
+        return {
+            key: copy.deepcopy(value)
+            for key, value in settings.items()
+            if key not in NETWORK_LOCAL_SETTINGS
+        }
+
+    def _active_parts_and_orders(
+        self,
+    ) -> tuple[set[tuple[str, int]], set[str]]:
+        today_text = f"{datetime.date.today():%d.%m.%Y}"
+        active_parts: set[tuple[str, int]] = set()
+        active_orders: set[str] = set()
+        stat_file = DESKTOP_DIR / "RETAIL" / "Statistik" / f"{today_text}.txt"
+        if not stat_file.is_file():
+            return active_parts, active_orders
+        current_part: tuple[str, int] | None = None
+        for line in read_stat_lines(stat_file):
+            header = re.match(
+                r"^-{10}(\d{2}\.\d{2}\.\d{4}) Part (\d+)\.pdf-{10}",
+                line.strip(),
+                re.IGNORECASE,
+            )
+            if header is not None:
+                current_part = (header.group(1), int(header.group(2)))
+                if current_part[0] == today_text:
+                    active_parts.add(current_part)
+                continue
+            order_id = retail_order_id_from_stat_line(line)
+            if order_id is None or retail_stat_is_cancelled(line):
+                continue
+            assembled, packed = launcher_statistics_order_progress(line)
+            if not assembled or not packed:
+                active_orders.add(order_id)
+                if current_part is not None:
+                    active_parts.add(current_part)
+        return active_parts, active_orders
+
+    def _active_files(self) -> list[Path]:
+        active_parts, active_orders = self._active_parts_and_orders()
+        today_text = f"{datetime.date.today():%d.%m.%Y}"
+        files: list[Path] = []
+        if not self.downloads.is_dir():
+            return files
+        part_pattern = re.compile(
+            r"^(\d{2}\.\d{2}\.\d{4}) Part (\d+)"
+            r"(?: \((?:Order|Label)\))?\.(?:json|pdf)$",
+            re.IGNORECASE,
+        )
+        for path in self.downloads.iterdir():
+            if not path.is_file():
+                continue
+            part = part_pattern.fullmatch(path.name)
+            if part is not None:
+                key = (part.group(1), int(part.group(2)))
+                if key in active_parts or key[0] == today_text:
+                    files.append(path)
+                continue
+            change_ids = RETAIL_change_label_pdf_order_ids(path)
+            if change_ids and (
+                any(order_id in active_orders for order_id in change_ids)
+                or f"({today_text})" in path.name
+            ):
+                files.append(path)
+        return sorted(files, key=lambda value: value.name.casefold())
+
+    def _file_sha256(self, path: Path) -> str:
+        stat = path.stat()
+        key = str(path.resolve()).casefold()
+        cached = self._hash_cache.get(key)
+        signature = (stat.st_mtime_ns, stat.st_size)
+        if cached is not None and cached[:2] == signature:
+            return cached[2]
+        digest = hashlib.sha256()
+        with path.open("rb") as file:
+            while True:
+                chunk = file.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        value = digest.hexdigest()
+        self._hash_cache[key] = (signature[0], signature[1], value)
+        return value
+
+    def get_file_manifest(self) -> dict:
+        entries = []
+        mapping: dict[str, Path] = {}
+        for path in self._active_files():
+            stat = path.stat()
+            file_id = hashlib.sha256(
+                path.name.casefold().encode("utf-8")
+            ).hexdigest()[:32]
+            sha256 = self._file_sha256(path)
+            mapping[file_id] = path
+            entries.append({
+                "id": file_id,
+                "name": path.name,
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": sha256,
+            })
+        revision_source = "\n".join(
+            f"{item['name']}|{item['size']}|{item['sha256']}" for item in entries
+        )
+        with self._files_lock:
+            self._file_paths = mapping
+        return {
+            "revision": hashlib.sha256(
+                revision_source.encode("utf-8")
+            ).hexdigest(),
+            "files": entries,
+        }
+
+    def resolve_file(self, file_id: str) -> Path:
+        with self._files_lock:
+            path = self._file_paths.get(file_id)
+        if path is None:
+            self.get_file_manifest()
+            with self._files_lock:
+                path = self._file_paths.get(file_id)
+        if path is None:
+            raise NetworkAPIError(404, "Unknown file id")
+        return path
+
+    def get_statistics_snapshot(self) -> dict:
+        date_text = f"{datetime.date.today():%d.%m.%Y}"
+        stat_file = DESKTOP_DIR / "RETAIL" / "Statistik" / f"{date_text}.txt"
+        if not stat_file.is_file():
+            content = ""
+        else:
+            content = "".join(read_stat_lines(stat_file))
+        return {
+            "filename": stat_file.name,
+            "revision": self._statistics_revision(content),
+            "content": content,
+        }
+
+    def open_session(self, payload: dict) -> dict:
+        def action() -> dict:
+            session_id = uuid.uuid4().hex
+            with self._sessions_lock:
+                self._sessions[session_id] = {
+                    **payload,
+                    "opened_at": datetime.datetime.now().isoformat(),
+                }
+            return {"session_id": session_id}
+        return self._idempotent(payload, action)
+
+    def update_session(self, payload: dict) -> dict:
+        session_id = self._payload_text(payload, "session_id")
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+            if session is not None:
+                session["name"] = self._payload_text(payload, "name")
+        return {"session_id": session_id}
+
+    def next_order(self, payload: dict) -> dict:
+        def action() -> dict:
+            worker = self._worker(payload)
+            settings = load_settings()
+            orders = load_RETAIL_orders_from_statistics(worker, settings)
+            sync_RETAIL_sort_queues(worker, orders, settings, reset=True)
+            order_id = reserve_RETAIL_order_for_selected_sort(
+                worker,
+                orders,
+                settings,
+                prefer_available_ups=True,
+            )
+            if order_id is None:
+                raise NetworkAPIError(409, "No available RETAIL orders")
+            MAIN_NETWORK_EVENTS.put(("order_claimed", (order_id,)))
+            return {
+                "order_id": order_id,
+                "manifest_revision": self.get_file_manifest()["revision"],
+                "statistics_revision": self.get_statistics_snapshot()["revision"],
+            }
+        return self._idempotent(payload, action)
+
+    def claim_order(self, payload: dict) -> dict:
+        def action() -> dict:
+            worker = self._worker(payload)
+            order_id = self._payload_text(payload, "order_id")
+            if not order_id.startswith("#"):
+                order_id = "#" + order_id
+            status = claim_RETAIL_order(worker, order_id)
+            if status not in {"claimed", "active"}:
+                raise NetworkAPIError(409, f"Order unavailable {order_id}: {status}")
+            MAIN_NETWORK_EVENTS.put(("order_claimed", (order_id,)))
+            return {
+                "order_id": order_id,
+                "status": status,
+                "statistics_revision": self.get_statistics_snapshot()["revision"],
+            }
+        return self._idempotent(payload, action)
+
+    def release_order(self, payload: dict) -> dict:
+        def action() -> dict:
+            worker = self._worker(payload)
+            order_id = self._payload_text(payload, "order_id")
+            released = release_RETAIL_order_reservation(worker, order_id)
+            if released:
+                MAIN_NETWORK_EVENTS.put(("orders_updated", (order_id,)))
+            return {
+                "order_id": order_id,
+                "released": released,
+                "statistics_revision": self.get_statistics_snapshot()["revision"],
+            }
+        return self._idempotent(payload, action)
+
+    def cancel_order(self, payload: dict) -> dict:
+        def action() -> dict:
+            worker = self._worker(payload)
+            order_id = self._payload_text(payload, "order_id")
+            if not order_id.startswith("#"):
+                order_id = "#" + order_id
+            if not cancel_order(worker, order_id):
+                raise NetworkAPIError(404, f"Order not found {order_id}")
+            MAIN_NETWORK_EVENTS.put(("orders_updated", (order_id,)))
+            MAIN_NETWORK_EVENTS.put(("retail_up_header", ()))
+            return {
+                "order_id": order_id,
+                "cancelled": True,
+                "statistics_revision": self.get_statistics_snapshot()["revision"],
+            }
+        return self._idempotent(payload, action)
+
+    def pack_order(self, payload: dict) -> dict:
+        def action() -> dict:
+            worker = self._worker(payload, RETAIL_UP_DEPARTMENT)
+            order_id = self._payload_text(payload, "order_id")
+            RETAIL_UP_ready_statistics_line(worker, order_id)
+            name = worker["NAME"]
+            if payload.get("parenthesized"):
+                name = f"({name})"
+            duplicate = append_RETAIL_UP_print_name(worker, order_id, name)
+            MAIN_NETWORK_EVENTS.put(("retail_up_header", ()))
+            return {
+                "order_id": order_id,
+                "duplicate": duplicate,
+                "statistics_revision": self.get_statistics_snapshot()["revision"],
+            }
+        return self._idempotent(payload, action)
+
+    def save_photo(self, payload: dict, photo: bytes) -> dict:
+        def action() -> dict:
+            if not photo.startswith(b"\xff\xd8"):
+                raise NetworkAPIError(400, "Uploaded photo is not a JPEG")
+            worker = self._worker(payload)
+            order_id = self._payload_text(payload, "order_id")
+            if not re.fullmatch(r"#\d+", order_id):
+                raise NetworkAPIError(400, "Invalid photo order number")
+            photo_dir, _statistics_dir = department_paths("RETAIL")
+            photo_dir.mkdir(parents=True, exist_ok=True)
+            number = 1
+            while True:
+                suffix = "" if number == 1 else f"_{number}"
+                filename = f"{order_id}{suffix}.jpg"
+                target = photo_dir / filename
+                if not target.exists():
+                    break
+                number += 1
+            temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.part")
+            try:
+                temporary.write_bytes(photo)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            manually = bool(payload.get("manually"))
+            update_order_in_statistics(
+                worker,
+                order_id,
+                add_plus=not manually,
+                manual_plus=manually,
+            )
+            MAIN_NETWORK_EVENTS.put(("orders_updated", (order_id,)))
+            MAIN_NETWORK_EVENTS.put(("retail_up_header", ()))
+            return {
+                "filename": filename,
+                "first_photo": number == 1,
+                "statistics_revision": self.get_statistics_snapshot()["revision"],
+            }
+        return self._idempotent(payload, action)
+
+    def save_uploaded_file(self, payload: dict, data: bytes) -> dict:
+        """Accept the maintained `send part N` Label PDF over HTTP."""
+        def action() -> dict:
+            filename = self._payload_text(payload, "filename")
+            if Path(filename).name != filename or not re.fullmatch(
+                r"\d{2}\.\d{2}\.\d{4} Part \d+ \(Label\)\.pdf",
+                filename,
+                re.IGNORECASE,
+            ):
+                raise NetworkAPIError(400, "Unsupported upload filename")
+            if b"%PDF-" not in data[:4096]:
+                raise NetworkAPIError(400, "Uploaded file is not a PDF")
+            expected_hash = self._payload_text(payload, "sha256")
+            actual_hash = hashlib.sha256(data).hexdigest()
+            if not secrets.compare_digest(expected_hash, actual_hash):
+                raise NetworkAPIError(400, "Uploaded file checksum mismatch")
+            self.downloads.mkdir(parents=True, exist_ok=True)
+            target = self.downloads / filename
+            temporary = target.with_name(
+                f".{target.name}.{uuid.uuid4().hex}.part"
+            )
+            try:
+                temporary.write_bytes(data)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return {"filename": filename, "sha256": actual_hash}
+        return self._idempotent(payload, action)
+
+
 def dispatcher() -> None:
     """Own idle display ports and hand each busy port to its worker process."""
     latest_display_versions = get_latest_display_versions()
@@ -11222,6 +12033,13 @@ def dispatcher() -> None:
     retail_monitor_auth_blocked = False
     launcher_label_ocr_process = None
     label_ocr_running_event: multiprocessing.Event = multiprocessing.Event()
+    support_http_client = None
+    next_network_catalog_sync = 0.0
+    if support_mode_enabled(settings):
+        try:
+            support_http_client = create_support_network_client(settings)
+        except ValueError as error:
+            print(f"XXX Support HTTP configuration error: {error}")
     if SUPPORT_NETWORK_AUTH_BLOCKED:
         print(
             "? Main-computer credentials are unavailable; RETAIL order "
@@ -11229,21 +12047,33 @@ def dispatcher() -> None:
         )
     try:
         launcher_retail_worker = create_launcher_RETAIL_worker(settings)
-        process_pending_admin_download_files(launcher_retail_worker)
-        launcher_label_ocr_process = maintain_launcher_label_ocr(
-            launcher_retail_worker,
-            launcher_label_ocr_process,
-            label_ocr_running_event,
-        )
-        process_pending_RETAIL_order_sources(
-            launcher_retail_worker, settings
-        )
-        process_pending_RETAIL_change_pdfs(
-            launcher_retail_worker, settings
-        )
-        process_pending_RETAIL_change_label_pdfs(
-            launcher_retail_worker
-        )
+        if support_mode_enabled(settings):
+            if support_http_client is None:
+                raise NetworkUnavailableError(
+                    "NETWORK.token is not configured"
+                )
+            settings, _changed = synchronize_support_http_data(
+                support_http_client,
+                sync_catalogs=True,
+            )
+            launcher_retail_worker["NETWORK_CLIENT"] = support_http_client
+            next_network_catalog_sync = time.monotonic() + 60.0
+        else:
+            process_pending_admin_download_files(launcher_retail_worker)
+            launcher_label_ocr_process = maintain_launcher_label_ocr(
+                launcher_retail_worker,
+                launcher_label_ocr_process,
+                label_ocr_running_event,
+            )
+            process_pending_RETAIL_order_sources(
+                launcher_retail_worker, settings
+            )
+            process_pending_RETAIL_change_pdfs(
+                launcher_retail_worker, settings
+            )
+            process_pending_RETAIL_change_label_pdfs(
+                launcher_retail_worker
+            )
     except Exception as error:
         retail_monitor_last_error = str(error)
         print(
@@ -11310,6 +12140,32 @@ def dispatcher() -> None:
             print("* Dispatcher ready; waiting for AutoChecker displays")
 
         while True:
+            # HTTP requests are handled in background threads.  Apply their
+            # state notifications in the dispatcher thread so local workers
+            # see remote claims, cancellations and packing progress at once.
+            while True:
+                try:
+                    event_name, event_order_ids = MAIN_NETWORK_EVENTS.get_nowait()
+                except queue.Empty:
+                    break
+                if event_name == "order_claimed":
+                    broadcast_RETAIL_order_claimed(
+                        worker_update_queues,
+                        worker_identities,
+                        event_order_ids,
+                    )
+                elif event_name == "orders_updated":
+                    broadcast_RETAIL_orders_updated(
+                        worker_update_queues,
+                        worker_identities,
+                        event_order_ids,
+                    )
+                elif event_name == "retail_up_header":
+                    broadcast_RETAIL_UP_header(
+                        worker_update_queues,
+                        worker_identities,
+                    )
+
             # A stopped worker releases its port; the dispatcher can listen to it again.
             for display_number, process in list(workers.items()):
                 if not process.is_alive():
@@ -11405,41 +12261,78 @@ def dispatcher() -> None:
                             daemon=True,
                         ).start()
                         launcher_console_started = True
-                    process_pending_admin_download_files(
-                        launcher_retail_worker
-                    )
-                    launcher_label_ocr_process = maintain_launcher_label_ocr(
-                        launcher_retail_worker,
-                        launcher_label_ocr_process,
-                        label_ocr_running_event,
-                    )
-                    imported_order_ids = process_pending_RETAIL_order_sources(
-                        launcher_retail_worker, settings
-                    )
-                    changed_orders, _changed_metadata, _new_markers = (
-                        process_pending_RETAIL_change_pdfs(
-                            launcher_retail_worker, settings
+                    if support_mode_enabled(settings):
+                        if support_http_client is None:
+                            support_http_client = create_support_network_client(
+                                settings
+                            )
+                        launcher_retail_worker["NETWORK_CLIENT"] = (
+                            support_http_client
                         )
-                    )
-                    changed_label_ids = (
-                        process_pending_RETAIL_change_label_pdfs(
+                        sync_catalogs_now = (
+                            time.monotonic() >= next_network_catalog_sync
+                        )
+                        settings, network_changed = synchronize_support_http_data(
+                            support_http_client,
+                            sync_catalogs=sync_catalogs_now,
+                        )
+                        if sync_catalogs_now:
+                            next_network_catalog_sync = time.monotonic() + 60.0
+                        if network_changed:
+                            broadcast_display_data(
+                                settings,
+                                cameras,
+                                printers,
+                                scanners,
+                                idle_displays,
+                                worker_update_queues,
+                                worker_identities,
+                            )
+                            broadcast_RETAIL_orders_updated(
+                                worker_update_queues,
+                                worker_identities,
+                                (),
+                            )
+                            broadcast_RETAIL_UP_header(
+                                worker_update_queues,
+                                worker_identities,
+                            )
+                    else:
+                        process_pending_admin_download_files(
                             launcher_retail_worker
                         )
-                    )
-                    refreshed_order_ids = (
-                        set(imported_order_ids) | set(changed_orders)
-                    )
-                    if refreshed_order_ids:
-                        broadcast_RETAIL_orders_updated(
-                            worker_update_queues,
-                            worker_identities,
-                            refreshed_order_ids,
+                        launcher_label_ocr_process = maintain_launcher_label_ocr(
+                            launcher_retail_worker,
+                            launcher_label_ocr_process,
+                            label_ocr_running_event,
                         )
-                    if changed_label_ids:
-                        broadcast_RETAIL_UP_header(
-                            worker_update_queues,
-                            worker_identities,
+                        imported_order_ids = process_pending_RETAIL_order_sources(
+                            launcher_retail_worker, settings
                         )
+                        changed_orders, _changed_metadata, _new_markers = (
+                            process_pending_RETAIL_change_pdfs(
+                                launcher_retail_worker, settings
+                            )
+                        )
+                        changed_label_ids = (
+                            process_pending_RETAIL_change_label_pdfs(
+                                launcher_retail_worker
+                            )
+                        )
+                        refreshed_order_ids = (
+                            set(imported_order_ids) | set(changed_orders)
+                        )
+                        if refreshed_order_ids:
+                            broadcast_RETAIL_orders_updated(
+                                worker_update_queues,
+                                worker_identities,
+                                refreshed_order_ids,
+                            )
+                        if changed_label_ids:
+                            broadcast_RETAIL_UP_header(
+                                worker_update_queues,
+                                worker_identities,
+                            )
                     if retail_monitor_last_error is not None:
                         print("* RETAIL order monitor resumed")
                         retail_monitor_last_error = None
@@ -11451,21 +12344,12 @@ def dispatcher() -> None:
                     next_retail_order_scan = (
                         time.monotonic() + ORDER_SOURCE_RETRY_INTERVAL
                     )
-                    if (
-                        launcher_retail_worker is not None
-                        and launcher_retail_worker.get("SUPPORT")
-                        and (
-                            isinstance(error, OSError)
-                            or is_support_authentication_error(error)
-                        )
-                    ):
+                    if support_mode_enabled(settings):
                         set_support_network_state(False)
-                        configure_worker_storage(
-                            launcher_retail_worker, settings
-                        )
                         print(
-                            "? RETAIL order monitor switched to local folders "
-                            "because the main computer is unavailable"
+                            "? Main AutoChecker is unavailable; automatic "
+                            "support synchronization and new-order assignment "
+                            "are blocked"
                         )
 
             if time.monotonic() >= next_port_scan:
@@ -12168,20 +13052,47 @@ if __name__ == "__main__":
     check_for_updates()
     ensure_default_sound_file()
     startup_settings = ensure_settings_schema()
+    network_server = None
     if not support_mode_enabled(startup_settings):
         ensure_windows_network_discovery_enabled()
     ensure_windows_protected_print_disabled()
     if support_mode_enabled(startup_settings):
-        if connect_support_network_session(startup_settings):
-            startup_settings = synchronize_support_catalog_settings(
-                startup_settings
+        try:
+            startup_client = create_support_network_client(startup_settings)
+            startup_settings, _changed = synchronize_support_http_data(
+                startup_client,
+                sync_catalogs=True,
             )
-        else:
             print(
-                "? Product settings were not updated from the main computer; "
-                "the local Settings.json will be used"
+                f"* Main AutoChecker discovered at "
+                f"{startup_client.endpoint.base_url}"
+            )
+        except (NetworkUnavailableError, NetworkAPIError, ValueError) as error:
+            set_support_network_state(False)
+            print(
+                "XXX Main AutoChecker is unavailable; new orders will be "
+                f"blocked: {error}"
             )
     else:
         ensure_main_network_shares(startup_settings)
+        network = startup_settings["NETWORK"]
+        ensure_autochecker_http_firewall(int(network["port"]))
+        try:
+            network_server = AutoCheckerNetworkServer(
+                AutoCheckerNetworkBackend(),
+                str(network["token"]),
+                int(network["port"]),
+                str(network["client_id"]),
+            ).start()
+            print(
+                f"* AutoChecker HTTP server started on port "
+                f"{network_server.port}; mDNS service AutoChecker is ready"
+            )
+        except Exception as error:
+            print(f"XXX Cannot start AutoChecker HTTP server: {error}")
     sync_order_label_templates()
-    dispatcher()
+    try:
+        dispatcher()
+    finally:
+        if network_server is not None:
+            network_server.stop()
